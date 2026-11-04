@@ -3,380 +3,360 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>F.R.I.D.A.Y. — B2B-разведка и подготовка черновиков для любой ниши РФ</title>
-  <link rel="stylesheet" href="/static/app.css" />
+  <title>F.R.I.D.A.Y.</title>
+  <link rel="stylesheet" href="/static/app.css?v=3" />
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">
-      <div class="logo">F.R.I.D.A.Y.</div>
-      <div>
-        <div class="subtitle">Универсальная B2B-разведка и персонализированные черновики для рынка РФ</div>
-        <div class="compliance-pill unconfigured" id="headerBadges">
-          <span class="dot"></span>
-          <span id="nicheBadgeText">Шаг 1: настройте нишу и продукт</span>
-          · ИИ-агент рабочей среды как Мозг · ФЗ-38 ст. 18 (без автоотправки)
-        </div>
+    <div class="topbar-inner">
+      <div class="brand-group">
+        <span class="brand-mark">F.R.I.D.A.Y.</span>
+        <span class="divider-dot"></span>
+        <button type="button" class="project-pill" id="project-pill-btn" data-nav="project">
+          <span class="status-indicator" id="project-status-dot"></span>
+          <span id="project-status-text">Загрузка…</span>
+        </button>
       </div>
-    </div>
-    <div class="top-actions">
-      <button type="button" class="btn btn-ghost" id="btnExportCsv">Скачать CSV</button>
-      <button type="button" class="btn btn-ghost" id="btnExportMd">Скачать Markdown</button>
-      <button type="button" class="btn btn-primary" id="btnRefresh">Обновить</button>
+
+      <nav class="main-nav" aria-label="Разделы">
+        <button type="button" class="nav-btn active" data-tab="project">Проект</button>
+        <button type="button" class="nav-btn" data-tab="workspace">
+          Поиск и база <span class="nav-badge" id="badge-companies">0</span>
+        </button>
+        <button type="button" class="nav-btn" data-tab="drafts">
+          Черновики <span class="nav-badge" id="badge-drafts">0</span>
+        </button>
+        <button type="button" class="nav-btn" data-tab="signals">Сигналы</button>
+      </nav>
+
+      <div class="topbar-actions">
+        <button type="button" class="ghost-btn sm" id="btn-export-csv">CSV</button>
+        <button type="button" class="ghost-btn sm" id="btn-export-md">MD</button>
+      </div>
     </div>
   </header>
 
-  <nav class="tabs" id="mainTabs">
-    <button type="button" class="tab active" data-tab="niche">1. Ниша и продукт</button>
-    <button type="button" class="tab" data-tab="overview">2. Конвейер и сбор</button>
-    <button type="button" class="tab" data-tab="agent">3. Очередь ИИ-агента <span class="badge-cnt" id="tabAgentCnt">0</span></button>
-    <button type="button" class="tab" data-tab="drafts">4. Черновики <span class="badge-cnt" id="tabDraftsCnt">0</span></button>
-    <button type="button" class="tab" data-tab="companies">5. Компании и ЛПР</button>
-    <button type="button" class="tab" data-tab="signals">6. Сигналы РФ (28)</button>
-  </nav>
+  <main class="shell">
+    <!-- Глобальный индикатор выполнения задачи с живым прогрессом -->
+    <div id="live-job-card" class="job-card hidden" role="status" aria-live="polite">
+      <div class="job-header">
+        <div class="job-title-wrap">
+          <span class="job-spinner" id="job-spinner"></span>
+          <div>
+            <div class="job-title" id="job-title">Выполнение операции</div>
+            <div class="job-stage" id="job-stage">Подготовка…</div>
+          </div>
+        </div>
+        <div class="job-percent" id="job-percent">0%</div>
+      </div>
+      <div class="job-bar-track">
+        <div class="job-bar-fill" id="job-bar-fill" style="width: 0%"></div>
+      </div>
+      <div class="job-steps" id="job-steps"></div>
+    </div>
 
-  <main class="container">
-    <div id="toast" class="toast hidden"></div>
-    <div id="statusBar" class="status-bar hidden"></div>
+    <!-- РАЗДЕЛ 1: ПРОЕКТ -->
+    <section id="tab-project" class="view active">
+      <div class="surface">
+        <div class="surface-head">
+          <div>
+            <h1 class="surface-title">Настройка проекта</h1>
+            <p class="surface-sub">Укажите сайт и опишите ваш продукт — система сформирует портрет клиентов и поисковые запросы.</p>
+          </div>
+          <div class="preset-strip" id="niche-presets-bar"></div>
+        </div>
 
-    <!-- 1. НИША И ПРОДУКТ (ШАГ 1) -->
-    <section class="panel active" id="tab-niche">
-      <div class="callout" id="nicheCallout">
-        <div>
-          <strong id="nicheCalloutTitle">Шаг 1. Обучите F.R.I.D.A.Y. вашему продукту и целевой нише</strong>
-          <p id="nicheCalloutDesc">
-            Система универсальна для любой сферы бизнеса в РФ. Отправьте сайт/бриф на разбор ИИ-агенту рабочей среды, примените готовый шаблон для примера или заполните анкету ниже — настройки сохранятся в <code>friday.local.yaml</code> и <code>skills/product_knowledge.md</code>.
-          </p>
+        <div class="grid-2">
+          <label class="field">
+            <span class="field-label">Сайт вашего проекта</span>
+            <input id="train-website" type="text" placeholder="https://company.ru" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span class="field-label">Целевая аудитория</span>
+            <input id="train-niche-hint" type="text" placeholder="Например: Адвокаты и адвокатские бюро" autocomplete="off" />
+          </label>
+          <label class="field span-2">
+            <span class="field-label">Описание продукта или услуги</span>
+            <textarea id="train-brief" rows="3" placeholder="Чем вы помогаете клиентам, ключевые услуги и формат первого шага"></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">Города поиска</span>
+            <input id="train-cities" type="text" placeholder="Москва, Санкт-Петербург, Екатеринбург, Казань" />
+          </label>
+          <div class="field field-end">
+            <button type="button" id="btn-train-niche" class="primary-btn full-w">
+              Сформировать профиль
+            </button>
+          </div>
         </div>
       </div>
 
-      <div class="grid-2">
-        <div class="card">
-          <h2>Вариант 1А. Обучить через ИИ-агента по сайту или брифу</h2>
-          <p class="muted">
-            Система скачает доступные страницы вашего сайта ($0, SSRF-safe) и передаст задачу настройки ниши ИИ-агенту вашей рабочей среды — он сам заполнит профиль продукта, ICP и поисковые запросы.
-          </p>
-          <form id="formTrainAgent" class="form-stack" novalidate>
-            <label>Сайт вашего продукта / компании (необязательно, если есть описание)
-              <input type="text" id="trWebsite" placeholder="https://ваш-продукт.рф" />
-            </label>
-            <label>Кому вы продаёте в РФ (целевая ниша)
-              <input type="text" id="trNiche" placeholder="Например: производственные и оптовые компании с отделом продаж от 5 человек" />
-            </label>
-            <label>Кратко о вашем продукте и какую боль он закрывает
-              <textarea id="trBrief" rows="3" placeholder="Например: Внедряем сквозную аналитику и CRM за 14 дней, чтобы заявки с Яндекс.Директа и карт не терялись..."></textarea>
-            </label>
-            <label>Целевые города РФ (через запятую)
-              <input type="text" id="trCities" value="Москва, Санкт-Петербург, Екатеринбург, Казань" />
-            </label>
-            <div>
-              <button type="submit" class="btn btn-primary" id="btnSubmitTrain">Отправить на настройку ИИ-агенту</button>
-            </div>
-          </form>
+      <div class="surface">
+        <div class="surface-head">
+          <div>
+            <h2 class="surface-title">Параметры профиля</h2>
+            <p class="surface-sub">Используются при поиске компаний, оценке релевантности и подготовке писем.</p>
+          </div>
+          <button type="button" id="btn-save-niche" class="secondary-btn">Сохранить изменения</button>
         </div>
 
-        <div class="card">
-          <h2>Готовые примеры ниш РФ (1 клик)</h2>
-          <p class="muted">
-            Можно сразу применить любой шаблон ниже для проверки конвейера или подставить его в анкету для редактирования под себя:
-          </p>
-          <div id="presetList" class="preset-list"></div>
-        </div>
-      </div>
-
-      <div class="card" id="cardNicheForm">
-        <h2>Прямая анкета продукта, целевой ниши (ICP) и правил ФЗ-38</h2>
-        <form id="formSaveNiche" class="form-stack" novalidate>
-          <div class="grid-3">
-            <label>Название вашей компании *
-              <input type="text" id="nsBizName" placeholder="ООО «Вектор»" />
+        <div class="grid-2">
+          <div class="subpanel">
+            <h3 class="subpanel-title">Отправитель и предложение</h3>
+            <label class="field">
+              <span class="field-label">Название компании / бренда</span>
+              <input id="cfg-persona-company" type="text" placeholder="Название вашей компании" />
             </label>
-            <label>Сайт вашего продукта
-              <input type="text" id="nsBizWebsite" placeholder="https://example.ru" />
-            </label>
-            <label>Название продукта / услуги *
-              <input type="text" id="nsProdName" placeholder="Внедрение CRM / Логистика / Поставки..." />
-            </label>
-          </div>
-
-          <div class="grid-2">
-            <label>Описание продукта и какую задачу он решает *
-              <textarea id="nsProdDesc" rows="2" placeholder="Настраиваем связку сайта, телефонии и CRM за 14 дней..."></textarea>
-            </label>
-            <label>Ключевые выгоды (по одной на строке)
-              <textarea id="nsProdBenefits" rows="2" placeholder="Фиксация всех звонков и мессенджеров в CRM&#10;Запуск за 14 дней"></textarea>
-            </label>
-          </div>
-
-          <div class="grid-3">
-            <label>Мягкий первый шаг (Entry Offer в конце письма) *
-              <input type="text" id="nsProdEntry" placeholder="прислать короткий разбор из 3 пунктов в чат" />
-            </label>
-            <label>Ценовая модель / условия (необязательно)
-              <input type="text" id="nsProdPricing" placeholder="от 50 000 ₽ или расчёт под проект" />
-            </label>
-            <label>Специальный отраслевой фильтр ФЗ-38 «О рекламе»
-              <select id="nsRegulated">
-                <option value="none">Стандартный B2B / услуги / торговля / IT (общие правила ст. 5 и 18 ФЗ-38)</option>
-                <option value="medicine">Медицина, клиники, медоборудование (ст. 24 ФЗ-38)</option>
-                <option value="finance">Финансы, лизинг, инвестиции, страхование (ст. 28 ФЗ-38)</option>
-                <option value="legal_advocates">Адвокатские образования (ФЗ-63 и КПЭА)</option>
-              </select>
-            </label>
-          </div>
-
-          <hr class="sep" />
-
-          <div class="grid-2">
-            <label>Описание целевой ниши (ICP) *
-              <input type="text" id="nsIcpNiche" placeholder="Оптовые и производственные компании РФ..." />
-            </label>
-            <label>Отрасли клиентов (через запятую)
-              <input type="text" id="nsIcpIndustries" placeholder="Производство, Оптовая торговля, Логистика" />
-            </label>
-          </div>
-
-          <div class="grid-2">
-            <label>Поисковые запросы для Яндекса / 2ГИС / hh.ru (по одному на строке) *
-              <textarea id="nsIcpQueries" rows="3" placeholder="производство металлоконструкций&#10;оптовый поставщик стройматериалов"></textarea>
-            </label>
-            <label>Города РФ (через запятую)
-              <textarea id="nsIcpCities" rows="3" placeholder="Москва, Санкт-Петербург, Екатеринбург, Казань"></textarea>
-            </label>
-          </div>
-
-          <div class="grid-2">
-            <label>Целевые должности ЛПР на сайтах (через запятую)
-              <input type="text" id="nsIcpTitles" placeholder="коммерческий директор, руководитель отдела продаж, генеральный директор, основатель" />
-            </label>
-            <label>Сигнальные вакансии на hh.ru (через запятую — бесплатный поиск по найму)
-              <input type="text" id="nsIcpHiring" placeholder="менеджер по продажам, руководитель отдела продаж, закупщик" />
-            </label>
-          </div>
-
-          <hr class="sep" />
-
-          <div class="grid-3">
-            <label>Имя отправителя (подпись в черновиках)
-              <input type="text" id="nsSenderName" placeholder="Алексей Смирнов" />
-            </label>
-            <label>Должность отправителя
-              <input type="text" id="nsSenderTitle" placeholder="Руководитель проектов" />
-            </label>
-            <label>Telegram / контакт отправителя
-              <input type="text" id="nsSenderTg" placeholder="@alex_smirnov" />
-            </label>
-          </div>
-
-          <div class="btn-row">
-            <button type="submit" class="btn btn-primary" id="btnSubmitSaveNiche">Сохранить нишу и продукт (friday.local.yaml)</button>
-          </div>
-        </form>
-      </div>
-
-      <div class="card">
-        <h2>Активная база знаний продукта (<code>skills/product_knowledge.md</code>)</h2>
-        <pre id="productSkillPreview" class="code-preview">Пока не создана — сохраните настройки ниши выше или отправьте сайт/бриф ИИ-агенту.</pre>
-      </div>
-    </section>
-
-    <!-- 2. КОНВЕЙЕР И СБОР -->
-    <section class="panel" id="tab-overview">
-      <div class="kpi-grid" id="kpiGrid"></div>
-
-      <div class="grid-2">
-        <div class="card">
-          <h2>Этапы конвейера ($0 сбор + Мозг ИИ-агента)</h2>
-          <p class="muted">
-            Каждый этап работает независимо через общую SQLite (WAL). Автоматической рассылки нет — система исследует рынок и готовит проверенные черновики.
-          </p>
-          <div class="btn-row">
-            <button type="button" class="btn" id="btnRunProfile">1. Профилировать сайты ($0)</button>
-            <button type="button" class="btn" id="btnRunProspects">2. Найти ЛПР и ФИО ($0)</button>
-            <button type="button" class="btn" id="btnRunScore">3. Скоринг ICP</button>
-            <button type="button" class="btn btn-accent" id="btnRunScoreAi">3+. Углублённый скоринг (ИИ-агенту)</button>
-          </div>
-          <div class="btn-row" style="margin-top:10px">
-            <button type="button" class="btn btn-primary" id="btnQueueDraftsTg">4. Черновики Telegram (ИИ-агенту)</button>
-            <button type="button" class="btn btn-primary" id="btnQueueDraftsEmail">4. Черновики Email (ИИ-агенту)</button>
-            <button type="button" class="btn btn-ghost" id="btnPreviewTemplateTg">Быстрый шаблон-предпросмотр</button>
-          </div>
-          <hr class="sep" />
-          <div class="btn-row">
-            <button type="button" class="btn btn-ok" id="btnSeedSample">Загрузить 2 тестовые карточки под выбранную нишу</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Поиск компаний в РФ или импорт файла</h2>
-          <form id="formDiscover" class="form-stack" novalidate>
-            <div class="grid-2">
-              <label>Поисковый запрос (из ниши или свой)
-                <input type="text" id="inpQuery" placeholder="Например: производство упаковки" />
+            <div class="grid-2 compact">
+              <label class="field">
+                <span class="field-label">Имя отправителя</span>
+                <input id="cfg-persona-name" type="text" placeholder="Алексей Смирнов" />
               </label>
-              <label>Город РФ
-                <input type="text" id="inpCity" placeholder="Москва" />
+              <label class="field">
+                <span class="field-label">Должность</span>
+                <input id="cfg-persona-role" type="text" placeholder="Руководитель проектов" />
               </label>
             </div>
-            <div class="grid-2">
-              <label>Источник обнаружения
-                <select id="selProvider">
-                  <option value="auto">Авто (Яндекс/2ГИС + hh.ru + веб Рунета)</option>
-                  <option value="hh_ru">HeadHunter (api.hh.ru — бесплатно по вакансиям)</option>
-                  <option value="ddg_ru">Веб-поиск Рунета (бесплатно, без агрегаторов)</option>
-                  <option value="osm_ru">OpenStreetMap Организации РФ (бесплатно)</option>
-                  <option value="yandex_search">Яндекс Поиск v2 (позиции 11–30, нужен ключ)</option>
-                  <option value="twogis">2ГИС Справочник (нужен ключ)</option>
-                  <option value="yandex_maps">Яндекс Карты (нужен ключ)</option>
+            <div class="grid-2 compact">
+              <label class="field">
+                <span class="field-label">Telegram</span>
+                <input id="cfg-persona-telegram" type="text" placeholder="@username" />
+              </label>
+              <label class="field">
+                <span class="field-label">Сайт</span>
+                <input id="cfg-persona-website" type="text" placeholder="https://..." />
+              </label>
+            </div>
+            <label class="field">
+              <span class="field-label">Продукт / услуга</span>
+              <input id="cfg-product-name" type="text" placeholder="Краткое название продукта" />
+            </label>
+            <label class="field">
+              <span class="field-label">Суть предложения</span>
+              <textarea id="cfg-product-desc" rows="3" placeholder="Лаконичное описание ценности для клиента"></textarea>
+            </label>
+            <label class="field">
+              <span class="field-label">Предлагаемый первый шаг</span>
+              <input id="cfg-offer-entry" type="text" placeholder="прислать короткий разбор из 3 точек роста" />
+            </label>
+          </div>
+
+          <div class="subpanel">
+            <h3 class="subpanel-title">Аудитория и критерии поиска</h3>
+            <label class="field">
+              <span class="field-label">Целевой сегмент</span>
+              <input id="cfg-icp-niche" type="text" placeholder="Сегмент компаний" />
+            </label>
+            <label class="field">
+              <span class="field-label">Поисковые запросы (по одному в строке)</span>
+              <textarea id="cfg-icp-queries" rows="4" placeholder="адвокатское бюро&#10;коллегия адвокатов"></textarea>
+            </label>
+            <label class="field">
+              <span class="field-label">Города (через запятую)</span>
+              <input id="cfg-icp-cities" type="text" placeholder="Москва, Санкт-Петербург" />
+            </label>
+            <label class="field">
+              <span class="field-label">Целевые должности ЛПР (через запятую)</span>
+              <input id="cfg-icp-titles" type="text" placeholder="управляющий партнёр, генеральный директор" />
+            </label>
+            <div class="grid-2 compact">
+              <label class="field">
+                <span class="field-label">Сигнальные вакансии</span>
+                <input id="cfg-icp-hiring" type="text" placeholder="маркетолог, РОП" />
+              </label>
+              <label class="field">
+                <span class="field-label">Отраслевой режим</span>
+                <select id="cfg-regulated">
+                  <option value="none">Стандартный B2B</option>
+                  <option value="legal_advocates">Адвокатура и право</option>
+                  <option value="medicine">Медицина и клиники</option>
+                  <option value="finance">Финансовый сектор</option>
                 </select>
               </label>
-              <label>Лимит компаний
-                <input type="number" id="inpLimit" value="15" min="1" max="50" />
-              </label>
             </div>
-            <div>
-              <button type="submit" class="btn btn-primary" id="btnSubmitDiscover">Найти компании ($0)</button>
-            </div>
-          </form>
-
-          <hr class="sep" />
-
-          <form id="formUpload" class="form-inline" novalidate>
-            <input type="file" id="inpFile" accept=".csv,.json,.jsonl,.txt" />
-            <button type="submit" class="btn" id="btnSubmitUpload">Импортировать CSV / JSON / TXT</button>
-          </form>
-          <p class="muted" style="margin-top:6px;margin-bottom:0">
-            Поддерживаются выгрузки Контур.Компас, СБИС, 2ГИС, Rusprofile или текстовый список доменов <code>.ru</code> / <code>.рф</code>.
-          </p>
+          </div>
         </div>
+
+        <details class="clean-details">
+          <summary>Дополнительные параметры и база знаний</summary>
+          <div class="details-body grid-2">
+            <label class="field">
+              <span class="field-label">Отрасли (через запятую)</span>
+              <input id="cfg-icp-industries" type="text" placeholder="Юридические услуги, Консалтинг" />
+            </label>
+            <label class="field">
+              <span class="field-label">Ориентир стоимости</span>
+              <input id="cfg-product-pricing" type="text" placeholder="по расчёту проекта" />
+            </label>
+            <label class="field span-2">
+              <span class="field-label">Преимущества (по одному в строке)</span>
+              <textarea id="cfg-product-benefits" rows="2"></textarea>
+            </label>
+            <label class="field span-2">
+              <span class="field-label">Памятка по продукту</span>
+              <textarea id="cfg-skill-md" rows="5"></textarea>
+            </label>
+          </div>
+        </details>
       </div>
     </section>
 
-    <!-- 3. ОЧЕРЕДЬ ЗАДАЧ ИИ-АГЕНТА -->
-    <section class="panel" id="tab-agent">
-      <div class="card">
-        <div class="toolbar" style="margin-bottom:0">
-          <div>
-            <h2>Очередь задач ИИ-агента рабочей среды</h2>
-            <p class="muted" style="margin-bottom:0">
-              Ручное копирование промптов и вставка JSON не требуются: ИИ-агент вашей рабочей среды сам забирает задачи из очереди, выполняет настройку ниши, скоринг или подготовку черновиков (с автоматической проверкой шлюза ФЗ-38), а панель обновляет статус автоматически.
-            </p>
-          </div>
-          <div class="filters">
-            <select id="fltTaskStatus">
-              <option value="pending">Ожидают агента</option>
-              <option value="completed">Выполненные</option>
-              <option value="all">Все задачи</option>
-            </select>
-          </div>
+    <!-- РАЗДЕЛ 2: ПОИСК И БАЗА -->
+    <section id="tab-workspace" class="view">
+      <div class="metrics-row">
+        <div class="metric-card">
+          <span class="metric-label">Компании</span>
+          <strong class="metric-value" id="kpi-companies">0</strong>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Руководители</span>
+          <strong class="metric-value" id="kpi-prospects">0</strong>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Сигналы</span>
+          <strong class="metric-value" id="kpi-observations">0</strong>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Черновики</span>
+          <strong class="metric-value" id="kpi-drafts">0</strong>
         </div>
       </div>
 
-      <div id="agentTasksList" class="drafts-list"></div>
-    </section>
-
-    <!-- 4. ЧЕРНОВИКИ -->
-    <section class="panel" id="tab-drafts">
-      <div class="toolbar">
-        <div class="filters">
-          <select id="fltDraftStatus">
-            <option value="">Все статусы</option>
-            <option value="pending_review">На проверке (pending_review)</option>
-            <option value="approved">Одобрено к ручной отправке (approved)</option>
-            <option value="sent_manually">Отправлено вручную (sent_manually)</option>
-            <option value="gate_blocked">Заблокировано шлюзом ФЗ-38 (gate_blocked)</option>
-            <option value="rejected">Отклонено (rejected)</option>
+      <div class="surface">
+        <div class="search-toolbar">
+          <input id="inp-query" class="flex-2" type="text" placeholder="Поисковый запрос (или по умолчанию из профиля)" />
+          <input id="inp-city" class="flex-1" type="text" placeholder="Город" />
+          <select id="sel-provider" class="w-source">
+            <option value="auto">Все источники</option>
+            <option value="hh">HeadHunter</option>
+            <option value="web">Веб-поиск</option>
+            <option value="yandex_search">Яндекс Поиск</option>
+            <option value="twogis">2ГИС</option>
+            <option value="yandex_maps">Яндекс Карты</option>
           </select>
-          <select id="fltDraftChannel">
+          <button type="button" id="btn-discover" class="primary-btn">Найти компании</button>
+        </div>
+
+        <div class="pipeline-bar">
+          <div class="pipeline-left">
+            <input id="inp-import-file" type="file" accept=".csv,.json,.jsonl,.txt" class="sr-only" />
+            <button type="button" id="btn-trigger-upload" class="ghost-btn">Импорт списка</button>
+            <button type="button" id="btn-enrich" class="ghost-btn">Обновить сайты и ЛПР</button>
+            <button type="button" id="btn-sample" class="ghost-btn">Демо-данные</button>
+          </div>
+          <div class="pipeline-right">
+            <select id="sel-draft-channel" class="compact-select">
+              <option value="telegram">Telegram</option>
+              <option value="email">Email</option>
+              <option value="whatsapp">WhatsApp</option>
+            </select>
+            <button type="button" id="btn-generate-drafts" class="secondary-btn accent-border">
+              Создать черновики
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="surface">
+        <div class="subview-bar">
+          <div class="segmented" id="db-subtabs">
+            <button type="button" class="seg-btn active" data-subview="companies">Компании</button>
+            <button type="button" class="seg-btn" data-subview="prospects">Руководители (ЛПР)</button>
+          </div>
+          <div class="cohort-inline" id="cohort-controls">
+            <input id="inp-require-codes" type="text" placeholder="Фильтр по коду сигнала…" />
+            <button type="button" id="btn-filter-cohort" class="ghost-btn sm">Применить</button>
+          </div>
+        </div>
+
+        <div id="subview-companies">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Компания</th>
+                  <th>Город</th>
+                  <th>Контакты</th>
+                  <th>Сигналы</th>
+                  <th>Источник</th>
+                </tr>
+              </thead>
+              <tbody id="companies-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div id="subview-prospects" class="hidden">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ФИО</th>
+                  <th>Должность</th>
+                  <th>Компания</th>
+                  <th>Каналы связи</th>
+                  <th>Оценка</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="prospects-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- РАЗДЕЛ 3: ЧЕРНОВИКИ -->
+    <section id="tab-drafts" class="view">
+      <div class="surface">
+        <div class="drafts-toolbar">
+          <div class="segmented" id="draft-status-pills">
+            <button type="button" class="seg-btn active" data-status="">Все</button>
+            <button type="button" class="seg-btn" data-status="pending_review">На проверке</button>
+            <button type="button" class="seg-btn" data-status="approved">Одобрены</button>
+            <button type="button" class="seg-btn" data-status="sent_manually">Отправлены</button>
+            <button type="button" class="seg-btn" data-status="rejected">Отклонены</button>
+          </div>
+          <select id="flt-draft-channel" class="compact-select">
             <option value="">Все каналы</option>
             <option value="telegram">Telegram</option>
             <option value="email">Email</option>
             <option value="whatsapp">WhatsApp</option>
           </select>
         </div>
-        <div class="muted">Проверка человеком и ручная отправка 1-на-1 обязательны (ст. 18 ФЗ-38 «О рекламе»)</div>
-      </div>
-      <div id="draftsList" class="drafts-list"></div>
-    </section>
 
-    <!-- 5. КОМПАНИИ И ЛПР -->
-    <section class="panel" id="tab-companies">
-      <div class="card">
-        <h2>Фильтр когорты компаний по сигналам Рунета</h2>
-        <div class="form-inline">
-          <input type="text" id="inpCohortRequire" placeholder="Обязательные коды (напр. HH_HIRING_ROLE,NO_ONLINE_CAPTURE)" />
-          <input type="text" id="inpCohortExclude" placeholder="Исключить коды (напр. SITE_UNREACHABLE)" />
-          <button type="button" class="btn btn-primary" id="btnApplyCohort">Применить фильтр</button>
-          <button type="button" class="btn btn-ghost" id="btnResetCohort">Сбросить</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Компании (<span id="cntCompanies">0</span>)</h2>
-        <div class="table-wrap">
-          <table class="data-table" id="tblCompanies">
-            <thead>
-              <tr>
-                <th>Компания / ИНН</th>
-                <th>Отрасль</th>
-                <th>Город</th>
-                <th>Сайт / Площадки</th>
-                <th>Стек Рунета</th>
-                <th>Сигналы</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Лица, принимающие решения — ЛПР (<span id="cntProspects">0</span>)</h2>
-        <div class="table-wrap">
-          <table class="data-table" id="tblProspects">
-            <thead>
-              <tr>
-                <th>Балл ICP</th>
-                <th>ФИО и должность</th>
-                <th>Компания / Отрасль</th>
-                <th>Публичные контакты</th>
-                <th>Угол персонализации (Scout)</th>
-                <th>Черновик</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
+        <div id="drafts-list" class="drafts-stack"></div>
       </div>
     </section>
 
-    <!-- 6. СИГНАЛЫ -->
-    <section class="panel" id="tab-signals">
-      <div class="card">
-        <h2>Каталог сигналов российского рынка (28 универсальных сигналов)</h2>
-        <p class="muted">
-          Коллекторы записывают в таблицу <code>observations</code> только те сигналы,
-          которые имеют статус <strong>confirmed</strong>. Вы можете включать и отключать любые сигналы под свою нишу.
-        </p>
+    <!-- РАЗДЕЛ 4: СИГНАЛЫ -->
+    <section id="tab-signals" class="view">
+      <div class="surface">
+        <div class="surface-head">
+          <div>
+            <h2 class="surface-title">Каталог сигналов</h2>
+            <p class="surface-sub">Выберите коммерческие и технические признаки, которые учитываются при отборе компаний.</p>
+          </div>
+        </div>
         <div class="table-wrap">
-          <table class="data-table" id="tblSignals">
+          <table>
             <thead>
               <tr>
-                <th>Код сигнала</th>
+                <th>Сигнал</th>
                 <th>Категория</th>
-                <th>Название и смысл для продаж</th>
-                <th>Коллектор</th>
+                <th>Описание</th>
                 <th>Статус</th>
-                <th>Управление</th>
+                <th></th>
               </tr>
             </thead>
-            <tbody></tbody>
+            <tbody id="signals-tbody"></tbody>
           </table>
         </div>
       </div>
     </section>
   </main>
 
-  <script src="/static/app.js"></script>
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>

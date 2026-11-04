@@ -1,13 +1,4 @@
-"""Шаг 1: обучение F.R.I.D.A.Y. продукту пользователя и целевой нише РФ.
-
-Поддерживает два сценария настройки:
-1. Интеллектуальный разбор через ИИ-агента рабочей среды (`friday train <url_или_описание>`):
-   Python скачивает главную и ключевые страницы сайта пользователя ($0, SSRF-safe),
-   оборачивает текст в `<untrusted>` и ставит задачу `train_niche` для ИИ-агента.
-   Агент формирует `friday.local.yaml`, `skills/product_knowledge.md` и `skills/competitive_intel.md`.
-2. Прямое сохранение анкеты ниши и продукта (через веб-интерфейс или CLI),
-   которое сразу записывает `friday.local.yaml` и `skills/product_knowledge.md`.
-"""
+"""Настройка проекта под продукт пользователя и целевую нишу рынка РФ."""
 
 from __future__ import annotations
 
@@ -17,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from friday.config import FridayConfig, load_config, save_local_config
+from friday.gate import display_domain
 from friday.paths import LOCAL_CONFIG_PATH, SKILLS_DIR
 from friday.public_http import PublicHttpError, SafePublicHttpClient
 from friday.untrusted import UNTRUSTED_RULE, wrap_untrusted
@@ -35,40 +27,40 @@ KEY_SUBPAGE_HINTS = (
     "pricing", "tarify", "price", "tseny", "cases", "kejsy",
 )
 
-# Примеры шаблонов для быстрой подстановки в мастере настройки (база НЕ предзаполнена ими)
 NICHE_TEMPLATES_RU: list[dict] = [
     {
         "id": "b2b_crm_integrator",
-        "label": "B2B IT / Интеграция CRM и сквозной аналитики",
+        "short_label": "IT и CRM",
+        "label": "Внедрение CRM и сквозной аналитики",
         "regulated_niche": "none",
         "persona": {
             "name": "Алексей Смирнов",
-            "company": "КонтурПоток Интеграция",
-            "role": "Руководитель проектов внедрения",
-            "telegram": "@konturpotok_crm",
+            "company": "КонтурПоток",
+            "role": "Руководитель проектов",
+            "telegram": "@konturpotok",
             "website": "https://example-crm.ru",
         },
         "product": {
-            "name": "Внедрение amoCRM / Битрикс24 и сквозной аналитики за 14 дней",
-            "category": "B2B IT / Автоматизация продаж",
+            "name": "Внедрение amoCRM / Битрикс24 и сквозной аналитики",
+            "category": "Автоматизация продаж",
             "description": (
-                "Настраиваем связку сайта, телефонии, мессенджеров и CRM, "
-                "чтобы заявки с Яндекс.Директа и карт не терялись между менеджерами."
+                "Настраиваем связку сайта, телефонии, мессенджеров и CRM за 14 дней, "
+                "чтобы обращения с рекламы и карт не терялись между менеджерами."
             ),
-            "pricing": "от 65 000 ₽ за проект под ключ",
+            "pricing": "от 65 000 ₽ за проект",
             "key_benefits": [
-                "Автоматическая фиксация всех звонков, форм и чатов Telegram/WhatsApp в CRM",
-                "Прозрачная воронка для РОПа и собственника без таблиц Excel",
+                "Автоматическая фиксация всех звонков, форм и чатов в CRM",
+                "Прозрачная воронка продаж без ручных таблиц",
             ],
             "offer": {
-                "entry": "прислать короткий 5-минутный разбор пути заявки на вашем сайте из 3 пунктов без созвона",
+                "entry": "прислать короткий разбор пути заявки на вашем сайте из 3 пунктов",
                 "goal": "send_audit",
             },
         },
         "icp": {
-            "niche": "Оптовые, производственные и сервисные компании РФ с отделом продаж",
+            "niche": "Производственные и оптовые компании с отделом продаж",
             "industries": ["Производство", "Оптовая торговля", "Строительные услуги"],
-            "cities": ["Москва", "Санкт-Петербург", "Екатеринбург", "Казань", "Новосибирск"],
+            "cities": ["Москва", "Санкт-Петербург", "Екатеринбург", "Казань"],
             "search_queries": [
                 "производство металлоконструкций",
                 "оптовая поставка стройматериалов",
@@ -88,35 +80,36 @@ NICHE_TEMPLATES_RU: list[dict] = [
     },
     {
         "id": "marketing_seo_ru",
-        "label": "Маркетинговое / SEO и геомаркетинговое агентство",
+        "short_label": "Маркетинг и SEO",
+        "label": "Разработка сайтов, SEO и геомаркетинг",
         "regulated_niche": "none",
         "persona": {
             "name": "Мария Власова",
             "company": "ГеоРост Digital",
             "role": "Руководитель поискового направления",
-            "telegram": "@georost_seo",
+            "telegram": "@georost",
             "website": "https://example-agency.ru",
         },
         "product": {
-            "name": "Продвижение в Яндекс Поиске и геосервисах (2ГИС, Яндекс Карты)",
-            "category": "Поисковый и локальный маркетинг",
+            "name": "Поисковое продвижение в Яндексе и геосервисах",
+            "category": "Поисковый маркетинг и разработка",
             "description": (
-                "Выводим локальный бизнес и сети услуг на первую страницу Яндекса и в топ карточек 2ГИС / Яндекс Карт "
-                "за счёт отдельных посадочных страниц под услуги и работы с репутацией."
+                "Создаём посадочные страницы под структуру спроса и выводим компании "
+                "в топ органической выдачи Яндекса и карточек 2ГИС / Яндекс Карт."
             ),
             "pricing": "от 55 000 ₽/мес",
             "key_benefits": [
-                "Рост органических обращений из Яндекса и карт без перегрева ставок в Директе",
-                "Проработка структуры посадочных под коммерческий спрос",
+                "Рост целевых обращений из поиска без перегрева ставок в рекламе",
+                "Понятный поэтапный план работ под приоритетные услуги",
             ],
             "offer": {
-                "entry": "прислать список из 3 точек потери органического трафика по вашему домену и карточке",
+                "entry": "прислать короткий аудит из 3 точек роста поискового трафика по вашему сайту",
                 "goal": "send_audit",
             },
         },
         "icp": {
-            "niche": "Локальные сети услуг, стоматологии, автосервисы и частные центры",
-            "industries": ["Локальные услуги", "Автобизнес", "Частные клиники"],
+            "niche": "Частные клиники, профильные центры и сервисные компании",
+            "industries": ["Локальные услуги", "Частные клиники", "Автобизнес"],
             "cities": ["Москва", "Санкт-Петербург", "Краснодар", "Нижний Новгород"],
             "search_queries": [
                 "стоматологическая клиника",
@@ -137,35 +130,36 @@ NICHE_TEMPLATES_RU: list[dict] = [
     },
     {
         "id": "b2b_logistics_ved",
-        "label": "Логистика, фулфилмент и ВЭД",
+        "short_label": "Логистика и ВЭД",
+        "label": "Международная логистика и таможенное оформление",
         "regulated_niche": "none",
         "persona": {
             "name": "Дмитрий Орлов",
             "company": "ВостокТранс ВЭД",
             "role": "Директор по работе с корпоративными клиентами",
-            "telegram": "@vostoktrans_ved",
+            "telegram": "@vostoktrans",
             "website": "https://example-ved.ru",
         },
         "product": {
-            "name": "Международная логистика, белая доставка и таможенное оформление",
+            "name": "Международная логистика и белое таможенное оформление",
             "category": "Логистика и ВЭД",
             "description": (
-                "Организуем прямые поставки комплектующих и оборудования с прозрачными валютными платежами "
+                "Организуем прямые поставки комплектующих и оборудования с прозрачными расчётами "
                 "и полным комплектом закрывающих документов и ГТД."
             ),
-            "pricing": "расчёт ставки под маршрут за 2 часа",
+            "pricing": "расчёт маршрута за 2 часа",
             "key_benefits": [
-                "Фиксированные сроки прохождения границы и белое таможенное оформление",
-                "Отсрочка и страхование груза на всём плече",
+                "Прогнозируемые сроки прохождения границы и таможни",
+                "Страхование груза на всём маршруте",
             ],
             "offer": {
-                "entry": "сделать расчёт альтернативного маршрута и ставки на одной вашей типовой партии",
+                "entry": "сделать расчёт альтернативного маршрута и ставки на одной типовой партии",
                 "goal": "get_reply",
             },
         },
         "icp": {
-            "niche": "Торговые дома, дистрибьюторы и производители с импортом комплектующих",
-            "industries": ["Дистрибуция", "Импорт оборудования", "Электроника и комплектующие"],
+            "niche": "Торговые дома, дистрибьюторы и импортёры оборудования",
+            "industries": ["Дистрибуция", "Импорт оборудования", "Комплектующие"],
             "cities": ["Москва", "Санкт-Петербург", "Владивосток", "Екатеринбург"],
             "search_queries": [
                 "оптовый поставщик промышленной фурнитуры",
@@ -187,29 +181,30 @@ NICHE_TEMPLATES_RU: list[dict] = [
     },
     {
         "id": "horeca_retail_supply",
-        "label": "Поставки и B2B-сервис для HoReCa и ритейла",
+        "short_label": "HoReCa и ритейл",
+        "label": "Поставки и сервис для ресторанов и кофеен",
         "regulated_niche": "none",
         "persona": {
             "name": "Екатерина Морозова",
-            "company": "ПрофХорека Сервис",
+            "company": "ПрофХорека",
             "role": "Руководитель отдела HoReCa",
-            "telegram": "@profhoreca_b2b",
+            "telegram": "@profhoreca",
             "website": "https://example-horeca.ru",
         },
         "product": {
-            "name": "Поставка ингредиентов / кофейного оборудования и сервис 24/7 для заведений",
+            "name": "Поставка ингредиентов, оборудования и сервис 24/7 для заведений",
             "category": "Поставки для HoReCa",
             "description": (
                 "Бесперебойные поставки для кофеен, пекарен и ресторанов с отсрочкой платежа "
-                "и выездом инженера с подменным оборудованием в день обращения."
+                "и подменным оборудованием в день обращения."
             ),
-            "pricing": "оптовый прайс от 15 000 ₽ заказа",
+            "pricing": "оптовый прайс от 15 000 ₽",
             "key_benefits": [
                 "Подменное оборудование в день заявки без простоя точки",
-                "Стабильная обжарка и матрица позиций под сетевые стандарты",
+                "Стабильная матрица позиций под сетевые стандарты",
             ],
             "offer": {
-                "entry": "отправить актуальный оптовый прайс и привезти бесплатный дегустационный сет",
+                "entry": "отправить актуальный оптовый прайс и привезти дегустационный сет",
                 "goal": "get_reply",
             },
         },
@@ -246,7 +241,7 @@ def _clean_html_text(html: str, max_chars: int = 4000) -> str:
     return cleaned[:max_chars]
 
 
-async def crawl_product_site(website_url: str) -> dict:
+async def crawl_product_site(website_url: str, *, timeout: float = 5.0) -> dict:
     """Безопасно скачивает главную и до 2 ключевых подстраниц сайта продукта пользователя."""
     url = website_url.strip()
     if not url:
@@ -255,7 +250,7 @@ async def crawl_product_site(website_url: str) -> dict:
         url = f"https://{url}"
 
     pages: list[dict] = []
-    client = SafePublicHttpClient(timeout=12.0)
+    client = SafePublicHttpClient(timeout=timeout)
     try:
         resp = await client.get(url)
         html = resp.text[:250_000]
@@ -316,29 +311,226 @@ async def crawl_product_site(website_url: str) -> dict:
         await client.close()
 
 
+def _brand_from_url_or_crawl(website: str, crawl: dict) -> str:
+    pages = crawl.get("pages") or []
+    if pages and pages[0].get("title"):
+        raw_title = pages[0]["title"]
+        # Берём первую осмысленную часть до разделителя «— | :»
+        parts = [p.strip() for p in re.split(r"[\|—–:]", raw_title) if p.strip()]
+        if parts and 2 <= len(parts[0]) <= 42:
+            return parts[0]
+    dom = display_domain(website)
+    if dom:
+        stem = dom.split(".")[0].replace("-", " ").replace("_", " ").strip()
+        if stem:
+            return stem.title() if stem.isascii() else stem.capitalize()
+    return "Наш проект"
+
+
+def synthesize_niche_profile(
+    *,
+    website: str = "",
+    crawl: dict | None = None,
+    brief: str = "",
+    niche_hint: str = "",
+    cities: list[str] | None = None,
+) -> dict:
+    """Формирует полный профиль проекта и ICP по сайту, брифу и целевой нише."""
+    crawl = crawl or {}
+    pages = crawl.get("pages") or []
+    site_meta = pages[0].get("meta_description", "") if pages else ""
+    site_headings = " ".join(pages[0].get("headings") or []) if pages else ""
+
+    clean_url = website.strip()
+    if clean_url and not clean_url.startswith(("http://", "https://")):
+        clean_url = f"https://{clean_url}"
+
+    company_name = _brand_from_url_or_crawl(clean_url, crawl)
+    combined_text = f"{niche_hint} {brief} {site_meta} {site_headings}".lower()
+
+    # 1. Определяем регулируемую отрасль ФЗ-38 / КПЭА
+    regulated_niche = "none"
+    if any(k in combined_text for k in ("адвокат", "адвокатск", "коллеги", "кпэа")):
+        regulated_niche = "legal_advocates"
+    elif any(k in combined_text for k in ("клиник", "стоматолог", "медицин", "врач", "косметолог")):
+        regulated_niche = "medicine"
+    elif any(k in combined_text for k in ("инвестиц", "лизинг", "финанс", "кредит", "страхован")):
+        regulated_niche = "finance"
+
+    # 2. Целевая ниша, запросы и роли ЛПР
+    target_niche = niche_hint.strip() or "Компании малого и среднего бизнеса РФ"
+    niche_l = target_niche.lower()
+
+    if any(k in niche_l for k in ("адвокат", "юрист", "юридич", "право")):
+        industries = ["Адвокатские бюро", "Коллегии адвокатов", "Юридические фирмы"]
+        queries = [
+            "адвокатское бюро",
+            "коллегия адвокатов",
+            "адвокат по арбитражным делам",
+            "адвокат по уголовным делам",
+            "юридическая компания сопровождение бизнеса",
+        ]
+        titles = [
+            "управляющий партнёр",
+            "старший партнёр",
+            "председатель коллегии",
+            "руководитель практики",
+            "адвокат",
+        ]
+    elif any(k in niche_l for k in ("стоматолог", "клиник", "медицин", "косметолог")):
+        industries = ["Частные клиники", "Стоматология", "Медицинские центры"]
+        queries = [
+            "стоматологическая клиника",
+            "многопрофильный медицинский центр",
+            "клиника эстетической медицины",
+            "центр имплантации",
+        ]
+        titles = ["главный врач", "управляющий клиникой", "собственник", "директор по маркетингу"]
+    elif any(k in niche_l for k in ("завод", "производств", "металл", "оборудован", "опт")):
+        industries = ["Производство", "Оптовые поставки", "Промышленность"]
+        queries = [
+            target_niche.lower(),
+            "производственная компания",
+            "оптовый поставщик оборудования",
+            "торгово-производственная компания",
+        ]
+        titles = ["генеральный директор", "коммерческий директор", "директор по развитию", "собственник"]
+    elif any(k in niche_l for k in ("ресторан", "кафе", "кофейн", "пекарн", "horeca", "отел")):
+        industries = ["Рестораны и кафе", "Сети кофеен", "Гостиничный бизнес"]
+        queries = ["сеть кофеен", "ресторан", "ремесленная пекарня", "бутик-отель"]
+        titles = ["управляющий", "владелец", "директор по закупкам", "операционный директор"]
+    elif any(k in niche_l for k in ("строй", "девелоп", "ремонт", "ижс", "архитект")):
+        industries = ["Строительство и ИЖС", "Проектирование", "Ремонт коммерческих помещений"]
+        queries = [
+            "строительство загородных домов",
+            "архитектурное бюро",
+            "генподрядная организация",
+            "ремонт коммерческих помещений",
+        ]
+        titles = ["генеральный директор", "коммерческий директор", "главный инженер", "основатель"]
+    else:
+        # Универсальная генерация запросов из формулировки ниши пользователя
+        raw_parts = [p.strip() for p in re.split(r"[,;/]|(?:\s+и\s+)", target_niche) if len(p.strip()) >= 3]
+        queries = list(dict.fromkeys([*(p.lower() for p in raw_parts), target_niche.lower()]))[:5]
+        industries = [p.capitalize() for p in raw_parts[:3]] or [target_niche]
+        titles = [
+            "генеральный директор",
+            "коммерческий директор",
+            "директор по маркетингу",
+            "основатель",
+            "собственник",
+        ]
+
+    # 3. Определяем продукт, категорию, мягкий оффер и сигнальные вакансии hh.ru по брифу
+    brief_clean = brief.strip() or site_meta.strip() or f"Профессиональные решения для сегмента «{target_niche}»"
+    brief_l = brief_clean.lower()
+
+    if any(k in brief_l for k in ("сайт", "seo", "сео", "продвижен", "трафик", "директ", "маркетинг")):
+        prod_category = "Разработка сайтов и поисковое продвижение (SEO)"
+        first_clause = re.split(r"[.!?]", brief_clean)[0].strip()
+        prod_name = first_clause[:90] if 10 <= len(first_clause) <= 95 else f"Разработка сайтов и SEO для ниши «{target_niche}»"
+        entry_offer = "прислать короткий разбор из 3 точек роста структуры сайта и поисковой видимости"
+        hiring_signals = ["маркетолог", "контент-менеджер", "помощник руководителя"]
+        benefits = [
+            "Проектирование структуры страниц под реальный поисковый спрос в Яндексе",
+            "Последовательный план работ с учётом приоритетных направлений и бюджета",
+            "Учёт отраслевых и репутационных ограничений ниши клиента",
+        ]
+    elif any(k in brief_l for k in ("crm", "црм", "битрикс", "amocrm", "аналитик", "автоматизац")):
+        prod_category = "Интеграция CRM и сквозной аналитики"
+        prod_name = f"Внедрение CRM и автоматизация обработки заявок ({company_name})"
+        entry_offer = "прислать короткий разбор пути клиента и точек потери обращений на сайте"
+        hiring_signals = ["менеджер по продажам", "руководитель отдела продаж"]
+        benefits = [
+            "Фиксация всех звонков, мессенджеров и заявок с сайта в едином окне",
+            "Прозрачная аналитика конверсии без ручных таблиц",
+        ]
+    elif any(k in brief_l for k in ("логист", "тамож", "вэд", "доставк", "перевоз")):
+        prod_category = "Логистика и сопровождение поставок"
+        prod_name = f"Логистика и сопровождение поставок ({company_name})"
+        entry_offer = "рассчитать сроки и ставку на вашем типовом маршруте"
+        hiring_signals = ["менеджер по закупкам", "менеджер ВЭД", "логист"]
+        benefits = [
+            "Прозрачный расчёт сроков и полный комплект закрывающих документов",
+            "Контроль груза на каждом участке маршрута",
+        ]
+    else:
+        first_clause = re.split(r"[.!?]", brief_clean)[0].strip()
+        prod_category = "B2B-услуги и решения"
+        prod_name = first_clause[:90] if 8 <= len(first_clause) <= 95 else f"Решения {company_name} для бизнеса"
+        entry_offer = "прислать короткий расчёт и 3 конкретных предложения под ваши задачи"
+        hiring_signals = ["менеджер по продажам", "руководитель направления"]
+        benefits = [
+            "Фокус на измеримом результате и прозрачном плане работ",
+            "Адаптация под специфику и бюджет компании клиента",
+        ]
+
+    target_cities = [c.strip() for c in (cities or []) if c.strip()] or ["Москва", "Санкт-Петербург"]
+
+    competitive_md = (
+        f"# Позиционирование и отстройка: {company_name}\n\n"
+        f"## Целевой сегмент\n"
+        f"- **Ниша**: {target_niche}\n"
+        f"- **География**: {', '.join(target_cities)}\n\n"
+        f"## Чем наше предложение отличается от типовых подрядчиков\n"
+        f"- Глубокое погружение в специфику сегмента «{target_niche}» вместо универсальных потоковых шаблонов.\n"
+        f"- Начинаем с предметного разбора текущей ситуации (точки потери обращений, структура спроса, приоритеты бюджета).\n"
+        f"- Спокойная деловая коммуникация с опорой на проверяемые факты.\n"
+    )
+
+    return {
+        "persona": {
+            "company": company_name,
+            "website": clean_url,
+            "role": "Руководитель проектов",
+        },
+        "product": {
+            "name": prod_name,
+            "category": prod_category,
+            "description": brief_clean,
+            "key_benefits": benefits,
+            "offer": {
+                "entry": entry_offer,
+                "goal": "send_audit",
+            },
+        },
+        "icp": {
+            "niche": target_niche,
+            "industries": industries,
+            "search_queries": queries,
+            "cities": target_cities,
+            "decision_maker_titles": titles,
+            "hiring_signals": hiring_signals,
+        },
+        "compliance": {
+            "regulated_niche": regulated_niche,
+        },
+        "competitive_intel_md": competitive_md,
+    }
+
+
 def render_default_product_skill(cfg: FridayConfig) -> str:
     """Генерирует структурированный `skills/product_knowledge.md` по настройкам ниши."""
     queries = "\n".join(f"- `{q}`" for q in cfg.icp.search_queries) or "- (не заданы)"
-    benefits = "\n".join(f"- {b}" for b in cfg.product.key_benefits) or "- Конкретная измеримая польза для клиента"
+    benefits = "\n".join(f"- {b}" for b in cfg.product.key_benefits) or "- Измеримая польза для бизнеса клиента"
     titles = ", ".join(cfg.icp.decision_maker_titles) or "руководитель, основатель"
-    hiring = ", ".join(cfg.icp.hiring_signals) or "нет специальных вакансий"
+    hiring = ", ".join(cfg.icp.hiring_signals) or "—"
     cities = ", ".join(cfg.icp.cities) or "Россия"
     return (
-        f"# Знание продукта и целевой ниши: {cfg.persona.company}\n\n"
-        f"- **Продукт / услуга**: {cfg.product.name} ({cfg.product.category})\n"
+        f"# Профиль продукта и ниши: {cfg.persona.company}\n\n"
+        f"- **Продукт**: {cfg.product.name}\n"
         f"- **Сайт**: {cfg.persona.website or 'не указан'}\n"
-        f"- **Целевая ниша (ICP)**: {cfg.icp.niche}\n"
-        f"- **География**: {cities}\n"
-        f"- **Ключевые роли ЛПР**: {titles}\n"
-        f"- **Сигнальные вакансии на hh.ru**: {hiring}\n"
-        f"- **Ценовая модель**: {cfg.product.pricing or 'по запросу'}\n\n"
-        f"## Описание продукта\n\n"
+        f"- **Целевая аудитория (ICP)**: {cfg.icp.niche}\n"
+        f"- **Города**: {cities}\n"
+        f"- **Ключевые ЛПР**: {titles}\n"
+        f"- **Сигнальные вакансии hh.ru**: {hiring}\n\n"
+        f"## Суть предложения\n\n"
         f"{cfg.product.description}\n\n"
-        f"## Ключевые выгоды\n\n"
+        f"## Ключевые преимущества\n\n"
         f"{benefits}\n\n"
-        f"## Мягкий первый шаг (Entry Offer)\n\n"
+        f"## Первый шаг (мягкий оффер)\n\n"
         f"{cfg.product.offer.entry}\n\n"
-        f"## Поисковые запросы для поиска компаний\n\n"
+        f"## Поисковые запросы\n\n"
         f"{queries}\n"
     )
 
@@ -350,13 +542,9 @@ def apply_niche_setup(
     local_config_path: Path | None = None,
     skills_dir: Path | None = None,
 ) -> dict:
-    """Применяет конфигурацию ниши и продукта (из ответа ИИ-агента или формы UI).
+    """Применяет конфигурацию ниши и продукта.
 
-    Поддерживает схему `persona` + `product` + `icp` + `compliance` (из `friday.yaml` и `prompts/train.md`).
-    Записывает:
-    - `friday.local.yaml`
-    - `skills/product_knowledge.md`
-    - `skills/competitive_intel.md` (если передан)
+    Записывает `friday.local.yaml`, `skills/product_knowledge.md` и `skills/competitive_intel.md`.
     """
     cfg = base_config or load_config()
     persona = data.get("persona") or {}
@@ -453,7 +641,7 @@ def build_train_prompt_context(
     target_niche_hint: str = "",
     cities_hint: list[str] | None = None,
 ) -> str:
-    """Формирует защищённый `<untrusted>` контекст и точную JSON-схему для задачи `train_niche`."""
+    """Формирует защищённый `<untrusted>` контекст для задачи `train_niche`."""
     blocks = [UNTRUSTED_RULE]
     if user_brief.strip():
         blocks.append(f"Описание от пользователя:\n{user_brief.strip()}")
@@ -480,27 +668,4 @@ def build_train_prompt_context(
     elif website_crawl.get("error"):
         blocks.append(f"Примечание: сайт не удалось скачать автоматически ({website_crawl['error']}). Опирайся на бриф пользователя.")
 
-    blocks.append(
-        "Обязательная структура JSON-ответа:\n"
-        "{\n"
-        '  "persona": {"name": "...", "company": "...", "role": "...", "website": "..."},\n'
-        '  "product": {\n'
-        '    "name": "...", "category": "...", "description": "...", "pricing": "...",\n'
-        '    "key_benefits": ["...", "..."],\n'
-        '    "offer": {"entry": "...", "goal": "send_audit"}\n'
-        "  },\n"
-        '  "icp": {\n'
-        '    "niche": "...",\n'
-        '    "industries": ["...", "..."],\n'
-        '    "search_queries": ["...", "..."],\n'
-        '    "cities": ["Москва", "Санкт-Петербург"],\n'
-        '    "company_size": "10–200 сотрудников",\n'
-        '    "decision_maker_titles": ["...", "..."],\n'
-        '    "hiring_signals": ["...", "..."]\n'
-        "  },\n"
-        '  "compliance": {"regulated_niche": "none"},\n'
-        '  "product_knowledge_md": "# ...",\n'
-        '  "competitive_intel_md": "# ..."\n'
-        "}"
-    )
     return "\n\n".join(blocks)

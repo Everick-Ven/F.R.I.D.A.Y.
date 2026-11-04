@@ -1,44 +1,91 @@
-/* F.R.I.D.A.Y. v0.2 UI — относительные URL (/api/*), надёжная работа внутри Live Preview iframe */
+/* F.R.I.D.A.Y. Web Client — относительные пути /api/* (совместимо с iframe Live Preview) */
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-let cachedPresets = [];
-let hasInitializedForm = false;
-let pendingTasksCount = 0;
+let NICHE_PRESETS = [];
+let CURRENT_DRAFT_STATUS = "";
+let ACTIVE_SUBVIEW = "companies";
+let JOB_HIDE_TIMER = null;
+const DRAFT_CACHE = new Map();
 
-function notify(msg, isError = false) {
-  const toast = $("#toast");
-  if (toast) {
-    toast.textContent = msg;
-    toast.style.borderColor = isError ? "var(--danger)" : "var(--primary)";
-    toast.classList.remove("hidden");
-    clearTimeout(notify._t);
-    notify._t = setTimeout(() => toast.classList.add("hidden"), 4800);
-  }
-  const bar = $("#statusBar");
-  if (bar) {
-    bar.textContent = msg;
-    bar.classList.toggle("error", Boolean(isError));
-    bar.classList.remove("hidden");
-  }
+const STATUS_LABELS = {
+  pending_review: { text: "На проверке", cls: "warn" },
+  approved: { text: "Одобрен", cls: "ok" },
+  sent_manually: { text: "Отправлен", cls: "ok" },
+  rejected: { text: "Отклонён", cls: "" },
+  gate_blocked: { text: "Требует правки", cls: "err" },
+};
+
+const SOURCE_LABELS = {
+  hh_ru: "HeadHunter",
+  yandex_search: "Яндекс",
+  twogis: "2ГИС",
+  yandex_maps: "Яндекс Карты",
+  web_search: "Веб-поиск",
+  osm: "Карты",
+  import_file: "Импорт",
+  website_team: "Сайт компании",
+};
+
+const SIGNAL_SHORT_LABELS = {
+  HH_HIRING_ROLE: "Вакансия hh.ru",
+  YANDEX_DIRECT_ACTIVE: "Яндекс Директ",
+  NO_ONLINE_CAPTURE: "Нет захвата заявок",
+  NO_YANDEX_METRIKA: "Без Метрики",
+  YANDEX_PAGE2_RANK: "Топ-20 Яндекса",
+  THIN_SERVICE_STRUCTURE: "Узкая структура сайта",
+  TELEGRAM_PUBLIC: "Telegram",
+  WHATSAPP_PUBLIC: "WhatsApp",
+  TECH_STACK_RU: "CMS / Стек",
+  LOW_MAP_RATING: "Рейтинг на картах",
+  NO_WEBSITE_ON_MAP: "Нет сайта в карточке",
+};
+
+const CATEGORY_LABELS = {
+  hiring: "Найм",
+  marketing: "Маркетинг",
+  website: "Сайт и конверсия",
+  seo: "Поиск",
+  maps: "Геосервисы",
+  contacts: "Контакты",
+  tech: "Технологии",
+  company: "Профиль",
+};
+
+function showToast(msg, isError = false) {
+  const el = $("#toast");
+  if (!el) return;
+  el.textContent = msg;
+  el.style.borderColor = isError ? "rgba(239, 68, 68, 0.5)" : "rgba(255, 255, 255, 0.16)";
+  el.classList.remove("hidden");
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => el.classList.add("hidden"), 3400);
+}
+
+function esc(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
 async function safeCopyText(text) {
-  if (!text) return false;
-  try {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(text);
+  const value = String(text ?? "");
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(value);
       return true;
+    } catch (_err) {
+      // Fallback для песочницы iframe
     }
-  } catch (_) {
-    // Внутри кросс-доменного iframe браузер может запретить Clipboard API — используем fallback
   }
   const ta = document.createElement("textarea");
-  ta.value = text;
+  ta.value = value;
   ta.setAttribute("readonly", "");
   ta.style.position = "fixed";
-  ta.style.top = "-1000px";
+  ta.style.top = "-9999px";
   ta.style.opacity = "0";
   document.body.appendChild(ta);
   ta.focus();
@@ -46,865 +93,699 @@ async function safeCopyText(text) {
   let ok = false;
   try {
     ok = document.execCommand("copy");
-  } catch (_) {
+  } catch (_err) {
     ok = false;
   }
   document.body.removeChild(ta);
   return ok;
 }
 
-async function downloadEndpoint(url, filename) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+async function downloadExport(url, filename, mimeType) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Ошибка ${res.status}`);
+    const text = await res.text();
+    const blob = new Blob([text], { type: mimeType });
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
+    showToast(`Файл ${filename} сохранён`);
+  } catch (e) {
+    showToast(e.message, true);
   }
-  const blob = await res.blob();
-  const blobUrl = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = blobUrl;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
 }
 
 async function api(path, opts = {}) {
-  const headers = opts.body instanceof FormData
-    ? (opts.headers || {})
-    : { "Content-Type": "application/json", ...(opts.headers || {}) };
-  const res = await fetch(path, { ...opts, headers });
-  if (!res.ok) {
-    let txt = await res.text();
-    try {
-      const parsed = JSON.parse(txt);
-      if (parsed.detail) {
-        txt = typeof parsed.detail === "string" ? parsed.detail : JSON.stringify(parsed.detail);
-      }
-    } catch (_) {}
-    throw new Error(txt || `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-async function withButtonBusy(btn, busyLabel, fn) {
-  const prevText = btn ? btn.textContent : "";
-  if (btn) {
-    btn.disabled = true;
-    if (busyLabel) btn.textContent = busyLabel;
-  }
+  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  const text = await res.text();
+  let data = {};
   try {
-    return await fn();
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      if (busyLabel) btn.textContent = prevText;
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+  if (!res.ok) {
+    throw new Error(data.detail || `Ошибка запроса (${res.status})`);
+  }
+  return data;
+}
+
+/* ── Живой индикатор прогресса ── */
+function renderJobCard(job) {
+  const card = $("#live-job-card");
+  if (!card) return;
+  clearTimeout(JOB_HIDE_TIMER);
+  card.classList.remove("hidden", "done", "failed");
+  if (job.status === "completed") card.classList.add("done");
+  if (job.status === "failed") card.classList.add("failed");
+
+  $("#job-title").textContent = job.title || "Выполнение";
+  $("#job-stage").textContent = job.stage || "";
+  $("#job-percent").textContent = `${job.percent ?? 0}%`;
+  $("#job-bar-fill").style.width = `${job.percent ?? 0}%`;
+
+  const stepsWrap = $("#job-steps");
+  stepsWrap.innerHTML = (job.steps || [])
+    .map(
+      (s) => `
+      <span class="job-step-item ${esc(s.state)}">
+        <span class="step-dot"></span>
+        <span>${esc(s.label)}</span>
+      </span>`
+    )
+    .join("");
+}
+
+async function runTrackedJob(path, payload, { button = null, onComplete = null } = {}) {
+  if (button) button.disabled = true;
+  try {
+    let job = await api(path, {
+      method: "POST",
+      body: payload !== undefined ? JSON.stringify(payload) : "{}",
+    });
+    renderJobCard(job);
+
+    while (job.status === "running") {
+      await new Promise((r) => setTimeout(r, 220));
+      job = await api(`/api/jobs/${encodeURIComponent(job.id)}`);
+      renderJobCard(job);
     }
+
+    if (job.status === "failed") {
+      showToast(job.error || "Не удалось выполнить операцию", true);
+      return null;
+    }
+
+    await loadSummary(true);
+    if (onComplete) await onComplete(job);
+
+    JOB_HIDE_TIMER = setTimeout(() => {
+      const card = $("#live-job-card");
+      if (card) card.classList.add("hidden");
+    }, 2600);
+    return job;
+  } catch (e) {
+    showToast(e.message, true);
+    const card = $("#live-job-card");
+    if (card) card.classList.add("hidden");
+    return null;
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
-function esc(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+/* ── Переключение разделов ── */
+function switchTab(tabId) {
+  $$(".nav-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tabId));
+  $$(".view").forEach((v) => v.classList.toggle("active", v.id === `tab-${tabId}`));
+  if (tabId === "workspace") {
+    loadCompanies();
+    loadProspects();
+  }
+  if (tabId === "drafts") loadDrafts();
+  if (tabId === "signals") loadSignals();
 }
 
-function statusBadge(status) {
-  const map = {
-    pending_review: ["На проверке", "badge-warn"],
-    approved: ["Одобрено к ручной отправке", "badge-ok"],
-    sent_manually: ["Отправлено вручную", "badge-ok"],
-    gate_blocked: ["Заблокировано шлюзом ФЗ-38", "badge-danger"],
-    rejected: ["Отклонено", "badge-danger"],
-    confirmed: ["confirmed", "badge-ok"],
-    proposed: ["proposed", "badge-warn"],
-    pending: ["Ожидает выполнения агентом", "badge-warn"],
-    completed: ["Выполнено агентом", "badge-ok"],
-    cancelled: ["Отменена", "badge-danger"],
-  };
-  const [label, cls] = map[status] || [status, ""];
-  return `<span class="badge ${cls}">${esc(label)}</span>`;
+function switchSubview(sub) {
+  ACTIVE_SUBVIEW = sub;
+  $$("#db-subtabs .seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.subview === sub));
+  $("#subview-companies").classList.toggle("hidden", sub !== "companies");
+  $("#subview-prospects").classList.toggle("hidden", sub !== "prospects");
+  $("#cohort-controls").classList.toggle("hidden", sub !== "companies");
 }
 
-function switchTab(target) {
-  $$("#mainTabs .tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === target));
-  $$(".panel").forEach((p) => p.classList.toggle("active", p.id === `tab-${target}`));
+/* ── Загрузка профиля и сводки ── */
+function fillNicheFormFromConfig(cfg, skills = {}) {
+  if (!cfg) return;
+  const p = cfg.persona || {};
+  const prod = cfg.product || {};
+  const icp = cfg.icp || {};
+  const comp = cfg.compliance || {};
+
+  const cleanVal = (v, placeholder) => (!v || v === placeholder ? "" : v);
+
+  $("#cfg-persona-company").value = cleanVal(p.company, "Ваша компания");
+  $("#cfg-persona-name").value = cleanVal(p.name, "Не задано");
+  $("#cfg-persona-role").value = p.role || "";
+  $("#cfg-persona-telegram").value = p.telegram || "";
+  $("#cfg-persona-website").value = p.website || "";
+
+  $("#cfg-product-name").value = cleanVal(prod.name, "Не настроен");
+  $("#cfg-product-desc").value = prod.description || "";
+  $("#cfg-product-pricing").value = prod.pricing || "";
+  $("#cfg-product-benefits").value = (prod.key_benefits || []).join("\n");
+  $("#cfg-offer-entry").value = (prod.offer && prod.offer.entry) || "";
+
+  $("#cfg-icp-niche").value = cleanVal(icp.niche, "Не настроена");
+  $("#cfg-icp-industries").value = (icp.industries || []).join(", ");
+  $("#cfg-icp-queries").value = (icp.search_queries || []).join("\n");
+  $("#cfg-icp-cities").value = (icp.cities || []).join(", ");
+  $("#cfg-icp-titles").value = (icp.decision_maker_titles || []).join(", ");
+  $("#cfg-icp-hiring").value = (icp.hiring_signals || []).join(", ");
+  $("#cfg-regulated").value = comp.regulated_niche || "none";
+
+  if (skills && typeof skills.product_knowledge_md === "string") {
+    $("#cfg-skill-md").value = skills.product_knowledge_md;
+  }
+
+  // Синхронизируем поля быстрого старта, если они ещё пустые
+  if (!$("#train-website").value && p.website) $("#train-website").value = p.website;
+  if (!$("#train-niche-hint").value && cleanVal(icp.niche, "Не настроена")) {
+    $("#train-niche-hint").value = icp.niche;
+  }
+  if (!$("#train-brief").value && prod.description) $("#train-brief").value = prod.description;
+  if (!$("#train-cities").value && (icp.cities || []).length) {
+    $("#train-cities").value = icp.cities.join(", ");
+  }
+
+  if (!$("#inp-query").value && (icp.search_queries || []).length) {
+    $("#inp-query").value = icp.search_queries[0];
+  }
+  if (!$("#inp-city").value && (icp.cities || []).length) {
+    $("#inp-city").value = icp.cities[0];
+  }
 }
 
-function splitComma(val) {
+async function loadSummary(forceFormFill = false) {
+  const data = await api("/api/summary");
+  const s = data.summary || {};
+
+  $("#kpi-companies").textContent = s.companies_total ?? 0;
+  $("#kpi-prospects").textContent = s.prospects_total ?? 0;
+  $("#kpi-observations").textContent = s.observations_total ?? 0;
+  $("#kpi-drafts").textContent = s.drafts_total ?? 0;
+
+  $("#badge-companies").textContent = s.companies_total ?? 0;
+  $("#badge-drafts").textContent = s.drafts_total ?? 0;
+
+  const dot = $("#project-status-dot");
+  const txt = $("#project-status-text");
+  if (data.niche_configured) {
+    dot.classList.add("ready");
+    const compName = data.config?.persona?.company || "Проект";
+    const nicheName = data.config?.icp?.niche || "";
+    txt.textContent = nicheName ? `${compName} · ${nicheName}` : compName;
+  } else {
+    dot.classList.remove("ready");
+    txt.textContent = "Новый проект";
+  }
+
+  if (forceFormFill) {
+    fillNicheFormFromConfig(data.config, data.skills);
+  }
+  return data;
+}
+
+async function loadNichePresets() {
+  const data = await api("/api/niche/presets");
+  NICHE_PRESETS = data.items || [];
+  const bar = $("#niche-presets-bar");
+  bar.innerHTML = NICHE_PRESETS.map(
+    (p, idx) =>
+      `<button type="button" class="preset-chip" data-preset-idx="${idx}">${esc(p.short_label || p.label)}</button>`
+  ).join("");
+}
+
+function splitLines(val) {
+  return String(val || "")
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function splitCsv(val) {
   return String(val || "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
 }
 
-function splitLinesOrComma(val) {
-  return String(val || "")
-    .split(/[\n,]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+async function saveNicheManual() {
+  const btn = $("#btn-save-niche");
+  btn.disabled = true;
+  try {
+    const payload = {
+      persona: {
+        name: $("#cfg-persona-name").value.trim(),
+        company: $("#cfg-persona-company").value.trim(),
+        role: $("#cfg-persona-role").value.trim(),
+        telegram: $("#cfg-persona-telegram").value.trim(),
+        website: $("#cfg-persona-website").value.trim(),
+      },
+      product: {
+        name: $("#cfg-product-name").value.trim(),
+        description: $("#cfg-product-desc").value.trim(),
+        pricing: $("#cfg-product-pricing").value.trim(),
+        key_benefits: splitLines($("#cfg-product-benefits").value),
+        offer: {
+          entry: $("#cfg-offer-entry").value.trim(),
+          goal: "send_audit",
+        },
+      },
+      icp: {
+        niche: $("#cfg-icp-niche").value.trim(),
+        industries: splitCsv($("#cfg-icp-industries").value),
+        search_queries: splitLines($("#cfg-icp-queries").value),
+        cities: splitCsv($("#cfg-icp-cities").value),
+        decision_maker_titles: splitCsv($("#cfg-icp-titles").value),
+        hiring_signals: splitCsv($("#cfg-icp-hiring").value),
+      },
+      compliance: {
+        regulated_niche: $("#cfg-regulated").value,
+      },
+      product_knowledge_md: $("#cfg-skill-md").value,
+    };
+    await api("/api/niche/save", { method: "POST", body: JSON.stringify(payload) });
+    await loadSummary(true);
+    showToast("Изменения профиля сохранены");
+  } catch (e) {
+    showToast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
-function fillNicheForm(cfg, forceOverwrite = false) {
-  // Не затираем то, что пользователь прямо сейчас печатает при фоновом автообновлении
-  if (hasInitializedForm && !forceOverwrite) return;
-  hasInitializedForm = true;
-
-  const per = cfg.persona || {};
-  const prod = cfg.product || {};
-  const icp = cfg.icp || {};
-  const comp = cfg.compliance || {};
-
-  $("#nsBizName").value = per.company && per.company !== "Ваша компания" ? per.company : "";
-  $("#nsBizWebsite").value = per.website || "";
-  $("#nsProdName").value = prod.name && prod.name !== "Ваш продукт или услуга" ? prod.name : "";
-  $("#nsProdDesc").value =
-    prod.description && !prod.description.startsWith("Опишите, что делает") ? prod.description : "";
-  $("#nsProdBenefits").value = (prod.key_benefits || []).join("\n");
-  $("#nsProdEntry").value = (prod.offer && prod.offer.entry) || "";
-  $("#nsProdPricing").value = prod.pricing || "";
-  $("#nsRegulated").value = comp.regulated_niche || "none";
-
-  $("#nsIcpNiche").value = icp.niche || "";
-  $("#nsIcpIndustries").value = (icp.industries || []).join(", ");
-  $("#nsIcpQueries").value = (icp.search_queries || []).join("\n");
-  $("#nsIcpCities").value = (icp.cities || []).join(", ");
-  $("#nsIcpTitles").value = (icp.decision_maker_titles || []).join(", ");
-  $("#nsIcpHiring").value = (icp.hiring_signals || []).join(", ");
-
-  if (per.name && per.name !== "Ваше имя") $("#nsSenderName").value = per.name;
-  if (per.role) $("#nsSenderTitle").value = per.role;
-  if (per.telegram) $("#nsSenderTg").value = per.telegram;
-
-  if ((icp.search_queries || []).length > 0 && (forceOverwrite || !$("#inpQuery").value)) {
-    $("#inpQuery").value = icp.search_queries[0];
-  }
-  if ((icp.cities || []).length > 0 && (forceOverwrite || !$("#inpCity").value)) {
-    $("#inpCity").value = icp.cities[0];
-  }
-}
-
-async function loadPresets() {
-  const { items } = await api("/api/niche/presets");
-  cachedPresets = items || [];
-  const wrap = $("#presetList");
-  wrap.innerHTML = cachedPresets
-    .map(
-      (tpl, idx) => `
-    <div class="preset-card">
-      <div>
-        <strong>${esc(tpl.label)}</strong>
-        <span>Целевая ниша: ${esc(tpl.icp.niche)}</span>
-      </div>
-      <div class="btn-row">
-        <button type="button" class="btn btn-sm btn-primary" data-preset-apply="${idx}">Применить сразу</button>
-        <button type="button" class="btn btn-sm" data-preset-fill="${idx}">В форму</button>
-      </div>
-    </div>`
-    )
-    .join("");
-}
-
-async function loadSummary(forceFormSync = false) {
-  const { summary, niche_configured, config, skills } = await api("/api/summary");
-  const d = summary.drafts_by_status || {};
-  pendingTasksCount = summary.pending_agent_tasks ?? 0;
-
-  $("#tabAgentCnt").textContent = pendingTasksCount;
-  $("#tabDraftsCnt").textContent = (d.pending_review ?? 0) + (d.approved ?? 0);
-
-  const badgeWrap = $("#headerBadges");
-  const badgeTxt = $("#nicheBadgeText");
-  const callout = $("#nicheCallout");
-
-  if (niche_configured) {
-    badgeWrap.classList.remove("unconfigured");
-    badgeTxt.textContent = `Ниша: ${config.persona.company} → ${config.icp.niche}`;
-    callout.classList.add("ready");
-    $("#nicheCalloutTitle").textContent = `Активная ниша настроена: ${config.persona.company} (${config.product.name})`;
-    $("#nicheCalloutDesc").textContent =
-      `Целевая аудитория (ICP): ${config.icp.niche}. Можно сразу переходить на вкладку «2. Конвейер и сбор» или обновить параметры ниши ниже.`;
-  } else {
-    badgeWrap.classList.add("unconfigured");
-    badgeTxt.textContent = "Шаг 1: настройте нишу и продукт";
-    callout.classList.remove("ready");
-  }
-
-  fillNicheForm(config, forceFormSync);
-
-  if (skills && skills.product_knowledge_md) {
-    $("#productSkillPreview").textContent = skills.product_knowledge_md;
-  }
-
-  $("#kpiGrid").innerHTML = [
-    ["Компаний в базе", summary.companies_total],
-    ["ЛПР / Контактов", summary.prospects_total],
-    ["Сигналов зафиксировано", summary.observations_total],
-    ["Черновиков на проверке", d.pending_review || 0],
-    ["Одобрено к отправке", d.approved || 0],
-    ["Задач в очереди агента", pendingTasksCount],
-  ]
-    .map(
-      ([label, val]) => `
-      <div class="kpi">
-        <div class="label">${esc(label)}</div>
-        <div class="value">${esc(val)}</div>
-      </div>`
-    )
-    .join("");
-}
-
-async function loadDrafts() {
-  const st = $("#fltDraftStatus").value;
-  const ch = $("#fltDraftChannel").value;
+/* ── Таблицы базы и сигналов ── */
+async function loadCompanies() {
+  const req = ($("#inp-require-codes")?.value || "").trim();
   const qs = new URLSearchParams();
-  if (st) qs.set("status", st);
-  if (ch) qs.set("channel", ch);
-  const { items } = await api(`/api/drafts?${qs.toString()}`);
+  if (req) qs.set("require", req);
+  const data = await api(`/api/companies?${qs.toString()}`);
+  const tbody = $("#companies-tbody");
 
-  if (!items.length) {
-    $("#draftsList").innerHTML = `<div class="card muted">Черновики пока отсутствуют. Соберите или загрузите компании на вкладке «2. Конвейер и сбор» и запустите подготовку черновиков.</div>`;
+  if (!data.items.length) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty-box">Список компаний пока пуст. Запустите поиск по запросу, импортируйте файл или добавьте демо-данные.</td></tr>`;
     return;
   }
 
-  $("#draftsList").innerHTML = items
-    .map((r) => {
-      const fio = [r.last_name, r.first_name, r.middle_name].filter(Boolean).join(" ") || "Руководитель / представитель";
-      const tg = r.prospect_telegram || r.company_telegram || "";
-      const gateNotes = (r.gate_notes || [])
-        .map((n) => `<span class="badge badge-danger">${esc(n)}</span>`)
+  tbody.innerHTML = data.items
+    .map((c) => {
+      const obsHtml = (c.observations || [])
+        .map((o) => {
+          const label = SIGNAL_SHORT_LABELS[o.signal_code] || o.signal_code;
+          const tip = o.value_text ? `${o.signal_code}: ${o.value_text}` : o.signal_code;
+          return `<span class="tag" title="${esc(tip)}">${esc(label)}</span>`;
+        })
         .join("");
+      const contacts = [
+        c.phone ? esc(c.phone) : "",
+        c.telegram ? `<a class="contact-link" href="${esc(c.telegram)}" target="_blank" rel="noopener">Telegram</a>` : "",
+        c.whatsapp ? `<a class="contact-link" href="${esc(c.whatsapp)}" target="_blank" rel="noopener">WhatsApp</a>` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
 
+      const siteUrl = c.website || (c.domain ? `https://${c.domain}` : "");
       return `
-      <div class="draft-card">
-        <div class="draft-head">
-          <div>
-            <strong>${esc(r.company_name || r.domain)}</strong>
-            ${r.industry ? `<span class="badge">${esc(r.industry)}</span>` : ""}
-            · ${esc(fio)} ${r.title ? `(${esc(r.title)})` : ""}
-            <div class="draft-meta">
-              Город: ${esc(r.city || "—")} · Канал: <strong>${esc(r.channel)}</strong> ·
-              Балл ICP: <strong>${esc(r.score)}/100</strong> ·
-              Сигнал: <span class="badge">${esc(r.signal_used || "—")}</span> ·
-              Источник: <span class="badge">${esc(r.brain_provider || "agent")}</span>
+        <tr>
+          <td>
+            <div class="entity-name">${esc(c.name)}</div>
+            <div class="entity-sub">
+              ${siteUrl ? `<a href="${esc(siteUrl)}" target="_blank" rel="noopener">${esc(c.domain || c.website)}</a>` : "—"}
+              ${c.inn ? ` · ИНН ${esc(c.inn)}` : ""}
             </div>
-          </div>
-          <div>${statusBadge(r.status)}</div>
-        </div>
-        ${r.subject ? `<div class="draft-meta"><strong>Тема:</strong> ${esc(r.subject)}</div>` : ""}
-        <div class="draft-body" id="draft-body-${esc(r.id)}">${esc(r.body)}</div>
-        ${r.audit_summary ? `<div class="draft-meta"><strong>Шпаргалка разбора (2–3 факта):</strong> ${esc(r.audit_summary)}</div>` : ""}
-        ${gateNotes ? `<div style="margin-bottom:8px">${gateNotes}</div>` : ""}
-        <div class="draft-meta">
-          Контакты для ручной отправки 1-на-1:
-          ${tg ? `<a href="${esc(tg)}" target="_blank" rel="noopener">${esc(tg)}</a>` : "Telegram —"} ·
-          Email: ${esc(r.email || "—")} · Тел.: ${esc(r.prospect_phone || "—")}
-        </div>
-        <div class="btn-row">
-          <button type="button" class="btn btn-sm btn-primary" data-copy-draft="${esc(r.id)}">Скопировать текст</button>
-          <button type="button" class="btn btn-sm btn-ok" data-draft-status="${esc(r.id)}:approved">Одобрить</button>
-          <button type="button" class="btn btn-sm" data-draft-status="${esc(r.id)}:sent_manually">Отметить отправленным</button>
-          <button type="button" class="btn btn-sm btn-danger" data-draft-status="${esc(r.id)}:rejected">Отклонить</button>
-        </div>
-      </div>`;
+          </td>
+          <td>${esc(c.city || "—")}</td>
+          <td>${contacts || "—"}</td>
+          <td>${obsHtml || '<span class="entity-sub">—</span>'}</td>
+          <td><span class="entity-sub">${esc(SOURCE_LABELS[c.source] || c.source || "—")}</span></td>
+        </tr>`;
     })
     .join("");
 }
 
-async function loadCompaniesAndProspects() {
-  const req = $("#inpCohortRequire").value.trim();
-  const exc = $("#inpCohortExclude").value.trim();
+async function loadProspects() {
+  const data = await api("/api/prospects");
+  const tbody = $("#prospects-tbody");
+
+  if (!data.items.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-box">Контакты руководителей появятся после поиска или обогащения компаний.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = data.items
+    .map((p) => {
+      const channels = [
+        p.telegram ? `<a class="contact-link" href="${esc(p.telegram)}" target="_blank" rel="noopener">Telegram</a>` : "",
+        p.email ? esc(p.email) : "",
+        p.phone ? esc(p.phone) : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      const scoreCls = p.fit_score >= 65 ? "score-pill high" : "score-pill";
+      return `
+        <tr>
+          <td>
+            <div class="entity-name">${esc(p.full_name)}</div>
+            <div class="entity-sub">${esc(p.city || "")}</div>
+          </td>
+          <td>${esc(p.title || "Руководитель")}</td>
+          <td>${esc(p.company || "—")}</td>
+          <td>${channels || "—"}</td>
+          <td><span class="${scoreCls}" title="${esc(p.score_reason || "")}">${p.fit_score}</span></td>
+          <td style="text-align:right">
+            <button type="button" class="ghost-btn sm" data-single-draft="${esc(p.id)}">Написать</button>
+          </td>
+        </tr>`;
+    })
+    .join("");
+}
+
+async function loadDrafts() {
+  const ch = $("#flt-draft-channel").value;
   const qs = new URLSearchParams();
-  if (req) qs.set("require", req);
-  if (exc) qs.set("exclude", exc);
+  if (CURRENT_DRAFT_STATUS) qs.set("status", CURRENT_DRAFT_STATUS);
+  if (ch) qs.set("channel", ch);
 
-  const [{ items: companies }, { items: prospects }] = await Promise.all([
-    api(`/api/companies?${qs.toString()}`),
-    api("/api/prospects"),
-  ]);
+  const data = await api(`/api/drafts?${qs.toString()}`);
+  const box = $("#drafts-list");
+  DRAFT_CACHE.clear();
 
-  $("#cntCompanies").textContent = companies.length;
-  $("#tblCompanies tbody").innerHTML = companies.length
-    ? companies
-        .map((c) => {
-          const links = [
-            c.website ? `<a href="${esc(c.website)}" target="_blank" rel="noopener">${esc(c.domain || c.website)}</a>` : "",
-            c.hh_url ? `<a href="${esc(c.hh_url)}" target="_blank" rel="noopener">hh.ru</a>` : "",
-            c.telegram ? `<a href="${esc(c.telegram)}" target="_blank" rel="noopener">TG</a>` : "",
-            c.twogis_url ? `<a href="${esc(c.twogis_url)}" target="_blank" rel="noopener">2ГИС</a>` : "",
-            c.ymaps_url ? `<a href="${esc(c.ymaps_url)}" target="_blank" rel="noopener">Я.Карты</a>` : "",
-          ]
-            .filter(Boolean)
-            .join(" · ");
-          const stack = (c.tech_stack || []).map((t) => `<span class="badge">${esc(t)}</span>`).join("") || "—";
-          const sigs = (c.observations || [])
-            .map((o) => `<span class="badge" title="${esc(o.value_text)}">${esc(o.signal_code)}</span>`)
-            .join("") || "—";
-          return `
-          <tr>
-            <td>
-              <strong>${esc(c.name)}</strong>
-              ${c.inn ? `<div class="muted">ИНН ${esc(c.inn)}</div>` : ""}
-            </td>
-            <td>${esc(c.industry || "—")}</td>
-            <td>${esc(c.city || "—")}</td>
-            <td>${links || "—"}</td>
-            <td>${stack}</td>
-            <td>${sigs}</td>
-          </tr>`;
-        })
-        .join("")
-    : `<tr><td colspan="6" class="muted">Компании пока не добавлены. На вкладке «2. Конвейер и сбор» запустите поиск, импортируйте CSV/JSON или загрузите 2 тестовые карточки.</td></tr>`;
+  if (!data.items.length) {
+    box.innerHTML = `<div class="empty-box">Черновиков по выбранному фильтру пока нет. Перейдите в «Поиск и база» и нажмите «Создать черновики».</div>`;
+    return;
+  }
 
-  $("#cntProspects").textContent = prospects.length;
-  $("#tblProspects tbody").innerHTML = prospects.length
-    ? prospects
-        .map((p) => {
-          const contacts = [
-            p.telegram ? `<a href="${esc(p.telegram)}" target="_blank" rel="noopener">Telegram</a>` : "",
-            p.email ? esc(p.email) : "",
-            p.phone ? esc(p.phone) : "",
-          ]
-            .filter(Boolean)
-            .join(" · ");
-          return `
-          <tr>
-            <td><strong>${esc(p.score)}</strong></td>
-            <td>
-              <strong>${esc(p.full_name)}</strong>
-              <div class="muted">${esc(p.title)}</div>
-            </td>
-            <td>
-              ${esc(p.company)}
-              <div class="muted">${esc(p.industry || "")} · ${esc(p.city || "")}</div>
-            </td>
-            <td>${contacts || "—"}</td>
-            <td>${esc(p.personalization_notes || "—")}</td>
-            <td>
-              <div class="btn-row">
-                <button type="button" class="btn btn-sm btn-primary" data-gen-draft="${esc(p.id)}:agent">В очередь агенту</button>
-                <button type="button" class="btn btn-sm" data-gen-draft="${esc(p.id)}:template">Шаблон сразу</button>
-              </div>
-            </td>
-          </tr>`;
-        })
-        .join("")
-    : `<tr><td colspan="6" class="muted">ЛПР пока не найдены.</td></tr>`;
+  box.innerHTML = data.items
+    .map((d) => {
+      DRAFT_CACHE.set(String(d.id), (d.subject ? `Тема: ${d.subject}\n\n` : "") + (d.body || ""));
+      const fio = [d.last_name, d.first_name, d.middle_name].filter(Boolean).join(" ") || "Руководитель";
+      const st = STATUS_LABELS[d.status] || { text: d.status, cls: "" };
+      const channelName =
+        d.channel === "telegram" ? "Telegram" : d.channel === "whatsapp" ? "WhatsApp" : "Email";
+
+      const contacts = [
+        d.telegram ? `<a class="contact-link" href="${esc(d.telegram)}" target="_blank" rel="noopener">Telegram</a>` : "",
+        d.email ? esc(d.email) : "",
+        d.phone ? esc(d.phone) : "",
+        d.website ? `<a class="contact-link" href="${esc(d.website)}" target="_blank" rel="noopener">Сайт</a>` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+
+      return `
+        <article class="draft-item">
+          <div class="draft-top">
+            <div>
+              <div class="draft-company">${esc(d.company_name || "Компания")}</div>
+              <div class="draft-person">${esc(fio)}${d.title ? ` · ${esc(d.title)}` : ""}${d.city ? ` · ${esc(d.city)}` : ""}</div>
+            </div>
+            <div class="draft-badges">
+              <span class="tag">${esc(channelName)}</span>
+              ${d.fit_score ? `<span class="score-pill ${d.fit_score >= 65 ? "high" : ""}">${d.fit_score}</span>` : ""}
+              <span class="tag ${st.cls}">${esc(st.text)}</span>
+            </div>
+          </div>
+
+          ${d.subject ? `<div class="draft-subject">Тема: <strong style="color:var(--text)">${esc(d.subject)}</strong></div>` : ""}
+          <div class="draft-body">${esc(d.body)}</div>
+
+          ${d.audit_summary ? `<div class="draft-note">Основание: ${esc(d.audit_summary)}</div>` : ""}
+          ${d.gate_notes && d.status === "gate_blocked" ? `<div class="draft-note err">Замечание проверки: ${esc(d.gate_notes)}</div>` : ""}
+
+          <div class="draft-bottom">
+            <div class="draft-contacts">${contacts}</div>
+            <div class="draft-actions">
+              <button type="button" class="secondary-btn sm" data-copy-draft="${esc(d.id)}">Копировать</button>
+              <button type="button" class="ghost-btn sm" data-draft-id="${esc(d.id)}" data-draft-status="approved">Одобрить</button>
+              <button type="button" class="ghost-btn sm" data-draft-id="${esc(d.id)}" data-draft-status="sent_manually">Отправлено</button>
+              <button type="button" class="ghost-btn sm danger" data-draft-id="${esc(d.id)}" data-draft-status="rejected">Отклонить</button>
+            </div>
+          </div>
+        </article>`;
+    })
+    .join("");
 }
 
 async function loadSignals() {
-  const { items } = await api("/api/signals");
-  $("#tblSignals tbody").innerHTML = items
-    .map(
-      (s) => `
-    <tr>
-      <td><code>${esc(s.code)}</code></td>
-      <td>${esc(s.category)}</td>
-      <td>
-        <strong>${esc(s.label)}</strong>
-        <div class="muted">${esc(s.description)}</div>
-      </td>
-      <td>${esc(s.collector)}</td>
-      <td>${statusBadge(s.status)}</td>
-      <td>
-        <div class="btn-row">
-          <button type="button" class="btn btn-sm btn-ok" data-sig="${esc(s.code)}:confirmed">Подтвердить</button>
-          <button type="button" class="btn btn-sm btn-danger" data-sig="${esc(s.code)}:rejected">Отклонить</button>
-        </div>
-      </td>
-    </tr>`
-    )
+  const data = await api("/api/signals");
+  const tbody = $("#signals-tbody");
+  tbody.innerHTML = data.items
+    .map((s) => {
+      const isActive = s.status === "confirmed";
+      const statusPill = isActive
+        ? `<span class="tag ok">Активен</span>`
+        : `<span class="tag">Отключён</span>`;
+      const nextStatus = isActive ? "rejected" : "confirmed";
+      const actionLabel = isActive ? "Отключить" : "Включить";
+      const title = SIGNAL_SHORT_LABELS[s.code] || s.code;
+      return `
+        <tr>
+          <td>
+            <div class="entity-name">${esc(title)}</div>
+            <div class="entity-sub">${esc(s.code)}</div>
+          </td>
+          <td>${esc(CATEGORY_LABELS[s.category] || s.category)}</td>
+          <td>${esc(s.description)}</td>
+          <td>${statusPill}</td>
+          <td style="text-align:right">
+            <button type="button" class="ghost-btn sm" data-sig-code="${esc(s.code)}" data-sig-next="${nextStatus}">
+              ${actionLabel}
+            </button>
+          </td>
+        </tr>`;
+    })
     .join("");
 }
 
-async function loadAgentTasks() {
-  const st = $("#fltTaskStatus")?.value || "pending";
-  const { items } = await api(`/api/agent-tasks?status=${encodeURIComponent(st)}`);
-  if (!items.length) {
-    $("#agentTasksList").innerHTML = `<div class="card muted">Задач с выбранным статусом нет. Когда вы ставите настройку ниши, глубокий скоринг или подготовку черновиков ИИ-агенту, они появляются здесь и автоматически обрабатываются агентом рабочей среды.</div>`;
+/* ── Обработчики событий ── */
+document.addEventListener("click", async (ev) => {
+  const navBtn = ev.target.closest(".nav-btn");
+  if (navBtn) {
+    switchTab(navBtn.dataset.tab);
     return;
   }
 
-  $("#agentTasksList").innerHTML = items
-    .map(
-      (t) => `
-    <div class="draft-card">
-      <div class="draft-head">
-        <div>
-          <strong>${esc(t.kind_label || t.kind)}</strong>
-          <span class="badge">#${esc(t.id)}</span>
-          <div class="draft-meta" style="margin-top:4px">
-            Объект: <strong>${esc(t.target || "—")}</strong>
-          </div>
-          <div class="draft-meta">
-            Создана: ${esc(t.created_at || "—")}
-            ${t.completed_at ? ` · Завершена: ${esc(t.completed_at)}` : ""}
-          </div>
-        </div>
-        <div class="btn-row" style="align-items:center">
-          ${statusBadge(t.status)}
-          ${t.status === "pending" ? `<button type="button" class="btn btn-sm btn-ghost" data-cancel-task="${esc(t.id)}">Отменить</button>` : ""}
-        </div>
-      </div>
-    </div>`
-    )
-    .join("");
-}
-
-async function refreshAll(forceFormSync = false) {
-  await Promise.all([
-    loadSummary(forceFormSync),
-    loadDrafts(),
-    loadCompaniesAndProspects(),
-    loadSignals(),
-    loadAgentTasks(),
-  ]);
-}
-
-// ── Единое делегирование кликов для всех динамических и навигационных кнопок ──
-
-document.addEventListener("click", async (e) => {
-  const tabBtn = e.target.closest("#mainTabs .tab");
-  if (tabBtn) {
-    switchTab(tabBtn.dataset.tab);
+  const pillNav = ev.target.closest("[data-nav]");
+  if (pillNav) {
+    switchTab(pillNav.dataset.nav);
     return;
   }
 
-  const presetFillBtn = e.target.closest("[data-preset-fill]");
-  if (presetFillBtn) {
-    const tpl = cachedPresets[Number(presetFillBtn.dataset.presetFill)];
-    if (!tpl) return;
-    fillNicheForm(
-      {
-        persona: tpl.persona,
-        product: tpl.product,
-        icp: tpl.icp,
-        compliance: { regulated_niche: tpl.regulated_niche || "none" },
-      },
-      true
-    );
-    $("#cardNicheForm")?.scrollIntoView({ behavior: "smooth", block: "start" });
-    notify(`Шаблон «${tpl.label}» подставлен в анкету ниже — проверьте поля и нажмите «Сохранить нишу и продукт».`);
+  const subBtn = ev.target.closest("[data-subview]");
+  if (subBtn) {
+    switchSubview(subBtn.dataset.subview);
     return;
   }
 
-  const presetApplyBtn = e.target.closest("[data-preset-apply]");
-  if (presetApplyBtn) {
-    const tpl = cachedPresets[Number(presetApplyBtn.dataset.presetApply)];
-    if (!tpl) return;
-    await withButtonBusy(presetApplyBtn, "Сохранение...", async () => {
-      try {
-        await api("/api/niche/save", {
-          method: "POST",
-          body: JSON.stringify({
-            persona: tpl.persona,
-            product: tpl.product,
-            icp: tpl.icp,
-            compliance: { regulated_niche: tpl.regulated_niche || "none" },
-          }),
-        });
-        await refreshAll(true);
-        notify(`Ниша «${tpl.label}» активирована и сохранена в friday.local.yaml.`);
-      } catch (err) {
-        notify(`Ошибка применения шаблона: ${err.message}`, true);
-      }
-    });
+  const statusPill = ev.target.closest("#draft-status-pills .seg-btn");
+  if (statusPill) {
+    CURRENT_DRAFT_STATUS = statusPill.dataset.status || "";
+    $$("#draft-status-pills .seg-btn").forEach((b) => b.classList.toggle("active", b === statusPill));
+    loadDrafts();
     return;
   }
 
-  const copyBtn = e.target.closest("[data-copy-draft]");
+  const presetBtn = ev.target.closest("[data-preset-idx]");
+  if (presetBtn) {
+    const preset = NICHE_PRESETS[Number(presetBtn.dataset.presetIdx)];
+    if (preset) {
+      $("#train-website").value = preset.persona?.website || "";
+      $("#train-niche-hint").value = preset.icp?.niche || "";
+      $("#train-brief").value = preset.product?.description || "";
+      $("#train-cities").value = (preset.icp?.cities || []).join(", ");
+      fillNicheFormFromConfig({
+        persona: preset.persona,
+        product: preset.product,
+        icp: preset.icp,
+        compliance: { regulated_niche: preset.regulated_niche || "none" },
+      });
+      showToast(`Заполнен шаблон «${preset.short_label || preset.label}»`);
+    }
+    return;
+  }
+
+  const copyBtn = ev.target.closest("[data-copy-draft]");
   if (copyBtn) {
-    const id = copyBtn.dataset.copyDraft;
-    const text = $(`#draft-body-${id}`)?.textContent || "";
+    const text = DRAFT_CACHE.get(copyBtn.dataset.copyDraft) || "";
     const ok = await safeCopyText(text);
-    if (ok) {
-      const prev = copyBtn.textContent;
-      copyBtn.textContent = "Скопировано ✓";
-      setTimeout(() => { copyBtn.textContent = prev; }, 1800);
-      notify("Текст черновика скопирован в буфер обмена для ручной отправки 1-на-1.");
-    } else {
-      notify("Выделите текст черновика выше и нажмите Ctrl+C / Cmd+C.", true);
-    }
+    showToast(ok ? "Текст скопирован в буфер обмена" : "Не удалось скопировать текст", !ok);
     return;
   }
 
-  const draftStBtn = e.target.closest("[data-draft-status]");
+  const draftStBtn = ev.target.closest("[data-draft-status]");
   if (draftStBtn) {
-    const [id, st] = draftStBtn.dataset.draftStatus.split(":");
-    await withButtonBusy(draftStBtn, "...", async () => {
-      try {
-        await api(`/api/drafts/${id}`, { method: "PATCH", body: JSON.stringify({ status: st }) });
-        await refreshAll();
-        notify(`Статус черновика изменён на «${st}».`);
-      } catch (err) {
-        notify(`Ошибка обновления статуса: ${err.message}`, true);
-      }
-    });
-    return;
-  }
-
-  const genDraftBtn = e.target.closest("[data-gen-draft]");
-  if (genDraftBtn) {
-    const [pid, mode] = genDraftBtn.dataset.genDraft.split(":");
-    await withButtonBusy(genDraftBtn, "В работе...", async () => {
-      try {
-        const res = await api("/api/run/draft-single", {
-          method: "POST",
-          body: JSON.stringify({
-            prospect_id: pid,
-            channel: "telegram",
-            template_preview: mode === "template",
-          }),
-        });
-        await refreshAll();
-        if (res.queued) {
-          notify(`Задача подготовки черновика #${res.task_id} передана в очередь ИИ-агента.`);
-          switchTab("agent");
-        } else {
-          notify("Шаблонный черновик создан — открыта вкладка «4. Черновики».");
-          switchTab("drafts");
-        }
-      } catch (err) {
-        notify(`Ошибка создания черновика: ${err.message}`, true);
-      }
-    });
-    return;
-  }
-
-  const sigBtn = e.target.closest("[data-sig]");
-  if (sigBtn) {
-    const [code, status] = sigBtn.dataset.sig.split(":");
-    await withButtonBusy(sigBtn, "...", async () => {
-      try {
-        await api(`/api/signals/${code}`, { method: "PATCH", body: JSON.stringify({ status }) });
-        await loadSignals();
-        notify(`Статус сигнала ${code} изменён на ${status}.`);
-      } catch (err) {
-        notify(`Ошибка обновления сигнала: ${err.message}`, true);
-      }
-    });
-    return;
-  }
-
-  const cancelTaskBtn = e.target.closest("[data-cancel-task]");
-  if (cancelTaskBtn) {
-    const tid = cancelTaskBtn.dataset.cancelTask;
-    await withButtonBusy(cancelTaskBtn, "Отмена...", async () => {
-      try {
-        await api(`/api/agent-tasks/${tid}`, { method: "DELETE" });
-        await refreshAll();
-        notify(`Задача #${tid} отменена.`);
-      } catch (err) {
-        notify(`Ошибка отмены задачи: ${err.message}`, true);
-      }
-    });
-  }
-});
-
-// ── Верхняя панель (Скачать CSV / Markdown / Обновить) ──
-
-$("#btnRefresh").addEventListener("click", (e) =>
-  withButtonBusy(e.currentTarget, "Обновление...", async () => {
-    await refreshAll();
-    notify("Данные панели обновлены.");
-  })
-);
-
-$("#btnExportCsv").addEventListener("click", (e) =>
-  withButtonBusy(e.currentTarget, "Скачивание...", async () => {
     try {
-      await downloadEndpoint("/api/export/csv", "friday_drafts_ru.csv");
-      notify("Файл friday_drafts_ru.csv скачан.");
-    } catch (err) {
-      notify(`Ошибка скачивания CSV: ${err.message}`, true);
+      await api(`/api/drafts/${encodeURIComponent(draftStBtn.dataset.draftId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: draftStBtn.dataset.draftStatus }),
+      });
+      await loadDrafts();
+      await loadSummary();
+    } catch (e) {
+      showToast(e.message, true);
     }
-  })
-);
-
-$("#btnExportMd").addEventListener("click", (e) =>
-  withButtonBusy(e.currentTarget, "Скачивание...", async () => {
-    try {
-      await downloadEndpoint("/api/export/markdown", "friday_drafts_ru.md");
-      notify("Пакет friday_drafts_ru.md скачан.");
-    } catch (err) {
-      notify(`Ошибка скачивания Markdown: ${err.message}`, true);
-    }
-  })
-);
-
-// ── Шаг 1: Сохранение ниши и отправка на обучение ИИ-агенту ──
-
-$("#formSaveNiche").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const bizName = $("#nsBizName").value.trim();
-  const prodName = $("#nsProdName").value.trim();
-  const prodDesc = $("#nsProdDesc").value.trim();
-  const prodEntry = $("#nsProdEntry").value.trim();
-  const icpNiche = $("#nsIcpNiche").value.trim();
-  const queries = splitLinesOrComma($("#nsIcpQueries").value);
-
-  if (!bizName || !prodName || !icpNiche || queries.length === 0) {
-    notify("Заполните название компании, продукт, целевую нишу (ICP) и хотя бы 1 поисковый запрос.", true);
     return;
   }
 
-  const payload = {
-    persona: {
-      company: bizName,
-      website: $("#nsBizWebsite").value.trim(),
-      name: $("#nsSenderName").value.trim() || "Руководитель направления",
-      role: $("#nsSenderTitle").value.trim() || "Руководитель проектов",
-      telegram: $("#nsSenderTg").value.trim(),
-    },
-    product: {
-      name: prodName,
-      description: prodDesc || prodName,
-      key_benefits: splitLinesOrComma($("#nsProdBenefits").value),
-      pricing: $("#nsProdPricing").value.trim(),
-      offer: {
-        entry: prodEntry || "прислать короткий разбор из 3 пунктов",
-        goal: "send_audit",
-      },
-    },
-    icp: {
-      niche: icpNiche,
-      industries: splitComma($("#nsIcpIndustries").value),
-      search_queries: queries,
-      cities: splitComma($("#nsIcpCities").value),
-      decision_maker_titles: splitComma($("#nsIcpTitles").value),
-      hiring_signals: splitComma($("#nsIcpHiring").value),
-    },
-    compliance: {
-      regulated_niche: $("#nsRegulated").value,
-    },
-  };
-
-  await withButtonBusy($("#btnSubmitSaveNiche"), "Сохранение...", async () => {
+  const singleDraftBtn = ev.target.closest("[data-single-draft]");
+  if (singleDraftBtn) {
+    singleDraftBtn.disabled = true;
     try {
-      await api("/api/niche/save", { method: "POST", body: JSON.stringify(payload) });
-      await refreshAll(true);
-      notify(`Ниша «${icpNiche}» и продукт сохранены в friday.local.yaml и skills/product_knowledge.md.`);
-    } catch (err) {
-      notify(`Ошибка сохранения: ${err.message}`, true);
-    }
-  });
-});
-
-$("#formTrainAgent").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const website = $("#trWebsite").value.trim();
-  const nicheHint = $("#trNiche").value.trim();
-  const brief = $("#trBrief").value.trim();
-  if (!website && !nicheHint && !brief) {
-    notify("Укажите сайт продукта или краткое описание ниши и вашего продукта.", true);
-    return;
-  }
-
-  await withButtonBusy($("#btnSubmitTrain"), "Постановка задачи...", async () => {
-    try {
-      const res = await api("/api/niche/train", {
+      const ch = $("#sel-draft-channel").value || "telegram";
+      const res = await api("/api/run/draft-single", {
         method: "POST",
         body: JSON.stringify({
-          website,
-          niche_hint: nicheHint,
-          brief,
-          cities: splitComma($("#trCities").value),
+          prospect_id: singleDraftBtn.dataset.singleDraft,
+          channel: ch,
+          template_preview: true,
         }),
       });
-      await refreshAll();
-      switchTab("agent");
-      notify(`Задача настройки ниши #${res.task_id} поставлена в очередь ИИ-агента — напишите в чат «Выполни задачу F.R.I.D.A.Y.», и агент сразу применит настройки.`);
-    } catch (err) {
-      notify(`Ошибка постановки задачи: ${err.message}`, true);
-    }
-  });
-});
-
-// ── Фильтры и кнопки Конвейера (вкладка 2) ──
-
-$("#fltDraftStatus").addEventListener("change", loadDrafts);
-$("#fltDraftChannel").addEventListener("change", loadDrafts);
-$("#fltTaskStatus").addEventListener("change", loadAgentTasks);
-
-$("#btnApplyCohort").addEventListener("click", (e) =>
-  withButtonBusy(e.currentTarget, "Фильтрация...", async () => {
-    await loadCompaniesAndProspects();
-    notify("Фильтр когорты применён.");
-  })
-);
-$("#btnResetCohort").addEventListener("click", () => {
-  $("#inpCohortRequire").value = "";
-  $("#inpCohortExclude").value = "";
-  loadCompaniesAndProspects();
-  notify("Фильтр когорты сброшен.");
-});
-
-$("#btnSeedSample").addEventListener("click", (e) =>
-  withButtonBusy(e.currentTarget, "Загрузка...", async () => {
-    try {
-      const res = await api("/api/run/sample", { method: "POST" });
-      await refreshAll();
-      notify(`Добавлено компаний: ${res.inserted_companies}, ЛПР: ${res.inserted_prospects}, сигналов: ${res.recorded_observations}.`);
-    } catch (err) {
-      notify(`Ошибка загрузки тестовых карточек: ${err.message}`, true);
-    }
-  })
-);
-
-$("#btnRunProfile").addEventListener("click", (e) =>
-  withButtonBusy(e.currentTarget, "Проверка сайтов...", async () => {
-    try {
-      const res = await api("/api/run/profile", { method: "POST" });
-      await refreshAll();
-      if (!res.checked) {
-        notify("Нет непроверенных сайтов в базе — сначала найдите компании, загрузите CSV или добавьте 2 тестовые карточки.");
-      } else {
-        notify(`Проверено сайтов: ${res.checked} (успешно: ${res.ok}, новых сигналов: ${res.observations}).`);
-      }
-    } catch (err) {
-      notify(`Ошибка профилирования: ${err.message}`, true);
-    }
-  })
-);
-
-$("#btnRunProspects").addEventListener("click", (e) =>
-  withButtonBusy(e.currentTarget, "Поиск ЛПР...", async () => {
-    try {
-      const res = await api("/api/run/prospects", { method: "POST" });
-      await refreshAll();
-      if (!res.companies_scanned) {
-        notify("Нет новых компаний для обхода страниц руководства.");
-      } else {
-        notify(`Проверено компаний: ${res.companies_scanned}, найдено новых ЛПР: ${res.prospects_created}.`);
-      }
-    } catch (err) {
-      notify(`Ошибка поиска ЛПР: ${err.message}`, true);
-    }
-  })
-);
-
-$("#btnRunScore").addEventListener("click", (e) =>
-  withButtonBusy(e.currentTarget, "Расчёт баллов...", async () => {
-    try {
-      const res = await api("/api/run/score", { method: "POST" });
-      await refreshAll();
-      if (!res.scored) {
-        notify("В базе пока нет ЛПР для скоринга — сначала добавьте компании или 2 тестовые карточки.");
-      } else {
-        notify(`Рассчитан балл соответствия ICP для ${res.scored} ЛПР.`);
-      }
-    } catch (err) {
-      notify(`Ошибка скоринга: ${err.message}`, true);
-    }
-  })
-);
-
-$("#btnRunScoreAi").addEventListener("click", (e) =>
-  withButtonBusy(e.currentTarget, "Постановка...", async () => {
-    try {
-      const res = await api("/api/run/score?use_ai=true", { method: "POST" });
-      await refreshAll();
-      if (!res.queued_agent_tasks) {
-        notify("В базе пока нет ЛПР для постановки задач скоринга.");
-      } else {
-        switchTab("agent");
-        notify(`В очередь ИИ-агента поставлено задач скоринга: ${res.queued_agent_tasks}.`);
-      }
-    } catch (err) {
-      notify(`Ошибка: ${err.message}`, true);
-    }
-  })
-);
-
-async function triggerBatchDrafts(btn, channel, templatePreview) {
-  await withButtonBusy(btn, "Подготовка...", async () => {
-    try {
-      const res = await api("/api/run/drafts", {
-        method: "POST",
-        body: JSON.stringify({ channel, template_preview: templatePreview }),
-      });
-      await refreshAll();
-      if (!res.processed) {
-        notify("Нет подходящих ЛПР с баллом выше порога ICP — сначала добавьте компании и запустите скоринг.");
-      } else if (templatePreview) {
+      await loadSummary();
+      if (res.ok) {
+        showToast("Черновик подготовлен");
         switchTab("drafts");
-        notify(`Создано шаблонных черновиков (${channel}): ${res.drafts_ready} (заблокировано ФЗ-38: ${res.gate_blocked}).`);
       } else {
-        switchTab("agent");
-        notify(`В очередь ИИ-агента передано задач на черновики (${channel}): ${res.queued_agent_tasks}.`);
+        showToast("Черновик требует правки — проверьте вкладку «Черновики»", true);
+        switchTab("drafts");
       }
-    } catch (err) {
-      notify(`Ошибка подготовки черновиков: ${err.message}`, true);
+    } catch (e) {
+      showToast(e.message, true);
+    } finally {
+      singleDraftBtn.disabled = false;
     }
-  });
-}
-
-$("#btnQueueDraftsTg").addEventListener("click", (e) => triggerBatchDrafts(e.currentTarget, "telegram", false));
-$("#btnQueueDraftsEmail").addEventListener("click", (e) => triggerBatchDrafts(e.currentTarget, "email", false));
-$("#btnPreviewTemplateTg").addEventListener("click", (e) => triggerBatchDrafts(e.currentTarget, "telegram", true));
-
-$("#formDiscover").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const q = $("#inpQuery").value.trim();
-  const c = $("#inpCity").value.trim();
-  if (!q) {
-    notify("Введите поисковый запрос или сначала сохраните нишу на вкладке «1. Ниша и продукт».", true);
     return;
   }
-  await withButtonBusy($("#btnSubmitDiscover"), "Поиск...", async () => {
+
+  const sigBtn = ev.target.closest("[data-sig-code]");
+  if (sigBtn) {
     try {
-      const res = await api("/api/run/discover", {
-        method: "POST",
-        body: JSON.stringify({
-          query: q,
-          city: c || "Москва",
-          provider: $("#selProvider").value,
-          limit: Number($("#inpLimit").value || 15),
-        }),
+      await api(`/api/signals/${encodeURIComponent(sigBtn.dataset.sigCode)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: sigBtn.dataset.sigNext }),
       });
-      await refreshAll();
-      if (!res.inserted_companies && !res.updated_companies) {
-        notify(
-          "Внешний поиск вернул 0 карточек (в облачном контейнере доступ к внешним сайтам ограничен — используйте импорт CSV/JSON/TXT или кнопку «Загрузить 2 тестовые карточки»)."
-        );
-      } else {
-        notify(`Поиск завершён: новых компаний +${res.inserted_companies}, обновлено ${res.updated_companies}.`);
-      }
-    } catch (err) {
-      notify(`Ошибка поиска: ${err.message}`, true);
+      await loadSignals();
+    } catch (e) {
+      showToast(e.message, true);
     }
+  }
+});
+
+/* ── Кнопки действий с живым прогрессом ── */
+$("#btn-train-niche").addEventListener("click", async (ev) => {
+  const payload = {
+    website: $("#train-website").value.trim(),
+    niche_hint: $("#train-niche-hint").value.trim(),
+    brief: $("#train-brief").value.trim(),
+    cities: splitCsv($("#train-cities").value),
+  };
+  await runTrackedJob("/api/jobs/train", payload, {
+    button: ev.currentTarget,
+    onComplete: async () => {
+      showToast("Профиль проекта сформирован и сохранён");
+    },
   });
 });
 
-$("#formUpload").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const fileEl = $("#inpFile");
-  if (!fileEl.files || !fileEl.files[0]) {
-    notify("Сначала выберите файл .csv, .json или .txt для импорта.", true);
-    return;
-  }
-  const fd = new FormData();
-  fd.append("file", fileEl.files[0]);
-  fd.append("city", $("#inpCity").value.trim());
-  await withButtonBusy($("#btnSubmitUpload"), "Импорт...", async () => {
-    try {
-      const res = await api("/api/import/upload", { method: "POST", body: fd });
-      fileEl.value = "";
-      await refreshAll();
-      notify(`Импортировано из ${res.filename}: +${res.inserted_companies} компаний, +${res.inserted_prospects} ЛПР.`);
-    } catch (err) {
-      notify(`Ошибка импорта: ${err.message}`, true);
-    }
+$("#btn-save-niche").addEventListener("click", saveNicheManual);
+
+$("#btn-discover").addEventListener("click", async (ev) => {
+  const payload = {
+    query: $("#inp-query").value.trim(),
+    city: $("#inp-city").value.trim(),
+    provider: $("#sel-provider").value,
+    limit: 15,
+  };
+  await runTrackedJob("/api/jobs/discover", payload, {
+    button: ev.currentTarget,
+    onComplete: async () => {
+      await loadCompanies();
+      await loadProspects();
+    },
   });
 });
 
-// Фоновое автообновление очереди (раз в 4 сек, когда есть ожидающие задачи ИИ-агента)
-setInterval(() => {
-  if (pendingTasksCount > 0 && !document.hidden) {
-    Promise.all([loadSummary(false), loadAgentTasks(), loadDrafts()]).catch(() => {});
-  }
-}, 4000);
+$("#btn-enrich").addEventListener("click", async (ev) => {
+  await runTrackedJob("/api/jobs/enrich", {}, {
+    button: ev.currentTarget,
+    onComplete: async () => {
+      await loadCompanies();
+      await loadProspects();
+    },
+  });
+});
 
-Promise.all([loadPresets(), refreshAll(true)]).catch((e) => notify(`Ошибка загрузки: ${e.message}`, true));
+$("#btn-sample").addEventListener("click", async (ev) => {
+  await runTrackedJob("/api/jobs/sample", {}, {
+    button: ev.currentTarget,
+    onComplete: async () => {
+      await loadCompanies();
+      await loadProspects();
+    },
+  });
+});
+
+$("#btn-generate-drafts").addEventListener("click", async (ev) => {
+  const ch = $("#sel-draft-channel").value || "telegram";
+  await runTrackedJob(
+    "/api/jobs/drafts",
+    { channel: ch, limit: 20 },
+    {
+      button: ev.currentTarget,
+      onComplete: async (job) => {
+        const ready = job?.result?.drafts_ready ?? 0;
+        showToast(`Подготовлено черновиков: ${ready}`);
+        switchTab("drafts");
+      },
+    }
+  );
+});
+
+$("#btn-trigger-upload").addEventListener("click", () => {
+  $("#inp-import-file").click();
+});
+
+$("#inp-import-file").addEventListener("change", async (ev) => {
+  const file = ev.target.files?.[0];
+  if (!file) return;
+  const btn = $("#btn-trigger-upload");
+  btn.disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("city", $("#inp-city").value.trim());
+    const res = await fetch("/api/import/upload", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Ошибка загрузки");
+    showToast(`Импортировано компаний: ${data.inserted_companies}`);
+    await loadSummary();
+    await loadCompanies();
+    await loadProspects();
+  } catch (e) {
+    showToast(e.message, true);
+  } finally {
+    ev.target.value = "";
+    btn.disabled = false;
+  }
+});
+
+$("#btn-filter-cohort").addEventListener("click", loadCompanies);
+$("#flt-draft-channel").addEventListener("change", loadDrafts);
+
+$("#btn-export-csv").addEventListener("click", () => {
+  downloadExport("/api/export/csv", "friday_drafts.csv", "text/csv;charset=utf-8");
+});
+$("#btn-export-md").addEventListener("click", () => {
+  downloadExport("/api/export/markdown", "friday_drafts.md", "text/markdown;charset=utf-8");
+});
+
+/* ── Инициализация ── */
+(async () => {
+  try {
+    await loadNichePresets();
+    const state = await loadSummary(true);
+    if (state.niche_configured && (state.summary?.companies_total ?? 0) > 0) {
+      switchTab("workspace");
+    } else {
+      switchTab("project");
+    }
+  } catch (e) {
+    showToast(`Ошибка запуска: ${e.message}`, true);
+  }
+})();

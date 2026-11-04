@@ -96,21 +96,32 @@ async def seed_sample_for_active_niche(
     role2 = cfg.icp.decision_maker_titles[1].capitalize() if len(cfg.icp.decision_maker_titles) > 1 else "Генеральный директор"
     vac_role = cfg.icp.hiring_signals[0] if cfg.icp.hiring_signals else "менеджер по продажам"
 
+    ind_l = (cfg.icp.niche or ind).lower()
+    if any(k in ind_l for k in ("адвокат", "юрист", "юридич")):
+        name1, dom1 = "Адвокатское бюро «Правовой Альянс»", "https://pravo-alliance-demo.ru"
+        name2, dom2 = "Коллегия адвокатов «Арбитраж и Партнёры»", "https://arbitr-partners-demo.ru"
+    elif any(k in ind_l for k in ("клиник", "стоматолог", "медицин")):
+        name1, dom1 = "Клиника «МедЭксперт»", "https://medexpert-demo.ru"
+        name2, dom2 = "Центр стоматологии «ДентаПроф»", "https://dentaprof-demo.ru"
+    else:
+        name1, dom1 = f"ООО «Вектор» ({ind[:22]})", "https://vektor-b2b-demo.ru"
+        name2, dom2 = f"ГК «СеверПром» ({ind[:20]})", "https://severprom-demo.ru"
+
     samples: list[tuple[DiscoveredItem, Prospect | None]] = [
         (
             DiscoveredItem(
-                name=f"ООО «Альфа-{ind[:18]}»",
-                website="https://alfa-sample-b2b.ru",
+                name=name1,
+                website=dom1,
                 city=city1,
                 industry=ind,
                 company_size="25–60 сотрудников",
                 inn="7704123456",
                 phone="+7 (495) 740-11-22",
-                telegram="https://t.me/alfa_sample_b2b",
+                telegram="https://t.me/vektor_b2b_demo",
                 hh_url="https://hh.ru/employer/100001",
-                external_id="sample:alfa_b2b",
+                external_id=f"sample:{dom1}",
                 source="hh_ru",
-                description=f"Профильная компания сферы «{ind}» в г. {city1}.",
+                description=f"Профильная организация сегмента «{ind}» в г. {city1}.",
                 observations=[
                     {
                         "signal_code": "HH_HIRING_ROLE",
@@ -122,19 +133,19 @@ async def seed_sample_for_active_niche(
                         "signal_code": "YANDEX_DIRECT_ACTIVE",
                         "collector": "profile",
                         "value_text": "Запущены кампании в Яндекс.Директе",
-                        "evidence_url": "https://alfa-sample-b2b.ru",
+                        "evidence_url": dom1,
                     },
                     {
                         "signal_code": "NO_ONLINE_CAPTURE",
                         "collector": "profile",
-                        "value_text": "На посадочной нет квиза, онлайн-чата и захвата заявок",
-                        "evidence_url": "https://alfa-sample-b2b.ru",
+                        "value_text": "На сайте нет быстрой формы обращения и виджетов мессенджеров",
+                        "evidence_url": dom1,
                     },
                     {
                         "signal_code": "TELEGRAM_PUBLIC",
                         "collector": "profile",
-                        "value_text": "https://t.me/alfa_sample_b2b",
-                        "evidence_url": "https://alfa-sample-b2b.ru",
+                        "value_text": "https://t.me/vektor_b2b_demo",
+                        "evidence_url": dom1,
                     },
                 ],
             ),
@@ -144,10 +155,10 @@ async def seed_sample_for_active_niche(
                 middle_name="Викторович",
                 title=role1,
                 role_kind="icp_decision_maker",
-                email="a.gromov@alfa-sample-b2b.ru",
+                email=f"a.gromov@{dom1.removeprefix('https://')}",
                 email_source="personal_page",
                 phone="+7 (495) 740-11-22",
-                telegram="https://t.me/alfa_sample_b2b",
+                telegram="https://t.me/vektor_b2b_demo",
                 industry=ind,
                 city=city1,
                 source="website_team",
@@ -155,37 +166,37 @@ async def seed_sample_for_active_niche(
         ),
         (
             DiscoveredItem(
-                name=f"ГК «СеверПром» ({ind[:20]})",
-                website="https://severprom-sample.ru",
+                name=name2,
+                website=dom2,
                 city=city2,
                 industry=ind,
-                company_size="50–120 сотрудников",
+                company_size="30–90 сотрудников",
                 inn="7810654321",
                 phone="+7 (812) 602-44-19",
                 whatsapp="https://wa.me/78126024419",
-                external_id="sample:severprom",
+                external_id=f"sample:{dom2}",
                 source="yandex_search",
-                description=f"Поставщик и подрядчик направления «{q_label}» в {city2}.",
+                description=f"Организация направления «{q_label}» в г. {city2}.",
                 observations=[
                     {
                         "signal_code": "YANDEX_PAGE2_RANK",
                         "collector": "yandex_search",
                         "value_num": 14.0,
                         "value_text": f"Позиция #14 в Яндексе по запросу «{q_label} {city2}»",
-                        "evidence_url": "https://severprom-sample.ru",
+                        "evidence_url": dom2,
                     },
                     {
                         "signal_code": "THIN_SERVICE_STRUCTURE",
                         "collector": "profile",
                         "value_num": 2.0,
-                        "value_text": "Узкая структура (2 внутренние ссылки без отдельных посадочных)",
-                        "evidence_url": "https://severprom-sample.ru",
+                        "value_text": "Узкая структура страниц под профильные направления",
+                        "evidence_url": dom2,
                     },
                     {
                         "signal_code": "TECH_STACK_RU",
                         "collector": "profile",
                         "value_text": "1С-Битрикс",
-                        "evidence_url": "https://severprom-sample.ru",
+                        "evidence_url": dom2,
                     },
                 ],
             ),
@@ -195,7 +206,7 @@ async def seed_sample_for_active_niche(
                 middle_name="Андреевна",
                 title=role2,
                 role_kind="icp_decision_maker",
-                email="kovaleva@severprom-sample.ru",
+                email=f"kovaleva@{dom2.removeprefix('https://')}",
                 email_source="personal_page",
                 phone="+7 (812) 602-44-19",
                 whatsapp="https://wa.me/78126024419",

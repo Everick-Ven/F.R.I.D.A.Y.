@@ -111,11 +111,28 @@ def _build_template_draft(
         )
         audit_summary = f"1) Профильная компания ниши «{cfg.icp.niche}» ({city})."
 
-    offer_line = cfg.product.description.strip()
-    cta_goal = (cfg.product.offer.entry or "прислать короткий разбор из 3 пунктов").strip()
-    sender_sign = f"{cfg.persona.name}, {cfg.persona.role}".strip(", ")
-    if cfg.persona.company and cfg.persona.company != "Ваша компания":
-        sender_sign = f"{sender_sign} ({cfg.persona.company})".strip()
+    offer_raw = cfg.product.description.strip()
+    max_offer_words = 26 if channel in ("telegram", "whatsapp") else 52
+    offer_words = offer_raw.split()
+    if len(offer_words) > max_offer_words:
+        trimmed = " ".join(offer_words[:max_offer_words]).rstrip(",;:-— ")
+        offer_line = trimmed if trimmed.endswith(".") else f"{trimmed}."
+    else:
+        offer_line = offer_raw if offer_raw.endswith(".") else f"{offer_raw}."
+
+    cta_goal = (cfg.product.offer.entry or "прислать короткий разбор из 3 пунктов").strip().rstrip(".?")
+    person_name = cfg.persona.name.strip() if cfg.persona.name and cfg.persona.name.strip() != "Не задано" else ""
+    role_name = cfg.persona.role.strip() if cfg.persona.role else ""
+    comp_name = cfg.persona.company.strip() if cfg.persona.company and cfg.persona.company not in ("Ваша компания", "Наш проект") else ""
+
+    if person_name and comp_name:
+        sender_sign = f"{person_name}, {comp_name}"
+    elif person_name:
+        sender_sign = f"{person_name}, {role_name}".strip(", ")
+    elif comp_name:
+        sender_sign = f"Команда {comp_name}"
+    else:
+        sender_sign = role_name or "Команда проекта"
 
     if channel in ("telegram", "whatsapp"):
         body = (
@@ -264,6 +281,7 @@ async def generate_draft_for_prospect(
         await state.set_prospect_status(prospect.id, "draft_ready")
 
     return {
+        "ok": gate_res.passed,
         "queued": False,
         "draft_id": did,
         "prospect_id": prospect.id,

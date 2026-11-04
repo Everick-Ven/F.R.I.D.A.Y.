@@ -67,11 +67,14 @@ def test_dashboard_starts_clean_and_supports_niche_presets_and_pipeline(
         assert del_r.status_code == 200
         assert del_r.json()["status"] == "cancelled"
 
-        # Проверяем, что в HTML/JS нет ручного копирования промптов и ручной вставки JSON
+        # Проверяем, что в UI нет ручного копирования промптов, очереди агента и технических заметок
         html_txt = client.get("/").text
         js_txt = client.get("/static/app.js").text
         assert "Скопировать полный промпт задачи" not in html_txt + js_txt
         assert "Применить JSON-ответ" not in html_txt + js_txt
+        assert "Очередь задач ИИ-агента" not in html_txt + js_txt
+        assert "ФЗ-38" not in html_txt
+        assert "SQLite" not in html_txt
 
         # 5. И быстрый предпросмотр шаблонных черновиков + экспорт CSV
         tpl_res = client.post("/api/run/drafts", json={"channel": "telegram", "template_preview": True})
@@ -81,3 +84,89 @@ def test_dashboard_starts_clean_and_supports_niche_presets_and_pipeline(
         csv_r = client.get("/api/export/csv")
         assert csv_r.status_code == 200
         assert "Логистика" in csv_r.text or "Дистрибуция" in csv_r.text
+
+
+def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import time
+
+    monkeypatch.setattr("friday.trainer.LOCAL_CONFIG_PATH", tmp_path / "friday.local.yaml")
+    monkeypatch.setattr("friday.trainer.SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr("friday.dashboard.SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(
+        "friday.config.find_config_file",
+        lambda explicit_path=None: (
+            Path(explicit_path)
+            if explicit_path
+            else (
+                tmp_path / "friday.local.yaml"
+                if (tmp_path / "friday.local.yaml").exists()
+                else Path(__file__).resolve().parent.parent / "friday.yaml"
+            )
+        ),
+    )
+
+    async def _fast_crawl(url: str, *, timeout: float = 4.5) -> dict:
+        return {"url": url, "pages": [], "error": ""}
+
+    monkeypatch.setattr("friday.dashboard.crawl_product_site", _fast_crawl)
+
+    app = create_app(db_path=str(tmp_path / "live_jobs.db"))
+    with TestClient(app) as client:
+        start = client.post(
+            "/api/jobs/train",
+            json={
+                "website": "https://pravotraffic.ru",
+                "niche_hint": "Адвокаты и адвокатские бюро",
+                "brief": (
+                    "Разрабатываем сайты для адвокатов, настраиваем и ведем SEO, определяем приоритетные "
+                    "направления развития, предлагаем инструменты, распределяем задачи и формируем "
+                    "последовательный план работ с учётом целей, бюджета и особенностей адвокатской практики."
+                ),
+                "cities": ["Москва", "Санкт-Петербург", "Екатеринбург", "Казань"],
+            },
+        )
+        assert start.status_code == 200
+        job = start.json()
+        job_id = job["id"]
+
+        for _ in range(40):
+            job = client.get(f"/api/jobs/{job_id}").json()
+            if job["status"] != "running":
+                break
+            time.sleep(0.05)
+
+        assert job["status"] == "completed"
+        assert job["percent"] == 100
+        assert job["result"]["niche_configured"] is True
+
+        summary = client.get("/api/summary").json()
+        assert summary["niche_configured"] is True
+        assert summary["config"]["icp"]["niche"] == "Адвокаты и адвокатские бюро"
+        assert summary["config"]["compliance"]["regulated_niche"] == "legal_advocates"
+
+        # Демо-карточки под адвокатскую нишу + генерация черновиков с прогрессом
+        smp = client.post("/api/jobs/sample").json()
+        for _ in range(30):
+            smp = client.get(f"/api/jobs/{smp['id']}").json()
+            if smp["status"] != "running":
+                break
+            time.sleep(0.05)
+        assert smp["status"] == "completed"
+
+        dr = client.post("/api/jobs/drafts", json={"channel": "telegram", "limit": 10}).json()
+        for _ in range(40):
+            dr = client.get(f"/api/jobs/{dr['id']}").json()
+            if dr["status"] != "running":
+                break
+            time.sleep(0.05)
+        assert dr["status"] == "completed"
+        assert dr["result"]["drafts_ready"] >= 2
+
+        drafts = client.get("/api/drafts").json()["items"]
+        assert len(drafts) >= 2
+        assert all("Не задано" not in d["body"] for d in drafts)
+        assert all(d["status"] == "pending_review" for d in drafts)
+
