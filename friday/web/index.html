@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>F.R.I.D.A.Y. — Разведка и подготовка аутрича для юридического рынка РФ</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">F</div>
+      <div>
+        <div class="brand-title">F.R.I.D.A.Y.</div>
+        <div class="brand-sub">Разведка и подготовка ручного аутрича · ФЗ-38 «О рекламе» и ст. 17 КПЭА</div>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span id="brain-badge" class="badge badge-neutral">Brain: загрузка...</span>
+      <a class="btn btn-outline" href="/api/export/prospects.csv" download>CSV для Excel</a>
+      <a class="btn btn-outline" href="/api/export/dossiers.md" download>Тетрадь досье (.md)</a>
+    </div>
+  </header>
+
+  <nav class="tabs" id="main-tabs">
+    <button class="tab active" data-tab="overview">Обзор</button>
+    <button class="tab" data-tab="drafts">Черновики и досье <span id="tab-count-drafts" class="pill">0</span></button>
+    <button class="tab" data-tab="companies">Реестр практик <span id="tab-count-companies" class="pill">0</span></button>
+    <button class="tab" data-tab="signals">Словарь сигналов</button>
+    <button class="tab" data-tab="import">Импорт и источники</button>
+    <button class="tab" data-tab="tasks">Задачи ИИ-агента <span id="tab-count-tasks" class="pill">0</span></button>
+  </nav>
+
+  <main class="container">
+    <div id="toast" class="toast hidden"></div>
+
+    <!-- Вкладка: Обзор -->
+    <section id="view-overview" class="view active">
+      <div class="kpi-grid" id="kpi-grid"></div>
+
+      <div class="two-col">
+        <div class="card">
+          <h2>Быстрые действия пайплайна</h2>
+          <p class="muted">
+            Система работает строго в режиме <strong>«Разведка + черновики»</strong>: собирает сигналы по Яндексу, 2ГИС, Яндекс Картам, реестрам и сайтам практик, проверяет тексты по 38-ФЗ и ст. 17 КПЭА и готовит сообщения для вашей личной отправки.
+          </p>
+          <div class="action-row">
+            <button class="btn btn-primary" id="btn-confirm-free">1. Подтвердить бесплатные сигналы</button>
+            <button class="btn btn-primary" id="btn-run-prepare">2. Оценить и собрать черновики</button>
+            <button class="btn btn-outline" id="btn-run-template">Каркас черновиков без LLM (Template)</button>
+          </div>
+          <div id="pipeline-result" class="notice hidden"></div>
+        </div>
+
+        <div class="card">
+          <h2>Контур мышления (Brain) и позиционирование</h2>
+          <div id="brain-details" class="kv-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Вкладка: Черновики и досье -->
+    <section id="view-drafts" class="view">
+      <div class="toolbar">
+        <div>
+          <h2>Персональные черновики для ручной отправки</h2>
+          <p class="muted">Скопируйте проверенный текст в Telegram, TenChat или личную почту только тем, кому контакт уместен.</p>
+        </div>
+        <div class="filter-group">
+          <select id="draft-status-filter">
+            <option value="">Все статусы</option>
+            <option value="pending_review">Ждут проверки</option>
+            <option value="approved">Одобрены</option>
+            <option value="sent_manually">Отправлены вручную</option>
+            <option value="gate_blocked">Остановлены фильтром ФЗ-38/КПЭА</option>
+          </select>
+          <select id="draft-channel-filter">
+            <option value="">Все каналы</option>
+            <option value="telegram">Telegram</option>
+            <option value="email">Email</option>
+            <option value="tenchat">TenChat</option>
+          </select>
+        </div>
+      </div>
+      <div id="drafts-list" class="stack"></div>
+    </section>
+
+    <!-- Вкладка: Реестр практик -->
+    <section id="view-companies" class="view">
+      <div class="toolbar">
+        <div>
+          <h2>Реестр адвокатских образований и практик</h2>
+          <p class="muted">Каждая найденная коллегия, бюро и адвокатский кабинет с оценкой Fit (0–100) и подтверждёнными сигналами.</p>
+        </div>
+        <input type="search" id="company-search" placeholder="Поиск по названию, городу, ФИО или сигналу..." class="search-input">
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Fit</th>
+              <th>Адвокатское образование / Практика</th>
+              <th>Город</th>
+              <th>ЛПР и контакты</th>
+              <th>Сигналы и стек</th>
+              <th>Статус</th>
+            </tr>
+          </thead>
+          <tbody id="companies-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Вкладка: Словарь сигналов -->
+    <section id="view-signals" class="view">
+      <div class="toolbar">
+        <div>
+          <h2>Управляемый словарь сигналов</h2>
+          <p class="muted">F.R.I.D.A.Y. собирает только те сигналы, которые вы подтвердили (`confirmed`). Каждый факт хранится в `observations` со ссылкой-доказательством.</p>
+        </div>
+        <div class="action-row">
+          <button class="btn btn-primary" id="btn-sig-free">Подтвердить все бесплатные</button>
+          <button class="btn btn-outline" id="btn-sig-all">Подтвердить все (вкл. платный SERP)</button>
+        </div>
+      </div>
+      <div id="signals-list" class="stack"></div>
+    </section>
+
+    <!-- Вкладка: Импорт и источники -->
+    <section id="view-import" class="view">
+      <div class="two-col">
+        <div class="card">
+          <h2>Импорт своего списка или выгрузки реестра адвокатов</h2>
+          <p class="muted">Вставьте CSV (с `;` или `,`), JSON, HTML-таблицу региональной адвокатской палаты / Минюста или просто список доменов и @telegram по одному на строку.</p>
+          <div class="form-row">
+            <input type="text" id="import-city" placeholder="Город по умолчанию (например: Москва)" class="input">
+            <label class="checkbox-label">
+              <input type="checkbox" id="import-is-registry">
+              Это выгрузка реестра адвокатов (отсеять приостановленные/прекращённые статусы)
+            </label>
+          </div>
+          <textarea id="import-textarea" rows="9" class="textarea" placeholder="название;фио;реестровый номер;статус;город;сайт;telegram&#10;МКА «Арбитраж и Право»;Волков Алексей Сергеевич;77/99001;действующий;Москва;https://arbitr-volkov.example;@volkov_advokat"></textarea>
+          <div class="action-row">
+            <button class="btn btn-primary" id="btn-do-import">Импортировать в базу</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Провайдеры автоматического поиска (DISCOVER)</h2>
+          <div id="providers-list" class="stack-sm"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Вкладка: Задачи ИИ-агента -->
+    <section id="view-tasks" class="view">
+      <div class="card">
+        <h2>Очередь задач для ИИ-агента рабочей среды (`brain.provider: agent`)</h2>
+        <p class="muted">
+          Когда F.R.I.D.A.Y. работает на базе внешнего ИИ-агента (например, Arena.ai Agent Mode, Cursor или Claude Code без отдельного API-ключа),
+          Python-коллекторы собирают проверенные факты и формируют готовые промпты здесь и в папке <code>data/agent_tasks/</code>.
+        </p>
+        <div id="tasks-list" class="stack"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

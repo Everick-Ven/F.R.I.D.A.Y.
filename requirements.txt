@@ -1,0 +1,9 @@
+# Синхронизировано с [project.dependencies] в pyproject.toml
+pyyaml>=6.0.1,<7
+python-dotenv>=1.0.1,<2
+httpx>=0.27.0,<1
+beautifulsoup4>=4.12.3,<5
+aiosqlite>=0.19,<1
+pydantic>=2.5,<3
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
