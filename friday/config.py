@@ -1,6 +1,6 @@
 """Загрузка, валидация и сохранение конфигурации F.R.I.D.A.Y. (`friday.yaml` / `friday.local.yaml`).
 
-Как и в Harvey:
+Принцип разделения конфигурации:
 - отслеживаемый в Git `friday.yaml` остаётся чистым шаблоном («Ваша компания»);
 - на Шаге 1 (задание ниши через `friday train`, веб-панель или ИИ-агента) создаётся
   `friday.local.yaml` (в `.gitignore`), который автоматически имеет приоритет.
@@ -113,7 +113,7 @@ class FridayConfig(BaseModel):
     source_path: str = Field(default="", exclude=True)
 
     def is_niche_configured(self) -> bool:
-        """Проверка Шага 1 (как в Harvey): задана ли реальная ниша и продукт вместо шаблона."""
+        """Проверка Шага 1: задана ли реальная ниша и продукт вместо стартового шаблона."""
         comp_low = (self.persona.company or "").strip().lower()
         prod_low = (self.product.name or "").strip().lower()
         has_targets = bool(self.icp.niche.strip() or self.icp.search_queries or self.icp.industries)

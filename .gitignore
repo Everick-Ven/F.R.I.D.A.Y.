@@ -1,4 +1,4 @@
-# Environment & local trained configuration (like Harvey's harvey.local.yaml)
+# Environment & local trained configuration
 .env
 .env.*
 !.env.example
