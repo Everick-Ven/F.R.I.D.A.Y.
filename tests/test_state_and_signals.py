@@ -1,78 +1,55 @@
-"""Тесты SQLite состояния, управляемого словаря сигналов, триггера наблюдений и когорт."""
+"""Тесты SQLite WAL, каталога сигналов РФ, триггера observations и дедупликации .рф / ИНН."""
+
+from __future__ import annotations
 
 import aiosqlite
 import pytest
 
-from friday.models import Company
-from friday.signals import seed_signal_catalog
+from friday.models.company import Company
 from friday.state import StateManager
 
 
 @pytest.mark.asyncio
-async def test_signal_vocabulary_gate_and_trigger(tmp_path):
-    st = StateManager(db_path=tmp_path / "gov.db")
-    await st.init_db()
-    count = await seed_signal_catalog(st, auto_confirm_free=False)
-    assert count >= 20
-
-    cid, is_new = await st.upsert_company(
-        Company(name="КА «Север»", domain="sever-law.example", city="Москва")
-    )
-    assert is_new is True
-
-    # Пока сигнал в статусе proposed — он НЕ записывается
-    obs_none = await st.record_observation(
-        signal_code="NO_YANDEX_METRIKA",
-        company_id=cid,
-        collector="profile",
-        value_num=1.0,
-    )
-    assert obs_none is None
-
-    # После подтверждения человеком — записывается
-    await st.set_signal_status("NO_YANDEX_METRIKA", "confirmed")
-    obs_ok = await st.record_observation(
-        signal_code="NO_YANDEX_METRIKA",
-        company_id=cid,
-        collector="profile",
-        value_num=1.0,
-        evidence_url="https://sever-law.example",
-    )
-    assert obs_ok is not None
-
-    # Попытка вставить сигнал вне словаря отклоняется SQLite-триггером
+async def test_unknown_signal_code_aborted_by_sqlite_trigger(state: StateManager):
     with pytest.raises(aiosqlite.IntegrityError):
-        await st.record_observation(
-            signal_code="INVENTED_JUNK_SIGNAL",
-            company_id=cid,
+        await state.record_observation(
+            signal_code="NON_EXISTENT_SIGNAL_999",
+            company_id="dummy",
+            require_confirmed=False,
         )
 
 
 @pytest.mark.asyncio
-async def test_idn_rf_dedup_and_cohort_intersection(state_db: StateManager):
-    # Кириллический домен .рф и его punycode должны склеиваться в одну практику
-    cid1, new1 = await state_db.upsert_company(
-        Company(name="АБ «Правоведъ»", website="https://адвокат-тест.рф", city="Казань")
+async def test_idn_rf_and_inn_deduplication_and_cohort(state: StateManager):
+    c1_id, created1 = await state.upsert_company(
+        Company(
+            name="ООО ПромСнаб",
+            website="https://промснаб-тест.рф",
+            industry="Оптовая торговля",
+            inn="7701987654",
+            city="Москва",
+        )
     )
-    cid2, new2 = await state_db.upsert_company(
-        Company(name="АБ «Правоведъ»", domain="www.xn----7sbahjj6a5a5ahbc.xn--p1ai", phone="+7 (843) 000-00-01")
+    assert created1 is True
+
+    # Повторная запись с punycode того же домена .рф не создаёт дубликат
+    puny = "промснаб-тест.рф".encode("idna").decode("ascii")
+    c2_id, created2 = await state.upsert_company(
+        Company(name="ООО ПромСнаб МСК", website=f"http://www.{puny}/about", city="Москва")
     )
-    assert new1 is True
-    assert new2 is False
-    assert cid1 == cid2
+    assert created2 is False
+    assert c1_id == c2_id
 
-    cid_other, _ = await state_db.upsert_company(
-        Company(name="КА «Вектор»", domain="vektor-law.example", city="Казань")
+    c3_id, _ = await state.upsert_company(
+        Company(name="Завод Вектор", website="https://vektor-zavod.ru", industry="Производство", city="Казань")
     )
 
-    await state_db.record_observation(signal_code="NO_YANDEX_METRIKA", company_id=cid1, value_num=1.0)
-    await state_db.record_observation(signal_code="MISSING_PRACTICE_PAGES", company_id=cid1, value_num=1.0)
+    await state.record_observation(signal_code="HH_HIRING_ROLE", company_id=c1_id, value_text="РОП")
+    await state.record_observation(signal_code="NO_ONLINE_CAPTURE", company_id=c1_id, value_text="Нет форм")
+    await state.record_observation(signal_code="HH_HIRING_ROLE", company_id=c3_id, value_text="Логист")
 
-    await state_db.record_observation(signal_code="NO_YANDEX_METRIKA", company_id=cid_other, value_num=1.0)
-    await state_db.record_observation(signal_code="RUNNING_YANDEX_DIRECT", company_id=cid_other, value_text="Calltouch")
+    both = await state.cohort(require=["HH_HIRING_ROLE", "NO_ONLINE_CAPTURE"])
+    assert [c.id for c in both] == [c1_id]
 
-    cohort_a = await state_db.cohort(
-        require=["NO_YANDEX_METRIKA", "MISSING_PRACTICE_PAGES"],
-        exclude=["RUNNING_YANDEX_DIRECT"],
-    )
-    assert [c.id for c in cohort_a] == [cid1]
+    excl = await state.cohort(require=["HH_HIRING_ROLE"], exclude=["NO_ONLINE_CAPTURE"])
+    assert [c.id for c in excl] == [c3_id]

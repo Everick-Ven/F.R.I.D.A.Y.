@@ -1,380 +1,280 @@
-"""Brain — мульти-провайдерный аналитический движок F.R.I.D.A.Y.
+"""Мозг F.R.I.D.A.Y. — Вариант А: ИИ-агент рабочей среды как Мозг (`agent` mode).
 
-Поддерживает 4 режима мышления (`brain.provider` в `friday.yaml`):
-1. `claude` (по умолчанию, как у Harvey) — локальный вызов `claude -p` по подписке Claude Max/Pro
-   в полной изоляции без инструментов.
-2. `agent` — работа на базе самого ИИ-агента рабочей среды (Arena.ai Agent Mode, Cursor, Windsurf,
-   Claude Code). Python собирает все факты детерминированно и складывает готовые пакеты задач в
-   таблицу `agent_tasks` и папку `data/agent_tasks/`, а агент среды читает их, анализирует и
-   применяет ответы через `friday tasks apply`.
-3. `openai_compatible` — универсальный HTTP-клиент для любого OpenAI-совместимого API
-   (OpenRouter, локальный Ollama/vLLM, Qwen, DeepSeek, шлюзы YandexGPT / GigaChat).
-4. `template` — полностью автономный детерминированный режим без LLM (строит оценку и аккуратный
-   каркас сообщения исключительно по подтверждённым сигналам).
+Архитектурный принцип:
+- F.R.I.D.A.Y. НЕ требует платных API-ключей к внешним LLM и НЕ вызывает сторонние CLI.
+- Python-ядро детерминированно собирает данные (Яндекс, 2ГИС, hh.ru, сайты компаний),
+  изолирует внешний текст в `<untrusted>`, проверяет юридический шлюз ФЗ-38 (`gate.py`)
+  и формирует структурированные пакеты задач (`agent_tasks`) для ИИ-агента рабочей среды
+  (Arena.ai Agent Mode, Cursor, Windsurf, Claude Code и др.).
+- ИИ-агент рабочей среды читает задачу через `friday tasks next` (или `data/agent_tasks/`),
+  выполняет интеллектуальную работу (`train_niche`, `scout_score`, `writer_draft`)
+  и записывает результат через `friday tasks apply <task_id> '<json>'` (или REST API).
+- Дополнительно доступен режим `template` — мгновенный детерминированный предпросмотр
+  черновиков и скоринга без ожидания ответа агента.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-import logging
 import re
-import time
 from pathlib import Path
 
-import httpx
-
-from friday.config import BrainConfig, EnvConfig, FridayConfig, load_env
-from friday.paths import AGENT_TASKS_DIR, PROMPTS_DIR, SKILLS_DIR
+from friday.config import FridayConfig, load_config
+from friday.gate import validate_draft
+from friday.models.draft import Draft
+from friday.paths import DATA_DIR, PROMPTS_DIR, SKILLS_DIR
 from friday.state import StateManager
-from friday.textio import read_user_text
+from friday.trainer import apply_niche_setup
 
-logger = logging.getLogger("friday.brain")
+JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
-DEFAULT_TIMEOUT_SECONDS = 240.0
-DEFAULT_MAX_RETRIES = 2
-RETRY_BASE_DELAY = 3.0
 
-SKILL_MAP: dict[str, tuple[str, ...]] = {
-    "scout": (
-        "fz38_kpea_compliance.md",
-        "signal_playbook_ru.md",
-        "lead_qualification_ru.md",
-    ),
-    "writer": (
-        "fz38_kpea_compliance.md",
-        "signal_playbook_ru.md",
-        "outreach_frameworks_ru.md",
-    ),
-}
+class BrainError(RuntimeError):
+    """Ошибка обработки задачи Мозга."""
 
 
 class AgentTaskQueued(Exception):
-    """В режиме `brain.provider == 'agent'` задача поставлена в очередь для ИИ-агента среды."""
+    """Сигнал о том, что задача поставлена в очередь для ИИ-агента рабочей среды."""
 
-    def __init__(self, task_id: str, file_path: str):
-        super().__init__(f"Задача поставлена в очередь ИИ-агента: {task_id} ({file_path})")
+    def __init__(self, task_id: str, kind: str, task_file: str = ""):
+        super().__init__(f"Создана задача ИИ-агента #{task_id} ({kind})")
         self.task_id = task_id
-        self.file_path = file_path
+        self.kind = kind
+        self.task_file = task_file
 
 
-def extract_json_payload(raw_text: str):
-    """Извлечь JSON-объект или JSON-массив из ответа модели (устойчиво к ```json обёрткам)."""
-    if not raw_text:
-        return None
-    cleaned = raw_text.strip()
-    fence_match = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL | re.IGNORECASE)
-    if fence_match:
-        cleaned = fence_match.group(1).strip()
+def load_prompt(name: str) -> str:
+    path = PROMPTS_DIR / f"{name}.md"
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def load_skills(names: list[str] | None = None) -> str:
+    """Собирает активные базы знаний из `skills/*.md` (включая обученный `product_knowledge.md`)."""
+    if not SKILLS_DIR.exists():
+        return ""
+    chunks: list[str] = []
+    if names is None:
+        # Порядок важен: сначала обученный продукт и конкуренты, затем универсальные плейбуки РФ
+        priority = [
+            "product_knowledge",
+            "competitive_intel",
+            "ru_compliance",
+            "signal_playbook_ru",
+            "lead_qualification_ru",
+            "outreach_frameworks_ru",
+        ]
+        seen: set[str] = set()
+        ordered_files: list[Path] = []
+        for stem in priority:
+            p = SKILLS_DIR / f"{stem}.md"
+            if p.exists():
+                ordered_files.append(p)
+                seen.add(p.name)
+        for p in sorted(SKILLS_DIR.glob("*.md")):
+            if p.name != "README.md" and p.name not in seen:
+                ordered_files.append(p)
+        files = ordered_files
+    else:
+        files = [SKILLS_DIR / f"{n}.md" for n in names if (SKILLS_DIR / f"{n}.md").exists()]
+
+    for f in files:
+        chunks.append(f"### Навык: {f.stem}\n\n{f.read_text(encoding='utf-8').strip()}")
+    return "\n\n---\n\n".join(chunks)
+
+
+def extract_json_object(raw: str | dict) -> dict:
+    """Извлекает JSON-объект из ответа ИИ-агента (поддерживает чистый JSON и markdown-блоки)."""
+    if isinstance(raw, dict):
+        return raw
+    text = (raw or "").strip()
+    if not text:
+        raise BrainError("Пустой JSON-ответ")
     try:
-        return json.loads(cleaned)
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except ValueError:
         pass
 
-    # Поиск первого сбалансированного [...] или {...}
-    for open_ch, close_ch in (("[", "]"), ("{", "}")):
-        start = cleaned.find(open_ch)
-        end = cleaned.rfind(close_ch)
-        if start != -1 and end > start:
-            snippet = cleaned[start : end + 1]
-            try:
-                return json.loads(snippet)
-            except ValueError:
-                continue
-    return None
-
-
-class Brain:
-    def __init__(
-        self,
-        state: StateManager,
-        brain_config: BrainConfig | None = None,
-        env: EnvConfig | None = None,
-    ):
-        self.state = state
-        self.config = brain_config or BrainConfig()
-        self.env = env or load_env()
-        self.provider = self.config.provider
-        self.model = self.config.model
-        self.last_reply_empty = False
-
-    def load_prompt(self, name: str, variables: dict[str, str] | None = None) -> str:
-        path = PROMPTS_DIR / f"{name}.md"
-        if not path.exists():
-            return ""
-        text = read_user_text(path)
-        for key, val in (variables or {}).items():
-            text = text.replace("{{" + key + "}}", str(val))
-        return text
-
-    def load_skills_for_agent(self, agent_name: str) -> str:
-        files = SKILL_MAP.get(agent_name, ())
-        chunks: list[str] = []
-        for fname in files:
-            p = SKILLS_DIR / fname
-            if p.exists():
-                chunks.append(read_user_text(p).strip())
-        local_rules = SKILLS_DIR / "outreach_rules.local.md"
-        if agent_name == "writer" and local_rules.exists():
-            chunks.append(read_user_text(local_rules).strip())
-        return "\n\n---\n\n".join(c for c in chunks if c)
-
-    def build_system_header(self, config: FridayConfig) -> str:
-        return self.load_prompt(
-            "system",
-            {
-                "company_name": config.persona.company,
-                "bureau_description": config.bureau.description,
-            },
-        )
-
-    async def preflight(self) -> tuple[bool, str]:
-        """Проверить готовность выбранного провайдера без платного вызова модели."""
-        if self.provider == "template":
-            return True, "Детерминированный режим `template` активен (внешняя LLM не требуется)."
-        if self.provider == "agent":
-            return True, (
-                "Режим `agent` активен: задачи анализа и генерации сохраняются в `data/agent_tasks/` "
-                "для выполнения непосредственно ИИ-агентом вашей среды (например, Arena / Cursor)."
-            )
-        if self.provider == "openai_compatible":
-            base_url = self.env.openai_base_url or "https://api.openai.com/v1"
-            model = self.model or self.env.openai_model
-            if not model:
-                return False, "Для `openai_compatible` укажите `brain.model` в friday.yaml или `OPENAI_MODEL` в .env."
-            if "localhost" not in base_url and "127.0.0.1" not in base_url and not self.env.openai_api_key:
-                return False, "Для внешнего `openai_compatible` шлюза укажите `OPENAI_API_KEY` в .env."
-            return True, f"OpenAI-совместимый API готов ({base_url}, модель {model})."
-
-        # Default: claude CLI
-        from friday.claude_runtime import ClaudeRuntimeError, check_cli
-
+    m = JSON_BLOCK_RE.search(text)
+    if m:
         try:
-            exe = await asyncio.to_thread(check_cli)
-            return True, f"Claude CLI готов и изолирован ({exe})."
-        except ClaudeRuntimeError as exc:
-            return False, str(exc)
-
-    async def queue_for_workspace_agent(
-        self,
-        *,
-        kind: str,
-        payload: dict,
-        prompt: str,
-    ) -> tuple[str, Path]:
-        """Сохранить задачу для выполнения самим ИИ-агентом рабочей среды."""
-        task_id = await self.state.create_agent_task(kind=kind, payload=payload, prompt_text=prompt)
-        AGENT_TASKS_DIR.mkdir(parents=True, exist_ok=True)
-        task_file = AGENT_TASKS_DIR / f"{task_id}_{kind}.json"
-        packet = {
-            "task_id": task_id,
-            "kind": kind,
-            "instructions": (
-                "Прочитайте поле `prompt`, сформируйте строго валидный JSON-ответ и примените его "
-                f"командой: friday tasks apply {task_id} --file <путь_к_ответу.json>"
-            ),
-            "payload": payload,
-            "prompt": prompt,
-        }
-        task_file.write_text(json.dumps(packet, ensure_ascii=False, indent=2), encoding="utf-8")
-        return task_id, task_file
-
-    async def think(
-        self,
-        prompt: str,
-        *,
-        agent: str = "",
-        task: str = "",
-        task_payload: dict | None = None,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
-        max_retries: int = DEFAULT_MAX_RETRIES,
-    ) -> str:
-        """Отправить промпт выбранному провайдеру мышления и вернуть текст ответа."""
-        self.last_reply_empty = False
-        if self.provider == "agent":
-            tid, tpath = await self.queue_for_workspace_agent(
-                kind=task or agent or "generic",
-                payload=task_payload or {},
-                prompt=prompt,
-            )
-            raise AgentTaskQueued(tid, str(tpath))
-
-        if self.provider == "openai_compatible":
-            return await self._think_openai_compatible(
-                prompt, agent=agent, task=task, timeout=timeout, max_retries=max_retries
-            )
-
-        if self.provider == "claude":
-            return await self._think_claude(
-                prompt, agent=agent, task=task, timeout=timeout, max_retries=max_retries
-            )
-
-        self.last_reply_empty = True
-        return ""
-
-    async def think_json(
-        self,
-        prompt: str,
-        *,
-        agent: str = "",
-        task: str = "",
-        task_payload: dict | None = None,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
-    ):
-        """Получить и распарсить JSON-ответ от модели."""
-        raw = await self.think(
-            prompt, agent=agent, task=task, task_payload=task_payload, timeout=timeout
-        )
-        if not raw:
-            self.last_reply_empty = True
-            return None
-        return extract_json_payload(raw)
-
-    async def _think_claude(
-        self,
-        prompt: str,
-        *,
-        agent: str,
-        task: str,
-        timeout: float,
-        max_retries: int,
-    ) -> str:
-        from friday import claude_runtime
-
-        try:
-            executable = await asyncio.to_thread(claude_runtime.check_cli)
-        except claude_runtime.ClaudeRuntimeError as exc:
-            logger.error("Вызов Claude отменён: %s", exc)
-            self.last_reply_empty = True
-            return ""
-
-        cmd = claude_runtime.build_command(executable, self.model)
-        for attempt in range(max_retries + 1):
-            if attempt > 0:
-                await asyncio.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
-            t0 = time.monotonic()
-            process = None
-            try:
-                with claude_runtime.isolated_cwd() as cwd:
-                    process = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        cwd=cwd,
-                        env=claude_runtime.runtime_env(cwd),
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(prompt.encode("utf-8")),
-                        timeout=timeout,
-                    )
-                duration_ms = int((time.monotonic() - t0) * 1000)
-                if process.returncode != 0:
-                    err = stderr.decode("utf-8", errors="replace").strip()
-                    logger.error("Claude завершился с кодом %s: %s", process.returncode, err[:300])
-                    if any(x in err.lower() for x in ("not logged in", "claude login", "unauthorized")):
-                        self.last_reply_empty = True
-                        return ""
-                    continue
-
-                raw_out = stdout.decode("utf-8", errors="replace").strip()
-                text, usage_meta, is_err = self._parse_claude_json(raw_out)
-                await self.state.record_usage_event(
-                    provider="claude",
-                    agent=agent,
-                    task=task,
-                    model=usage_meta.get("model", self.model or "claude"),
-                    input_tokens=int(usage_meta.get("input_tokens", 0)),
-                    output_tokens=int(usage_meta.get("output_tokens", 0)),
-                    duration_ms=duration_ms,
-                    is_error=is_err,
-                )
-                if is_err:
-                    continue
-                return text
-            except asyncio.TimeoutError:
-                logger.error("Таймаут вызова Claude (%.0fs)", timeout)
-                if process and process.returncode is None:
-                    process.kill()
-                    await process.wait()
-            except Exception as exc:
-                logger.error("Ошибка вызова Claude: %s", exc)
-
-        self.last_reply_empty = True
-        return ""
-
-    @staticmethod
-    def _parse_claude_json(raw: str) -> tuple[str, dict, bool]:
-        try:
-            payload = json.loads(raw)
+            obj = json.loads(m.group(1))
+            if isinstance(obj, dict):
+                return obj
         except ValueError:
-            return raw, {}, False
-        if not isinstance(payload, dict):
-            return raw, {}, False
-        usage = payload.get("usage") or {}
-        meta = {
-            "model": payload.get("model", ""),
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-        }
-        return str(payload.get("result") or ""), meta, bool(payload.get("is_error"))
+            pass
 
-    async def _think_openai_compatible(
-        self,
-        prompt: str,
-        *,
-        agent: str,
-        task: str,
-        timeout: float,
-        max_retries: int,
-    ) -> str:
-        base_url = (self.env.openai_base_url or "https://api.openai.com/v1").rstrip("/")
-        model = self.model or self.env.openai_model
-        if not model:
-            logger.error("Не задана модель для openai_compatible.")
-            self.last_reply_empty = True
-            return ""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(text[start : end + 1])
+            if isinstance(obj, dict):
+                return obj
+        except ValueError as exc:
+            raise BrainError(f"Не удалось разобрать JSON ответа: {exc}") from exc
 
-        headers = {"Content-Type": "application/json"}
-        if self.env.openai_api_key:
-            headers["Authorization"] = f"Bearer {self.env.openai_api_key}"
+    raise BrainError(f"Ответ не содержит валидного JSON-объекта: {text[:240]}")
 
-        url = f"{base_url}/chat/completions"
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-        }
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            for attempt in range(max_retries + 1):
-                if attempt > 0:
-                    await asyncio.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
-                t0 = time.monotonic()
-                try:
-                    resp = await client.post(url, headers=headers, json=body)
-                    duration_ms = int((time.monotonic() - t0) * 1000)
-                    if resp.status_code >= 500 or resp.status_code == 429:
-                        logger.warning("HTTP %s от LLM API, повтор...", resp.status_code)
-                        continue
-                    resp.raise_for_status()
-                    data = resp.json()
-                    choices = data.get("choices") or []
-                    content = (choices[0].get("message") or {}).get("content", "") if choices else ""
-                    usage = data.get("usage") or {}
-                    await self.state.record_usage_event(
-                        provider="openai_compatible",
-                        agent=agent,
-                        task=task,
-                        model=model,
-                        input_tokens=int(usage.get("prompt_tokens", 0)),
-                        output_tokens=int(usage.get("completion_tokens", 0)),
-                        duration_ms=duration_ms,
-                        is_error=False,
-                    )
-                    return str(content).strip()
-                except Exception as exc:
-                    logger.error("Ошибка OpenAI-совместимого вызова: %s", exc)
+def _tasks_dir(cfg: FridayConfig) -> Path:
+    raw = (cfg.brain.tasks_dir or "data/agent_tasks").strip()
+    p = Path(raw)
+    if not p.is_absolute():
+        p = DATA_DIR.parent / p
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-        self.last_reply_empty = True
-        return ""
+
+async def enqueue_agent_task(
+    state: StateManager,
+    cfg: FridayConfig,
+    *,
+    kind: str,
+    payload: dict,
+    system_prompt: str,
+    user_prompt: str,
+) -> tuple[str, str]:
+    """Создаёт задачу для ИИ-агента рабочей среды в SQLite и в `data/agent_tasks/`."""
+    full_prompt = (
+        f"# СИСТЕМНАЯ ИНСТРУКЦИЯ F.R.I.D.A.Y.\n\n{system_prompt.strip()}\n\n"
+        f"---\n\n# ЗАДАЧА ({kind})\n\n{user_prompt.strip()}\n"
+    )
+    tid = await state.create_agent_task(
+        kind=kind,
+        payload=payload,
+        prompt_text=full_prompt,
+    )
+    tdir = _tasks_dir(cfg)
+    task_file = tdir / f"{tid}_{kind}.json"
+    packet = {
+        "task_id": tid,
+        "kind": kind,
+        "status": "pending",
+        "how_to_apply_cli": f"friday tasks apply {tid} '<json>'",
+        "payload": payload,
+        "prompt": full_prompt,
+    }
+    task_file.write_text(json.dumps(packet, ensure_ascii=False, indent=2), encoding="utf-8")
+    return tid, str(task_file)
+
+
+async def apply_agent_task_result(
+    state: StateManager,
+    task_id: str,
+    raw_result: str | dict,
+    cfg: FridayConfig | None = None,
+) -> dict:
+    """Применяет JSON-ответ ИИ-агента рабочей среды к состоянию F.R.I.D.A.Y.
+
+    Поддерживаемые типы задач (`kind`):
+    - `train_niche`  -> обновляет `friday.local.yaml`, `skills/product_knowledge.md`, `skills/competitive_intel.md`
+    - `scout_score`  -> обновляет `score` и `personalization_notes` у ЛПР
+    - `writer_draft` -> прогоняет текст через детерминированный шлюз `gate.py` (ФЗ-38) и сохраняет черновик
+    """
+    cfg = cfg or load_config()
+    tasks = await state.list_agent_tasks(status="all")
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if not task:
+        raise BrainError(f"Задача #{task_id} не найдена в очереди agent_tasks")
+
+    parsed = extract_json_object(raw_result)
+    kind = task["kind"]
+    payload = task.get("payload") or {}
+    outcome: dict = {"task_id": task_id, "kind": kind}
+
+    if kind == "train_niche":
+        applied = apply_niche_setup(parsed, base_config=cfg)
+        outcome["setup"] = applied
+
+    elif kind == "scout_score":
+        prospect_id = str(payload.get("prospect_id") or parsed.get("prospect_id") or "")
+        if not prospect_id:
+            raise BrainError("В задаче scout_score отсутствует prospect_id")
+        base_score = int(payload.get("deterministic_score") or 50)
+        ai_score = int(parsed.get("score", base_score))
+        blended = max(0, min(100, round(0.5 * base_score + 0.5 * ai_score)))
+        angle = str(parsed.get("angle") or parsed.get("personalization_notes") or "").strip()
+        if not angle:
+            raise BrainError("Поле `angle` (угол персонализации) не должно быть пустым")
+        await state.update_prospect_scoring(
+            prospect_id,
+            score=blended,
+            personalization_notes=angle,
+        )
+        outcome.update({"prospect_id": prospect_id, "score": blended, "angle": angle})
+
+    elif kind == "writer_draft":
+        prospect_id = str(payload.get("prospect_id") or parsed.get("prospect_id") or "")
+        channel = str(payload.get("channel") or parsed.get("channel") or "telegram")
+        prospect = await state.get_prospect(prospect_id)
+        if not prospect:
+            raise BrainError(f"ЛПР {prospect_id} не найден")
+        company = await state.get_company(prospect.company_id) if prospect.company_id else None
+
+        subject = str(parsed.get("subject") or "").strip()
+        body = str(parsed.get("body") or "").strip()
+        audit_summary = str(parsed.get("audit_summary") or "").strip()
+        signal_used = str(parsed.get("signal_used") or "").strip()
+        if not body:
+            raise BrainError("Поле `body` (текст черновика) не должно быть пустым")
+
+        gate_res = validate_draft(
+            channel=channel,
+            subject=subject,
+            body=body,
+            company_domain=company.domain if company else "",
+            prospect_email=prospect.email,
+            prospect_telegram=prospect.telegram or (company.telegram if company else ""),
+            config=cfg,
+        )
+        status = "pending_review" if gate_res.passed else "gate_blocked"
+        notes = [*gate_res.reasons, *gate_res.warnings]
+
+        draft = Draft(
+            prospect_id=prospect.id,
+            company_id=prospect.company_id,
+            channel=channel,
+            subject=subject,
+            body=body,
+            audit_summary=audit_summary,
+            signal_used=signal_used,
+            status=status,
+            gate_notes=notes,
+            brain_provider="agent",
+        )
+        did = await state.upsert_draft(draft)
+        if gate_res.passed and prospect.status == "new":
+            await state.set_prospect_status(prospect.id, "draft_ready")
+        outcome.update(
+            {
+                "draft_id": did,
+                "prospect_id": prospect.id,
+                "channel": channel,
+                "gate_passed": gate_res.passed,
+                "status": status,
+                "gate_notes": notes,
+            }
+        )
+    else:
+        raise BrainError(f"Неизвестный тип задачи: {kind}")
+
+    raw_json_str = json.dumps(parsed, ensure_ascii=False)
+    await state.complete_agent_task(task_id, raw_json_str)
+
+    # Обновим JSON-пакет на диске, если он есть
+    tfile = _tasks_dir(cfg) / f"{task_id}_{kind}.json"
+    if tfile.exists():
+        try:
+            pkt = json.loads(tfile.read_text(encoding="utf-8"))
+            pkt["status"] = "completed"
+            pkt["response"] = parsed
+            pkt["outcome"] = outcome
+            tfile.write_text(json.dumps(pkt, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    return outcome

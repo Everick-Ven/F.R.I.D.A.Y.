@@ -1,138 +1,155 @@
-"""Тесты источников российской разведки: Яндекс XML, 2ГИС, Яндекс Карты, реестры Минюста и CSV в CP1251."""
+"""Тесты универсального поиска компаний в РФ (hh.ru, Яндекс Search, 2ГИС, импорт CSV с ИНН/отраслью)."""
 
+from __future__ import annotations
+
+import base64
+from pathlib import Path
+import httpx
 import pytest
+import respx
 
 from friday.collectors.discover import (
-    DiscoveryQuery,
-    import_practices_from_file,
-    is_junk_ru,
-    parse_twogis_items,
-    parse_yandex_maps_features,
-    parse_yandex_xml,
-    persist_discovered_practices,
+    discover_hh_ru,
+    discover_twogis,
+    discover_yandex_search,
+    is_junk_ru_domain,
+    parse_import_file,
+    persist_discovered_items,
 )
-from friday.config import FridayConfig
 from friday.state import StateManager
 
 
-def test_junk_filter_russian_aggregators_and_courts():
-    assert is_junk_ru("pravoved.ru", "Правовед") is True
-    assert is_junk_ru("msk.zoon.ru", "Юристы Москвы") is True
-    assert is_junk_ru("kad.arbitr.ru", "Картотека арбитражных дел") is True
-    assert is_junk_ru("advokatymoscow.ru", "Адвокатская палата") is True
-    assert is_junk_ru("example-rating.ru", "Топ-15 лучших адвокатов по уголовным делам") is True
-    assert is_junk_ru("ab-volkov.example", "Адвокатское бюро «Волков и партнёры»") is False
-
-
-def test_parse_yandex_xml_ranks():
-    sample_xml = """<?xml version="1.0" encoding="utf-8"?>
-    <yandexsearch version="1.0">
-      <response>
-        <results>
-          <grouping>
-            <group><doc><url>https://zoon.ru/msk/law/</url><title>Рейтинг юристов</title></doc></group>
-            <group><doc><url>https://kollegia-arbitr.example/uslugi</url><title>МКА «Арбитр Плюс» | Арбитражные споры в Москве</title></doc></group>
-          </grouping>
-        </results>
-      </response>
-    </yandexsearch>
-    """
-    q = DiscoveryQuery(term="адвокат по арбитражным спорам", city="Москва")
-    items = parse_yandex_xml(sample_xml, q)
-    assert len(items) == 2
-    assert items[1].domain == "kollegia-arbitr.example"
-    assert items[1].yandex_rank == 2
-    assert items[1].legal_form == "Коллегия адвокатов"
-
-
-def test_parse_twogis_and_yandex_maps():
-    q = DiscoveryQuery(term="коллегия адвокатов", city="Екатеринбург")
-    twogis_items = parse_twogis_items(
-        [
-            {
-                "id": "70000001012345_01",
-                "name": "Адвокатское бюро «УралПраво»",
-                "address_name": "ул. Малышева, 51",
-                "reviews": {"general_rating": 4.9, "general_review_count": 7},
-                "contact_groups": [
-                    {
-                        "contacts": [
-                            {"type": "phone", "value": "+7 (343) 000-11-22"},
-                            {"type": "telegram", "value": "@uralpravo_example"},
-                        ]
-                    }
-                ],
-                "rubrics": [{"name": "Адвокаты"}],
-            }
-        ],
-        query=q,
-    )
-    assert len(twogis_items) == 1
-    p = twogis_items[0]
-    assert p.has_website is False
-    assert p.card_incomplete is True
-    assert p.rating == 4.9
-    assert p.telegram == "@uralpravo_example"
-
-    ymaps_items = parse_yandex_maps_features(
-        [
-            {
-                "properties": {
-                    "CompanyMetaData": {
-                        "id": "1122334455",
-                        "name": "Коллегия адвокатов «Защита»",
-                        "url": "https://zaschita-ekb.example",
-                        "address": "Екатеринбург, пр. Ленина, 20",
-                        "Phones": [{"formatted": "+7 (343) 222-33-44"}],
-                        "Categories": [{"name": "Коллегия адвокатов"}],
-                        "Hours": {"text": "пн-пт 09:00-19:00"},
-                    }
-                }
-            }
-        ],
-        query=q,
-    )
-    assert len(ymaps_items) == 1
-    assert ymaps_items[0].domain == "zaschita-ekb.example"
-    assert ymaps_items[0].card_incomplete is False
+def test_junk_ru_aggregators_filtered_across_niches():
+    assert is_junk_ru_domain("https://www.avito.ru/moskva/oborudovanie") is True
+    assert is_junk_ru_domain("https://ozon.ru/seller/123") is True
+    assert is_junk_ru_domain("https://www.rusprofile.ru/id/12345") is True
+    assert is_junk_ru_domain("https://hh.ru/vacancy/999") is True
+    assert is_junk_ru_domain("https://2gis.ru/moscow") is True
+    # Реальные сайты бизнеса пропускаются
+    assert is_junk_ru_domain("https://metall-konstrukcii.ru") is False
+    assert is_junk_ru_domain("https://пекарня-хлеб.рф") is False
 
 
 @pytest.mark.asyncio
-async def test_import_regional_registry_and_cp1251_csv(state_db: StateManager, tmp_path):
-    await state_db.set_signal_status("YANDEX_SERP_RANK", "confirmed")
-    cfg = FridayConfig()
-
-    # 1. HTML-таблица регионального реестра адвокатов (проверка фильтрации прекращённого статуса)
-    reg_html = """
-    <table>
-      <tr><th>ФИО</th><th>Реестровый номер</th><th>Статус</th><th>Адвокатское образование</th></tr>
-      <tr><td>Соколов Дмитрий Андреевич</td><td>77/99101</td><td>Действующий</td><td>МКА «Соколов и партнёры»</td></tr>
-      <tr><td>Петров Игорь Олегович</td><td>77/99102</td><td>Прекращён</td><td>Адвокатский кабинет</td></tr>
-    </table>
-    """
-    reg_file = tmp_path / "registry.html"
-    reg_file.write_text(reg_html, encoding="utf-8")
-
-    rep_reg = await import_practices_from_file(
-        state_db, reg_file, config=cfg, is_registry=True, default_city="Москва"
+@respx.mock
+async def test_discover_hh_ru_free_keyless_api():
+    respx.get("https://api.hh.ru/vacancies").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "name": "Менеджер по продажам B2B",
+                        "alternate_url": "https://hh.ru/vacancy/777111",
+                        "area": {"name": "Екатеринбург"},
+                        "employer": {
+                            "id": "55501",
+                            "name": "ООО УралСпецСталь",
+                            "alternate_url": "https://hh.ru/employer/55501",
+                        },
+                    }
+                ]
+            },
+        )
     )
-    assert rep_reg.new_companies == 1
-    assert rep_reg.new_prospects == 1
-    assert rep_reg.skipped_junk == 1
+    respx.get("https://api.hh.ru/employers/55501").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "55501",
+                "name": "ООО УралСпецСталь",
+                "site_url": "https://ural-spec-stal.ru",
+                "open_vacancies": 4,
+                "industries": [{"name": "Металлообработка"}],
+                "description": "<p>Производство и поставка металлоконструкций по УрФО.</p>",
+            },
+        )
+    )
 
-    # 2. CSV в кодировке Windows-1251 с разделителем `;` (типичная выгрузка из русского Excel)
-    csv_cp1251 = (
-        "название;фио;город;сайт;telegram\r\n"
-        "АБ «Казань Арбитраж»;Морозова Елена Викторовна;Казань;https://kazan-arb.example;@morozova_law_ex\r\n"
-    ).encode("cp1251")
-    csv_file = tmp_path / "leads_ru.csv"
-    csv_file.write_bytes(csv_cp1251)
+    items = await discover_hh_ru("металлоконструкции", "Екатеринбург", hiring_role="менеджер по продажам", limit=5)
+    assert len(items) == 1
+    it = items[0]
+    assert it.name == "ООО УралСпецСталь"
+    assert it.website == "https://ural-spec-stal.ru"
+    assert it.industry == "Металлообработка"
+    codes = {o["signal_code"] for o in it.observations}
+    assert "HH_HIRING_ROLE" in codes
+    assert "HH_OPEN_ROLES" in codes
 
-    rep_csv = await import_practices_from_file(state_db, csv_file, config=cfg)
-    assert rep_csv.new_companies == 1
-    assert rep_csv.new_prospects == 1
 
-    prospects = await state_db.get_prospects()
-    names = {p.full_name() for p in prospects}
-    assert "Соколов Дмитрий Андреевич" in names
-    assert "Морозова Елена Викторовна" in names
+@pytest.mark.asyncio
+@respx.mock
+async def test_discover_yandex_search_page2_and_twogis(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("YANDEX_SEARCH_API_KEY", "test-ya-key")
+    monkeypatch.setenv("YANDEX_FOLDER_ID", "test-folder")
+    monkeypatch.setenv("TWOGIS_API_KEY", "test-2gis-key")
+
+    xml_page0 = "<yandexsearch><response><results><grouping></grouping></results></response></yandexsearch>"
+    xml_page1 = """
+    <yandexsearch><response><results><grouping>
+      <group><doc><url>https://avito.ru/skip</url><title>Авито</title></doc></group>
+      <group><doc><url>https://klinika-ulybka.ru/</url><title>Стоматология Улыбка</title></doc></group>
+    </grouping></results></response></yandexsearch>
+    """
+    calls = {"n": 0}
+
+    def _ya_handler(_request):
+        idx = calls["n"]
+        calls["n"] += 1
+        raw = xml_page1 if idx == 1 else xml_page0
+        b64 = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+        return httpx.Response(200, json={"rawData": b64})
+
+    respx.post("https://searchapi.api.cloud.yandex.net/v2/web/search").mock(side_effect=_ya_handler)
+    ya_items = await discover_yandex_search("стоматологическая клиника", "Москва", limit=10)
+    assert len(ya_items) == 1
+    assert ya_items[0].observations[0]["signal_code"] == "YANDEX_PAGE2_RANK"
+
+    respx.get("https://catalog.api.2gis.com/3.0/items").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "result": {
+                    "items": [
+                        {
+                            "id": "70000001_1",
+                            "name": "АвтоТехЦентр Юг",
+                            "address_name": "ул. Северная, 15",
+                            "rubrics": [{"name": "Автосервис"}],
+                            "reviews": {"general_rating": 3.8, "general_review_count": 29},
+                            "contact_groups": [
+                                {"contacts": [{"type": "phone", "value": "+7 (861) 200-10-20"}]}
+                            ],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    gis_items = await discover_twogis("кузовной ремонт", "Краснодар", limit=5)
+    assert len(gis_items) == 1
+    gis_codes = {o["signal_code"] for o in gis_items[0].observations}
+    assert "LOW_MAP_RATING" in gis_codes
+    assert "NO_WEBSITE_ON_MAP" in gis_codes
+
+
+@pytest.mark.asyncio
+async def test_universal_csv_import_with_inn_and_fio(state: StateManager, tmp_path: Path):
+    csv_file = tmp_path / "kontur_export.csv"
+    csv_file.write_text(
+        "Компания;ИНН;Отрасль;Сайт;Город;ФИО;Должность;Email;Telegram\n"
+        "ООО ЛогистТранс;7725112233;Логистика и ВЭД;logist-trans.ru;Москва;Орлов Максим Игоревич;Директор по логистике;orlov@logist-trans.ru;https://t.me/logist_trans\n",
+        encoding="utf-8",
+    )
+    parsed = parse_import_file(csv_file)
+    stats = await persist_discovered_items(state, parsed)
+    assert stats["inserted_companies"] == 1
+    assert stats["inserted_prospects"] == 1
+
+    companies = await state.get_companies()
+    assert companies[0].inn == "7725112233"
+    assert companies[0].industry == "Логистика и ВЭД"
+
+    prospects = await state.get_prospects()
+    assert prospects[0].polite_greeting == "Максим Игоревич"
+    assert prospects[0].title == "Директор по логистике"

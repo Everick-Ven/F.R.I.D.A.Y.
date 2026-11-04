@@ -1,4 +1,15 @@
-"""CLI-интерфейс F.R.I.D.A.Y. — команды разведки, профилирования, оценки, черновиков и экспорта."""
+"""CLI интерфейс F.R.I.D.A.Y. — универсальная B2B-разведка и подготовка черновиков для любой ниши РФ.
+
+Порядок работы (как в Harvey):
+  Шаг 1. Настройка ниши и продукта:
+         `friday train https://ваш-сайт.ru --brief "..." --niche "..."`
+         (или `friday setup --preset ...`, или вкладка «1. Ниша и продукт» в `friday ui`)
+  Шаг 2. Сбор и профилирование компаний:
+         `friday discover`, `friday import`, `friday profile`, `friday prospects`
+  Шаг 3. Мозг (Вариант А — ИИ-агент рабочей среды):
+         `friday score --ai`, `friday drafts --channel telegram`
+         `friday tasks next` -> `friday tasks apply <id> '<json>'`
+"""
 
 from __future__ import annotations
 
@@ -8,454 +19,503 @@ import json
 import sys
 from pathlib import Path
 
-from friday.agents.scout import Scout
-from friday.agents.writer import Writer
-from friday.brain import Brain
-from friday.collectors.discover import (
-     DEFAULT_PROVIDER,
-    PROVIDERS,
-    DiscoveryQuery,
-    import_practices_from_file,
-    run_discovery,
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from friday.agents.scout import score_all_prospects
+from friday.agents.writer import run_drafts
+from friday.brain import (
+    BrainError,
+    apply_agent_task_result,
+    enqueue_agent_task,
+    load_prompt,
+    load_skills,
 )
-from friday.config import ConfigError, FridayConfig, load_config, load_env
-from friday.export import export_dossiers_markdown, export_prospects_csv
-from friday.pipeline import apply_agent_task_result, run_full_pipeline, run_profile_stage
-from friday.register import build_company_register, register_to_csv
-from friday.signals import ALL_SIGNAL_CODES, FREE_SIGNAL_CODES, seed_signal_catalog
+from friday.collectors.discover import (
+     parse_import_file,
+    persist_discovered_items,
+    run_discover,
+)
+from friday.collectors.people import run_people
+from friday.collectors.profile import run_profile
+from friday.config import is_niche_configured, load_config
+from friday.export import export_drafts_csv, export_drafts_markdown
+from friday.pipeline import bootstrap_state, run_full_pipeline, seed_sample_for_active_niche
 from friday.state import StateManager
-from friday.textio import read_user_text, utf8_stdio
+from friday.trainer import (
+    NICHE_TEMPLATES_RU,
+    apply_niche_setup,
+    build_train_prompt_context,
+    crawl_product_site,
+)
+
+console = Console()
 
 
-async def _boot(auto_confirm_free: bool = False) -> tuple[StateManager, FridayConfig]:
-    state = StateManager()
-    await state.init_db()
-    await seed_signal_catalog(state, auto_confirm_free=auto_confirm_free)
-    try:
-        cfg = load_config()
-    except Exception:
-        cfg = FridayConfig()
-    return state, cfg
+async def _cmd_status(state: StateManager) -> int:
+    await bootstrap_state(state)
+    cfg = load_config()
+    configured = is_niche_configured(cfg)
+    summary = await state.get_state_summary()
 
-
-def cmd_status(_args) -> None:
-    async def _run():
-        state, cfg = await _boot()
-        env = load_env()
-        brain = Brain(state, brain_config=cfg.brain, env=env)
-        ready, msg = await brain.preflight()
-        s = await state.get_state_summary()
-
-        print("\n  F.R.I.D.A.Y. — Статус пайплайна разведки")
-        print("  " + "=" * 48)
-        print(f"  Бюро:                      {cfg.persona.company}")
-        print(f"  Режим работы:              Разведка + черновики (без автоотправки, ст. 18 ФЗ-38)")
-        print(f"  Движок анализа (Brain):    {cfg.brain.provider} ({'готов' if ready else 'требует настройки'})")
-        print(f"    └─ {msg}")
-        print(f"  Практик в реестре:         {s['companies_total']} (ждут разбора сайта: {s['unprofiled_companies']})")
-        print(f"  Контактов адвокатов / ЛПР: {s['prospects_total']} {s['prospects_by_status']}")
-        print(f"  Сигналов подтверждено:     {s['signals_by_status'].get('confirmed', 0)} (наблюдений в БД: {s['observations_total']})")
-        print(f"  Черновиков всего:          {s['drafts_total']} {s['drafts_by_status']}")
-        if s["pending_agent_tasks"]:
-            print(f"  Ожидают ответа ИИ-агента:  {s['pending_agent_tasks']} (`friday tasks list`)")
-        print()
-
-    asyncio.run(_run())
-
-
-def cmd_signals(args) -> None:
-    async def _run():
-        state, _ = await _boot()
-        if args.confirm:
-            raw = args.confirm.strip()
-            if raw.lower() == "free":
-                targets = sorted(FREE_SIGNAL_CODES)
-            elif raw.lower() == "all":
-                targets = sorted(ALL_SIGNAL_CODES)
-            else:
-                targets = [x.strip().upper() for x in raw.split(",") if x.strip()]
-            cnt = 0
-            for code in targets:
-                if await state.set_signal_status(code, "confirmed"):
-                    cnt += 1
-            print(f"\n  ✓ Подтверждено сигналов: {cnt}\n")
-            return
-
-        if args.reject:
-            targets = [x.strip().upper() for x in args.reject.split(",") if x.strip()]
-            cnt = 0
-            for code in targets:
-                if await state.set_signal_status(code, "rejected"):
-                    cnt += 1
-            print(f"\n  ✓ Отклонено сигналов: {cnt}\n")
-            return
-
-        rows = await state.list_signal_codes()
-        print("\n  Словарь сигналов F.R.I.D.A.Y. (собираются только `confirmed`):")
-        print("  " + "-" * 72)
-        for r in rows:
-            mark = "✓" if r["status"] == "confirmed" else ("✗" if r["status"] == "rejected" else "·")
-            print(f"  [{mark}] {r['code']:<28} ({r['status']:<9}) — {r['label']}")
-        print("\n  Подсказка: `friday signals --confirm free` подтвердит все бесплатные сигналы.\n")
-
-    asyncio.run(_run())
-
-
-def cmd_discover(args) -> None:
-    async def _run():
-        state, cfg = await _boot()
-        env = load_env()
-        if args.providers:
-            print("\n  Доступные провайдеры разведки (DISCOVER):")
-            print("  " + "-" * 72)
-            for p in PROVIDERS.values():
-                ok = "готов" if p.configured(env) else f"нужны ключи: {', '.join(p.missing_keys(env))}"
-                print(f"  • {p.key:<16} — {p.label} [{ok}]")
-                print(f"    {p.blurb}")
-            print()
-            return
-
-        queries = None
-        if args.query:
-            queries = [DiscoveryQuery(term=args.query, city=args.city or (cfg.icp.cities[0] if cfg.icp.cities else ""))]
-
-        rep = await run_discovery(
-            state,
-            cfg,
-            env,
-            provider_key=args.provider or DEFAULT_PROVIDER,
-            queries=queries,
-            max_spend_rub=args.max_spend,
-            dry_run=args.estimate,
+    niche_line = (
+        f"[bold green]НАСТРОЕНА[/bold green] — {cfg.persona.company} ({cfg.product.name})\n"
+        f"[bold]Целевая ниша (ICP):[/bold] {cfg.icp.niche}\n"
+        f"[bold]Города:[/bold] {', '.join(cfg.icp.cities) or '—'}\n"
+        f"[bold]Запросы:[/bold] {', '.join(cfg.icp.search_queries[:3]) or '—'}\n"
+        f"[bold]Регулируемая ниша ФЗ-38:[/bold] {cfg.compliance.regulated_niche}"
+        if configured
+        else (
+            "[bold yellow]НЕ НАСТРОЕНА (Шаг 1)[/bold yellow]\n"
+            "Сначала обучите F.R.I.D.A.Y. вашему продукту и нише:\n"
+            "  • `friday train https://ваш-сайт.ru --niche \"кто ваши клиенты\"`\n"
+            "  • или выберите шаблон: `friday presets` -> `friday setup --preset b2b_crm_integrator`\n"
+            "  • или откройте веб-интерфейс: `friday ui`"
         )
-        if args.estimate:
-            print(f"\n  Оценка стоимости ({rep.provider}): {rep.estimated_cost_rub:.2f} ₽\n")
-            return
-        print(
-            f"\n  Разведка завершена ({rep.provider}): запросов {rep.queries_run}, "
-            f"новых практик {rep.new_companies}, обновлено {rep.updated_companies}, "
-            f"наблюдений {rep.observations_written}, отсеяно агрегаторов {rep.skipped_junk}.\n"
+    )
+
+    console.print(
+        Panel.fit(
+            f"{niche_line}\n"
+            f"[bold]Мозг (Вариант А):[/bold] ИИ-агент рабочей среды (`mode={cfg.brain.mode}`)\n"
+            f"[bold]Режим комплаенса:[/bold] Только разведка + черновики (автоотправка отключена, ФЗ-38 ст. 18)",
+            title="F.R.I.D.A.Y. v0.2 — Статус системы",
+            border_style="cyan" if configured else "yellow",
         )
-        for err in rep.errors:
-            print(f"  ! {err}")
+    )
 
-    asyncio.run(_run())
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Показатель")
+    table.add_column("Значение", justify="right")
+    table.add_row("Компаний в базе", str(summary["companies_total"]))
+    table.add_row("Ожидают профилирования сайта", str(summary["unprofiled_companies"]))
+    table.add_row("ЛПР / контактов (всего)", str(summary["prospects_total"]))
+    table.add_row("Подтверждённых наблюдений (сигналов)", str(summary["observations_total"]))
+    table.add_row("Черновиков на проверке (pending_review)", str(summary["drafts_by_status"].get("pending_review", 0)))
+    table.add_row("Черновиков одобрено (approved)", str(summary["drafts_by_status"].get("approved", 0)))
+    table.add_row("Заблокировано шлюзом ФЗ-38 (gate_blocked)", str(summary["drafts_by_status"].get("gate_blocked", 0)))
+    table.add_row("Ожидающих задач ИИ-агента (agent_tasks)", str(summary["pending_agent_tasks"]))
+    console.print(table)
+    return 0
 
 
-def cmd_import(args) -> None:
-    async def _run():
-        state, cfg = await _boot(auto_confirm_free=True)
-        path = Path(args.file)
-        if not path.exists():
-            print(f"  Файл не найден: {path}", file=sys.stderr)
-            sys.exit(2)
-        rep = await import_practices_from_file(
-            state,
-            path,
-            config=cfg,
-            is_registry=args.registry,
-            default_city=args.city or "",
+async def _cmd_train(args: argparse.Namespace, state: StateManager) -> int:
+    await bootstrap_state(state)
+    cfg = load_config()
+    url = (args.website or "").strip()
+    brief = (args.brief or "").strip()
+    niche_hint = (args.niche or "").strip()
+    cities = [c.strip() for c in (args.cities or "").split(",") if c.strip()]
+
+    if not url and not brief and not niche_hint:
+        console.print(
+            "[red]Укажите хотя бы URL сайта продукта или краткий бриф (`--brief` / `--niche`).[/red]"
         )
-        print(
-            f"\n  ✓ Импорт из `{path.name}` завершён:\n"
-            f"    Новых практик: {rep.new_companies} (обновлено: {rep.updated_companies})\n"
-            f"    Именных контактов адвокатов: {rep.new_prospects}\n"
-            f"    Записано сигналов: {rep.observations_written}\n"
-            f"    Отсеяно (агрегаторы / недейств. статус / стоп-лист): {rep.skipped_junk + rep.skipped_dnc}\n"
+        return 1
+
+    crawl = {"url": "", "pages": [], "error": ""}
+    if url:
+        console.print(f"[cyan]Скачивание страниц продукта {url} ($0, SSRF-safe)...[/cyan]")
+        crawl = await crawl_product_site(url)
+
+    sys_prompt = "\n\n".join(
+        p for p in [load_prompt("system"), load_prompt("train"), load_skills(["ru_compliance"])] if p
+    )
+    user_prompt = build_train_prompt_context(
+        website_crawl=crawl,
+        user_brief=brief,
+        target_niche_hint=niche_hint,
+        cities_hint=cities or None,
+    )
+    tid, tfile = await enqueue_agent_task(
+        state,
+        cfg,
+        kind="train_niche",
+        payload={
+            "website": url,
+            "brief": brief,
+            "niche_hint": niche_hint,
+            "cities": cities,
+            "pages_crawled": len(crawl.get("pages") or []),
+        },
+        system_prompt=sys_prompt,
+        user_prompt=user_prompt,
+    )
+    console.print(
+        Panel.fit(
+            f"[green]Создана задача настройки ниши `train_niche` #{tid}[/green]\n"
+            f"Пакет задачи: `{tfile}`\n\n"
+            f"Чтобы ИИ-агент рабочей среды завершил настройку:\n"
+            f"  1) Прочитать задачу: `friday tasks show {tid}`\n"
+            f"  2) Применить JSON:   `friday tasks apply {tid} --file response.json`",
+            title="Шаг 1 — Задача для ИИ-агента рабочей среды",
+            border_style="green",
         )
-
-    asyncio.run(_run())
-
-
-def cmd_profile(args) -> None:
-    async def _run():
-        state, cfg = await _boot(auto_confirm_free=True)
-        comp_cnt, obs_cnt, prosp_cnt, _ = await run_profile_stage(
-            state, config=cfg, limit=args.limit
-        )
-        print(
-            f"\n  ✓ Профилирование завершено: проверено сайтов — {comp_cnt}, "
-            f"записано наблюдений — {obs_cnt}, найдено контактов ЛПР — {prosp_cnt}.\n"
-        )
-
-    asyncio.run(_run())
+    )
+    return 0
 
 
-def cmd_scout(args) -> None:
-    async def _run():
-        state, cfg = await _boot()
-        if args.provider:
-            cfg.brain.provider = args.provider
-        brain = Brain(state, brain_config=cfg.brain, env=load_env())
-        scout = Scout(brain=brain, state=state, config=cfg)
-        res = await scout.score_pending_prospects(limit=args.limit, rescore_all=args.rescore)
-        print(f"\n  ✓ Скоринг Scout ({res.get('mode', cfg.brain.provider)}): оценено {res['scored']}.")
-        if res["queued_task_ids"]:
-            print(f"    Поставлено задач для ИИ-агента: {', '.join(res['queued_task_ids'])} (`friday tasks list`)")
-        print()
-
-    asyncio.run(_run())
+async def _cmd_presets() -> int:
+    t = Table(title="Встроенные шаблоны ниш РФ (для быстрой настройки Шага 1)")
+    t.add_column("ID шаблона (`--preset`)")
+    t.add_column("Сфера / Продукт")
+    t.add_column("Целевая ниша (ICP)")
+    for tpl in NICHE_TEMPLATES_RU:
+        t.add_row(tpl["id"], tpl["label"], tpl["icp"]["niche"])
+    console.print(t)
+    return 0
 
 
-def cmd_draft(args) -> None:
-    async def _run():
-        state, cfg = await _boot()
-        if args.provider:
-            cfg.brain.provider = args.provider
-        channels = [c.strip() for c in args.channels.split(",") if c.strip()] if args.channels else None
-        brain = Brain(state, brain_config=cfg.brain, env=load_env())
-        writer = Writer(brain=brain, state=state, config=cfg)
-        res = await writer.generate_drafts(
-            min_score=args.min_score, limit=args.limit, channels=channels
-        )
-        print(
-            f"\n  ✓ Подготовка черновиков ({res['mode']}): "
-            f"готовы к проверке — {res['drafts_ready']}, "
-            f"остановлены фильтром ФЗ-38/КПЭА — {res['drafts_blocked_by_gate']}."
-        )
-        if res["queued_task_ids"]:
-            print(f"    Поставлено задач для ИИ-агента: {', '.join(res['queued_task_ids'])} (`friday tasks list`)")
-        print()
+async def _cmd_setup(args: argparse.Namespace) -> int:
+    data: dict | None = None
+    if args.preset:
+        tpl = next((x for x in NICHE_TEMPLATES_RU if x["id"] == args.preset), None)
+        if not tpl:
+            console.print(f"[red]Шаблон `{args.preset}` не найден. Посмотрите `friday presets`.[/red]")
+            return 1
+        data = tpl
+    elif args.file:
+        data = json.loads(Path(args.file).read_text(encoding="utf-8-sig"))
+    else:
+        console.print("[red]Укажите `--preset <id>` или `--file <setup.json>`.[/red]")
+        return 1
 
-    asyncio.run(_run())
+    res = apply_niche_setup(data)
+    console.print(f"[green]Ниша и продукт успешно сохранены:[/green] {res}")
+    return 0
 
 
-def cmd_run(args) -> None:
-    async def _run():
-        state, cfg = await _boot(auto_confirm_free=True)
-        if args.provider:
-            cfg.brain.provider = args.provider
-        rep = await run_full_pipeline(
-            state,
-            cfg,
-            load_env(),
-            discover_provider=args.discover_provider,
-            skip_discover=args.skip_discover,
-        )
-        print("\n  ✓ Полный цикл F.R.I.D.A.Y. завершён:")
-        print(json.dumps(rep.as_dict(), ensure_ascii=False, indent=2))
-        print()
+async def _cmd_signals(args: argparse.Namespace, state: StateManager) -> int:
+    await bootstrap_state(state)
+    if args.confirm:
+        ok = await state.set_signal_status(args.confirm.upper(), "confirmed")
+        console.print(f"Сигнал {args.confirm.upper()} -> confirmed ({ok})")
+        return 0 if ok else 1
+    if args.reject:
+        ok = await state.set_signal_status(args.reject.upper(), "rejected")
+        console.print(f"Сигнал {args.reject.upper()} -> rejected ({ok})")
+        return 0 if ok else 1
 
-    asyncio.run(_run())
-
-
-def cmd_drafts(args) -> None:
-    async def _run():
-        state, _ = await _boot()
-        if args.approve:
-            await state.set_draft_status(args.approve, "approved")
-            print(f"  ✓ Черновик {args.approve} одобрен к ручной отправке.")
-            return
-        if args.sent:
-            await state.set_draft_status(args.sent, "sent_manually")
-            print(f"  ✓ Черновик {args.sent} отмечен как отправленный вручную.")
-            return
-        if args.reject:
-            await state.set_draft_status(args.reject, "rejected")
-            print(f"  ✓ Черновик {args.reject} отклонён.")
-            return
-
-        rows = await state.list_drafts(status=args.status, limit=50)
-        if not rows:
-            print("\n  Черновиков пока нет. Запустите `friday draft`.\n")
-            return
-        for d in rows:
-            fio = " ".join(x for x in (d["last_name"], d["first_name"], d["middle_name"]) if x) or "Общий контакт"
-            print(f"\n  [{d['id']}] {d['company_name']} ({d['city']}) — {fio} | {d['channel'].upper()} | {d['status']}")
-            if d["subject"]:
-                print(f"  Тема: {d['subject']}")
-            print("  " + "-" * 60)
-            for ln in d["body"].splitlines():
-                print(f"  {ln}")
-        print()
-
-    asyncio.run(_run())
+    rows = await state.list_signal_codes(status=args.status)
+    t = Table(title="Каталог сигналов F.R.I.D.A.Y. (универсальный рынок РФ)")
+    t.add_column("Код")
+    t.add_column("Статус")
+    t.add_column("Категория")
+    t.add_column("Название")
+    t.add_column("Источник")
+    for r in rows:
+        st = r["status"]
+        color = "green" if st == "confirmed" else ("yellow" if st == "proposed" else "red")
+        t.add_row(r["code"], f"[{color}]{st}[/{color}]", r["category"], r["label"], r["collector"])
+    console.print(t)
+    return 0
 
 
-def cmd_companies(args) -> None:
-    async def _run():
-        state, cfg = await _boot()
-        rows = await build_company_register(state, cfg)
-        if args.out:
-            Path(args.out).write_text(register_to_csv(rows), encoding="utf-8-sig")
-            print(f"\n  ✓ Реестр практик ({len(rows)} строк) выгружен в {args.out}\n")
-            return
-        print(f"\n  Реестр адвокатских образований и практик ({len(rows)}):")
-        print("  " + "-" * 76)
-        for r in rows[:40]:
-            print(f"  [{r['fit']:>3}] {r['company']} ({r['city'] or 'РФ'}) — {r['status']} | {r['signals']}")
-        print()
+async def _cmd_tasks(args: argparse.Namespace, state: StateManager) -> int:
+    await bootstrap_state(state)
+    cfg = load_config()
 
-    asyncio.run(_run())
+    if args.tasks_action == "list":
+        tasks = await state.list_agent_tasks(status=args.status)
+        if not tasks:
+            console.print(f"[dim]Задачи со статусом `{args.status}` отсутствуют.[/dim]")
+            return 0
+        t = Table(title=f"Очередь задач ИИ-агента рабочей среды ({args.status})")
+        t.add_column("ID")
+        t.add_column("Тип (`kind`)")
+        t.add_column("Статус")
+        t.add_column("Детали")
+        t.add_column("Создана")
+        for tk in tasks:
+            pl = tk.get("payload") or {}
+            detail = pl.get("prospect_id") or pl.get("website") or pl.get("niche_hint") or ""
+            if pl.get("channel"):
+                detail = f"{detail} ({pl['channel']})"
+            t.add_row(tk["id"], tk["kind"], tk["status"], str(detail), tk["created_at"])
+        console.print(t)
+        return 0
 
+    if args.tasks_action == "next":
+        tasks = await state.list_agent_tasks(status="pending")
+        if not tasks:
+            console.print("[green]Нет ожидающих задач в очереди `agent_tasks`.[/green]")
+            return 0
+        tk = tasks[0]
+        if args.json:
+            print(json.dumps(tk, ensure_ascii=False, indent=2))
+        else:
+            console.print(f"[bold cyan]Задача #{tk['id']} ({tk['kind']})[/bold cyan]")
+            console.print(f"Применить ответ: `friday tasks apply {tk['id']} '<json>'`\n")
+            print(tk["prompt_text"])
+        return 0
 
-def cmd_export(args) -> None:
-    async def _run():
-        state, cfg = await _boot()
-        out_csv = args.out or "prospects.csv"
-        cnt, _ = await export_prospects_csv(
-            state,
-            cfg,
-            out_path=out_csv,
-            min_score=args.min_score,
-            include_all=args.all,
-            excel_ru=args.excel_ru,
-        )
-        print(f"\n  ✓ Выгружено контактов в `{out_csv}`: {cnt}")
-        if args.dossiers:
-            md_cnt, _ = await export_dossiers_markdown(
-                state, cfg, out_path=args.dossiers, min_score=args.min_score
-            )
-            print(f"  ✓ Рабочая тетрадь досье сохранена в `{args.dossiers}` ({md_cnt} карточек)")
-        print()
+    if args.tasks_action == "show":
+        tasks = await state.list_agent_tasks(status="all")
+        tk = next((x for x in tasks if x["id"] == args.task_id), None)
+        if not tk:
+            console.print(f"[red]Задача #{args.task_id} не найдена.[/red]")
+            return 1
+        print(tk["prompt_text"])
+        return 0
 
-    asyncio.run(_run())
+    if args.tasks_action == "apply":
+        raw_json = ""
+        if args.file:
+            raw_json = Path(args.file).read_text(encoding="utf-8-sig")
+        elif args.response_json:
+            raw_json = args.response_json
+        elif not sys.stdin.isatty():
+            raw_json = sys.stdin.read()
+        if not raw_json.strip():
+            console.print("[red]Передайте JSON-ответ строкой, через `--file` или в stdin.[/red]")
+            return 1
+        try:
+            outcome = await apply_agent_task_result(state, args.task_id, raw_json, cfg=cfg)
+            console.print(f"[green]Задача #{args.task_id} успешно применена:[/green] {outcome}")
+            return 0
+        except BrainError as exc:
+            console.print(f"[red]Ошибка применения задачи #{args.task_id}:[/red] {exc}")
+            return 1
 
-
-def cmd_tasks(args) -> None:
-    async def _run():
-        state, cfg = await _boot()
-        if args.subcmd == "list":
-            tasks = await state.list_agent_tasks(status=args.status)
-            if not tasks:
-                print("\n  Очередь задач для ИИ-агента пуста.\n")
-                return
-            for t in tasks:
-                print(f"  • {t['id']} | {t['kind']:<14} | {t['status']} | создана: {t['created_at']}")
-            return
-
-        if args.subcmd == "show":
-            tasks = await state.list_agent_tasks(status="all")
-            target = next((t for t in tasks if t["id"] == args.task_id), None)
-            if not target:
-                print(f"  Задача {args.task_id} не найдена.", file=sys.stderr)
-                sys.exit(2)
-            print(target["prompt_text"])
-            return
-
-        if args.subcmd == "apply":
-            if args.file:
-                raw = read_user_text(args.file)
-            else:
-                raw = sys.stdin.read()
-            res = await apply_agent_task_result(state, cfg, args.task_id, raw)
-            print(f"\n  ✓ Ответ ИИ-агента применён: {json.dumps(res, ensure_ascii=False)}\n")
-
-    asyncio.run(_run())
-
-
-def cmd_dashboard(args) -> None:
-    from friday.dashboard import start_dashboard
-
-    start_dashboard(host=args.host, port=args.port)
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="friday",
-        description="F.R.I.D.A.Y. — ИИ-разведка и подготовка ручного аутрича для юридического рынка РФ",
+        description="F.R.I.D.A.Y. — универсальная B2B-разведка и черновики писем для любой ниши рынка РФ",
     )
-    sub = parser.add_subparsers(dest="command")
+    parser.add_argument("--db", default="", help="Путь к SQLite БД (по умолчанию data/friday.db)")
+    sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("status", help="Сводка по базе практик, сигналам, черновикам и Brain")
+    sub.add_parser("status", help="Показать статус настройки ниши, базы и очереди ИИ-агента")
+    sub.add_parser("presets", help="Показать шаблоны ниш РФ для быстрого старта")
 
-    p_sig = sub.add_parser("signals", help="Просмотр и подтверждение словаря сигналов")
-    p_sig.add_argument("--confirm", help="Подтвердить сигналы: `free`, `all` или список кодов через запятую")
-    p_sig.add_argument("--reject", help="Отклонить сигналы (коды через запятую)")
+    p_train = sub.add_parser(
+        "train",
+        help="Шаг 1: обучить F.R.I.D.A.Y. продукту и нише по сайту/описанию (задача для ИИ-агента)",
+    )
+    p_train.add_argument("website", nargs="?", default="", help="URL сайта вашего продукта/услуги")
+    p_train.add_argument("--brief", default="", help="Краткое описание вашего продукта и оффера")
+    p_train.add_argument("--niche", default="", help="Кому вы хотите продавать (целевая ниша)")
+    p_train.add_argument("--cities", default="", help="Города РФ через запятую")
 
-    p_disc = sub.add_parser("discover", help="Поиск практик (Яндекс, 2ГИС, Яндекс Карты, OSM РФ)")
-    p_disc.add_argument("--providers", action="store_true", help="Показать доступные источники и статус ключей")
-    p_disc.add_argument("--estimate", action="store_true", help="Оценить стоимость запуска без запросов")
-    p_disc.add_argument("--provider", help="Ключ провайдера: yandex_search, twogis, yandex_maps, duckduckgo_ru, osm_ru")
-    p_disc.add_argument("--query", help="Конкретная поисковая тема (например: 'адвокат по банкротству')")
-    p_disc.add_argument("--city", help="Город поиска (например: 'Екатеринбург')")
-    p_disc.add_argument("--max-spend", type=float, default=None, help="Лимит бюджета в рублях")
+    p_setup = sub.add_parser(
+        "setup",
+        help="Шаг 1: применить готовый шаблон ниши (`--preset`) или JSON-конфигурацию (`--file`)",
+    )
+    p_setup.add_argument("--preset", default="", help="ID шаблона из `friday presets`")
+    p_setup.add_argument("--file", default="", help="Путь к JSON-файлу настройки ниши")
 
-    p_imp = sub.add_parser("import", help="Импортировать собственный список (CSV/JSON/TXT) или реестр адвокатов")
-    p_imp.add_argument("file", help="Путь к файлу списка или выгрузки реестра")
-    p_imp.add_argument("--registry", action="store_true", help="Режим реестра адвокатов Минюста/палаты")
-    p_imp.add_argument("--city", default="", help="Город по умолчанию, если его нет в колонках")
+    p_disc = sub.add_parser("discover", help="Найти целевые компании в РФ ($0)")
+    p_disc.add_argument("-q", "--query", default="", help="Поисковый запрос (по умолчанию из friday.local.yaml)")
+    p_disc.add_argument("-c", "--city", default="", help="Город (по умолчанию из friday.local.yaml)")
+    p_disc.add_argument(
+        "--provider",
+        default="auto",
+        choices=["auto", "hh_ru", "yandex_search", "twogis", "yandex_maps", "ddg_ru", "osm_ru"],
+    )
+    p_disc.add_argument("-n", "--limit", type=int, default=20)
 
-    p_prof = sub.add_parser("profile", help="Профилировать сайты практик ($0, без LLM)")
-    p_prof.add_argument("--limit", type=int, default=50, help="Максимум сайтов за проход")
+    p_imp = sub.add_parser("import", help="Импортировать список компаний/контактов из CSV, JSON или TXT")
+    p_imp.add_argument("file", help="Путь к файлу (.csv, .json, .jsonl, .txt)")
+    p_imp.add_argument("-c", "--city", default="", help="Город по умолчанию")
+    p_imp.add_argument("--industry", default="", help="Отрасль по умолчанию")
 
-    p_scout = sub.add_parser("scout", help="Оценить контакты (1–100) и сформулировать угол персонализации")
-    p_scout.add_argument("--limit", type=int, default=30)
-    p_scout.add_argument("--provider", choices=["claude", "agent", "openai_compatible", "template"])
-    p_scout.add_argument("--rescore", action="store_true", help="Пересчитать уже оценённые контакты")
+    p_prof = sub.add_parser("profile", help="Проверить сайты компаний на сигналы Рунета ($0 HTTP)")
+    p_prof.add_argument("-n", "--limit", type=int, default=50)
 
-    p_draft = sub.add_parser("draft", help="Подготовить досье и черновики с проверкой по 38-ФЗ и ст. 17 КПЭА")
-    p_draft.add_argument("--limit", type=int, default=10)
-    p_draft.add_argument("--min-score", type=int, default=45)
-    p_draft.add_argument("--channels", help="Каналы через запятую (например: telegram,email)")
-    p_draft.add_argument("--provider", choices=["claude", "agent", "openai_compatible", "template"])
+    p_peop = sub.add_parser("prospects", help="Извлечь ФИО руководителей/ЛПР и контакты с сайтов ($0)")
+    p_peop.add_argument("-n", "--limit", type=int, default=50)
 
-    p_run = sub.add_parser("run", help="Запустить полный цикл: разведка -> профиль -> скоринг -> черновики")
-    p_run.add_argument("--provider", choices=["claude", "agent", "openai_compatible", "template"])
-    p_run.add_argument("--discover-provider", default=None)
-    p_run.add_argument("--skip-discover", action="store_true", help="Работать только по уже загруженной базе")
+    p_sig = sub.add_parser("signals", help="Управление каталогом сигналов (proposed / confirmed / rejected)")
+    p_sig.add_argument("--status", choices=["proposed", "confirmed", "rejected"], default=None)
+    p_sig.add_argument("--confirm", default="", help="Подтвердить код сигнала")
+    p_sig.add_argument("--reject", default="", help="Отклонить код сигнала")
 
-    p_dr = sub.add_parser("drafts", help="Просмотр и одобрение готовых черновиков")
-    p_dr.add_argument("--status", default=None)
-    p_dr.add_argument("--approve", help="Одобрить черновик по ID")
-    p_dr.add_argument("--sent", help="Отметить черновик как отправленный вручную по ID")
-    p_dr.add_argument("--reject", help="Отклонить черновик по ID")
+    p_coh = sub.add_parser("cohort", help="Выбрать когорту компаний по пересечению сигналов")
+    p_coh.add_argument("--require", default="", help="Обязательные коды через запятую")
+    p_coh.add_argument("--exclude", default="", help="Исключающие коды через запятую")
 
-    p_comp = sub.add_parser("companies", help="Показать или выгрузить реестр практик с Fit-оценкой")
-    p_comp.add_argument("--out", help="Путь для сохранения CSV-реестра")
+    p_score = sub.add_parser("score", help="Рассчитать балл соответствия нише (0..100)")
+    p_score.add_argument("--ai", action="store_true", help="Поставить задачи углублённого скоринга ИИ-агенту")
+    p_score.add_argument("-n", "--limit", type=int, default=100)
 
-    p_exp = sub.add_parser("export", help="Выгрузить базу контактов и черновиков в CSV и Markdown-досье")
-    p_exp.add_argument("--out", default="prospects.csv", help="Путь к CSV-файлу")
-    p_exp.add_argument("--dossiers", default="", help="Путь к Markdown-тетради досье (например: dossiers.md)")
-    p_exp.add_argument("--min-score", type=int, default=0)
-    p_exp.add_argument("--excel-ru", action="store_true", help="Разделитель `;` и UTF-8 BOM для русского Excel")
-    p_exp.add_argument("--all", action="store_true", help="Включить все записи без фильтров")
+    p_drafts = sub.add_parser("drafts", help="Подготовить черновики писем (Вариант А: задачи ИИ-агенту)")
+    p_drafts.add_argument("--channel", default="telegram", choices=["telegram", "email", "whatsapp"])
+    p_drafts.add_argument("--min-score", type=int, default=None)
+    p_drafts.add_argument("-n", "--limit", type=int, default=20)
+    p_drafts.add_argument(
+        "--template",
+        action="store_true",
+        help="Сразу собрать детерминированные предпросмотровые черновики без ожидания ИИ-агента",
+    )
 
-    p_tasks = sub.add_parser("tasks", help="Управление задачами для ИИ-агента рабочей среды (`brain.provider: agent`)")
-    tasks_sub = p_tasks.add_subparsers(dest="subcmd", required=True)
-    p_tl = tasks_sub.add_parser("list", help="Список задач в очереди")
-    p_tl.add_argument("--status", default="pending")
-    p_ts = tasks_sub.add_parser("show", help="Вывести промпт задачи")
-    p_ts.add_argument("task_id")
-    p_ta = tasks_sub.add_parser("apply", help="Применить JSON-ответ от ИИ-агента")
-    p_ta.add_argument("task_id")
-    p_ta.add_argument("--file", help="Путь к JSON-файлу с ответом (иначе читается stdin)")
+    p_tasks = sub.add_parser("tasks", help="Очередь задач для ИИ-агента рабочей среды (Вариант А)")
+    tsub = p_tasks.add_subparsers(dest="tasks_action", required=True)
+    tl = tsub.add_parser("list", help="Список задач ИИ-агента")
+    tl.add_argument("--status", default="pending", choices=["pending", "completed", "all"])
+    tn = tsub.add_parser("next", help="Показать следующую ожидающую задачу для выполнения ИИ-агентом")
+    tn.add_argument("--json", action="store_true", help="Вывести JSON-пакет задачи")
+    ts = tsub.add_parser("show", help="Показать промпт задачи по ID")
+    ts.add_argument("task_id")
+    ta = tsub.add_parser("apply", help="Применить JSON-результат от ИИ-агента рабочей среды")
+    ta.add_argument("task_id")
+    ta.add_argument("response_json", nargs="?", default="", help="JSON-строка ответа агента")
+    ta.add_argument("--file", default="", help="Путь к JSON-файлу с ответом агента")
 
-    p_dash = sub.add_parser("dashboard", help="Запустить локальную веб-панель управления")
-    p_dash.add_argument("--host", default="127.0.0.1")
-    p_dash.add_argument("--port", type=int, default=5555)
+    p_exp = sub.add_parser("export", help="Экспортировать черновики в CSV или Markdown")
+    p_exp.add_argument("--format", default="csv", choices=["csv", "md"])
+    p_exp.add_argument("--status", default=None)
+    p_exp.add_argument("-o", "--output", default="", help="Путь к выходному файлу")
+
+    p_run = sub.add_parser("run", help="Запустить полный цикл разведки для настроенной ниши")
+    p_run.add_argument("-q", "--query", default="")
+    p_run.add_argument("-c", "--city", default="")
+    p_run.add_argument("--provider", default="auto")
+    p_run.add_argument("--channel", default="telegram", choices=["telegram", "email", "whatsapp"])
+    p_run.add_argument("-n", "--limit", type=int, default=15)
+    p_run.add_argument("--template", action="store_true")
+
+    sub.add_parser("sample", help="Загрузить 2 тестовые карточки под текущую настроенную нишу")
+
+    p_ui = sub.add_parser("ui", help="Запустить веб-интерфейс F.R.I.D.A.Y.")
+    p_ui.add_argument("--host", default="0.0.0.0")
+    p_ui.add_argument("--port", type=int, default=5555)
 
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
-    utf8_stdio()
+async def _dispatch(args: argparse.Namespace) -> int:
+    state = StateManager(db_path=args.db or None)
+    cfg = load_config()
+
+    if args.cmd in (None, "status"):
+        return await _cmd_status(state)
+    if args.cmd == "presets":
+        return await _cmd_presets()
+    if args.cmd == "train":
+        return await _cmd_train(args, state)
+    if args.cmd == "setup":
+        return await _cmd_setup(args)
+    if args.cmd == "signals":
+        return await _cmd_signals(args, state)
+    if args.cmd == "tasks":
+        return await _cmd_tasks(args, state)
+
+    await bootstrap_state(state)
+
+    if args.cmd == "discover":
+        q = args.query or (cfg.icp.search_queries[0] if cfg.icp.search_queries else "")
+        c = args.city or (cfg.icp.cities[0] if cfg.icp.cities else "Москва")
+        if not q:
+            console.print("[red]Укажите `-q <запрос>` или сначала настройте нишу (`friday train`).[/red]")
+            return 1
+        res = await run_discover(state, query=q, city=c, provider=args.provider, limit=args.limit, config=cfg)
+        console.print(f"[green]Поиск завершён:[/green] {res}")
+        return 0
+
+    if args.cmd == "import":
+        parsed = parse_import_file(
+            args.file,
+            default_city=args.city or (cfg.icp.cities[0] if cfg.icp.cities else ""),
+            default_industry=args.industry or cfg.icp.niche,
+        )
+        res = await persist_discovered_items(state, parsed, config=cfg, run_id="cli_import")
+        console.print(f"[green]Импорт завершён:[/green] {res}")
+        return 0
+
+    if args.cmd == "profile":
+        res = await run_profile(state, limit=args.limit)
+        console.print(f"[green]Профилирование завершено:[/green] {res}")
+        return 0
+
+    if args.cmd == "prospects":
+        res = await run_people(state, limit=args.limit, config=cfg)
+        console.print(f"[green]Поиск ЛПР завершён:[/green] {res}")
+        return 0
+
+    if args.cmd == "cohort":
+        req = [x.strip().upper() for x in args.require.split(",") if x.strip()]
+        exc = [x.strip().upper() for x in args.exclude.split(",") if x.strip()]
+        companies = await state.cohort(require=req, exclude=exc)
+        t = Table(title=f"Когорта компаний ({len(companies)})")
+        t.add_column("Название")
+        t.add_column("Отрасль")
+        t.add_column("Город")
+        t.add_column("Домен")
+        for c in companies:
+            t.add_row(c.name, c.industry, c.city, c.domain)
+        console.print(t)
+        return 0
+
+    if args.cmd == "score":
+        res = await score_all_prospects(state, use_ai=args.ai, limit=args.limit, config=cfg)
+        console.print(f"[green]Скоринг завершён:[/green] {res}")
+        return 0
+
+    if args.cmd == "drafts":
+        mode_ov = "template" if args.template else None
+        res = await run_drafts(
+            state,
+            channel=args.channel,
+            min_score=args.min_score,
+            limit=args.limit,
+            mode_override=mode_ov,
+            config=cfg,
+        )
+        console.print(f"[green]Подготовка черновиков:[/green] {res}")
+        return 0
+
+    if args.cmd == "export":
+        content = (
+            await export_drafts_csv(state, status=args.status)
+            if args.format == "csv"
+            else await export_drafts_markdown(state, status=args.status)
+        )
+        if args.output:
+            Path(args.output).write_text(content, encoding="utf-8")
+            console.print(f"[green]Экспортировано в {args.output}[/green]")
+        else:
+            sys.stdout.write(content)
+        return 0
+
+    if args.cmd == "run":
+        res = await run_full_pipeline(
+            state,
+            query=args.query or None,
+            city=args.city or None,
+            provider=args.provider,
+            limit=args.limit,
+            channel=args.channel,
+            mode_override="template" if args.template else None,
+            config=cfg,
+        )
+        console.print(f"[green]Конвейер завершён:[/green] {res}")
+        return 0
+
+    if args.cmd == "sample":
+        res = await seed_sample_for_active_niche(state, config=cfg)
+        console.print(f"[green]Тестовые карточки под текущую нишу добавлены:[/green] {res}")
+        return 0
+
+    return 1
+
+
+def main() -> None:
     parser = build_parser()
-    args = parser.parse_args(argv)
-    dispatch = {
-        "status": cmd_status,
-        "signals": cmd_signals,
-        "discover": cmd_discover,
-        "import": cmd_import,
-        "profile": cmd_profile,
-        "scout": cmd_scout,
-        "draft": cmd_draft,
-        "run": cmd_run,
-        "drafts": cmd_drafts,
-        "companies": cmd_companies,
-        "export": cmd_export,
-        "tasks": cmd_tasks,
-        "dashboard": cmd_dashboard,
-    }
-    handler = dispatch.get(args.command)
-    if not handler:
-        parser.print_help()
+    args = parser.parse_args()
+    if args.cmd == "ui":
+        import uvicorn
+        from friday.dashboard import create_app
+
+        app = create_app(db_path=args.db or None)
+        uvicorn.run(app, host=args.host, port=args.port)
         return
-    try:
-        handler(args)
-    except ConfigError as exc:
-        print(f"\n  Ошибка конфигурации: {exc}\n", file=sys.stderr)
-        sys.exit(2)
+
+    code = asyncio.run(_dispatch(args))
+    raise SystemExit(code)
 
 
 if __name__ == "__main__":

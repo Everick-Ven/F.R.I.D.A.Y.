@@ -1,15 +1,17 @@
-"""Общие фикстуры тестов F.R.I.D.A.Y. (все данные строго вымышленные: *.example)."""
+"""Общие фикстуры pytest для F.R.I.D.A.Y. v0.2."""
 
+from __future__ import annotations
+
+from pathlib import Path
 import pytest_asyncio
 
-from friday.signals import seed_signal_catalog
+from friday.pipeline import bootstrap_state
 from friday.state import StateManager
 
 
 @pytest_asyncio.fixture
-async def state_db(tmp_path):
+async def state(tmp_path: Path) -> StateManager:
     db_file = tmp_path / "test_friday.db"
-    st = StateManager(db_path=db_file)
-    await st.init_db()
-    await seed_signal_catalog(st, auto_confirm_free=True)
-    return st
+    sm = StateManager(db_path=db_file)
+    await bootstrap_state(sm, auto_confirm_core=True)
+    return sm

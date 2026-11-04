@@ -1,346 +1,384 @@
-"""Веб-панель управления F.R.I.D.A.Y. (FastAPI + чистый HTML/CSS/JS без шага сборки).
+"""FastAPI веб-сервер F.R.I.D.A.Y. (0.0.0.0:5555, любые хосты/прокси Live Preview, относительные `/api/*`).
 
-Работает одинаково надёжно локально (`127.0.0.1:5555`) и в облачном Live Preview (`0.0.0.0`),
-используя только относительные маршруты `/api/...`.
+Ключевые возможности:
+- Шаг 1 («1. Ниша и продукт»): настройка любой ниши рынка РФ (`friday.local.yaml` + `skills/product_knowledge.md`),
+  краулинг сайта продукта и постановка задачи `train_niche` ИИ-агенту рабочей среды.
+- Поиск и импорт компаний (включая открытый API `hh.ru`, Яндекс, 2ГИС, загрузку CSV/JSON/TXT).
+- Центр задач Мозга (Вариант А — `agent_tasks`): просмотр пакетов задач и применение JSON-ответов агента.
+- Проверка черновиков, шлюз ФЗ-38 (`gate.py`) и экспорт CSV / Markdown (без автоотправки).
 """
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import logging
+from dataclasses import asdict
 from pathlib import Path
+import tempfile
 
-import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, PlainTextResponse, Response
-from pydantic import BaseModel
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
-from friday.agents.scout import Scout
-from friday.agents.writer import Writer
-from friday.brain import Brain
-from friday.collectors.discover import PROVIDERS, parse_import_text, persist_discovered_practices
-from friday.config import FridayConfig, load_config, load_env
-from friday.export import export_dossiers_markdown, export_prospects_csv
-from friday.pipeline import apply_agent_task_result, run_profile_stage
-from friday.register import build_company_register, register_to_csv
-from friday.signals import FREE_SIGNAL_CODES, seed_signal_catalog
+from friday.agents.scout import score_all_prospects
+from friday.agents.writer import generate_draft_for_prospect, run_drafts
+from friday.brain import (
+    BrainError,
+    apply_agent_task_result,
+    enqueue_agent_task,
+    load_prompt,
+    load_skills,
+)
+from friday.collectors.discover import parse_import_file, persist_discovered_items, run_discover
+from friday.collectors.people import run_people
+from friday.collectors.profile import run_profile
+from friday.config import is_niche_configured, load_config
+from friday.export import export_drafts_csv, export_drafts_markdown
+from friday.paths import SKILLS_DIR
+from friday.pipeline import bootstrap_state, seed_sample_for_active_niche
 from friday.state import StateManager
-
-logger = logging.getLogger("friday.dashboard")
+from friday.trainer import (
+    NICHE_TEMPLATES_RU,
+    apply_niche_setup,
+    build_train_prompt_context,
+    crawl_product_site,
+)
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
 
-class SignalStatusUpdate(BaseModel):
+class NicheSaveRequest(BaseModel):
+    persona: dict = Field(default_factory=dict)
+    product: dict = Field(default_factory=dict)
+    icp: dict = Field(default_factory=dict)
+    compliance: dict = Field(default_factory=dict)
+    product_knowledge_md: str = ""
+    competitive_intel_md: str = ""
+
+
+class NicheTrainRequest(BaseModel):
+    website: str = ""
+    brief: str = ""
+    niche_hint: str = ""
+    cities: list[str] = Field(default_factory=list)
+
+
+class DiscoverRequest(BaseModel):
+    query: str = ""
+    city: str = ""
+    provider: str = "auto"
+    limit: int = Field(default=15, ge=1, le=50)
+
+
+class DraftsRequest(BaseModel):
+    channel: str = "telegram"
+    min_score: int | None = None
+    limit: int = Field(default=20, ge=1, le=100)
+    template_preview: bool = False
+
+
+class SingleDraftRequest(BaseModel):
+    prospect_id: str
+    channel: str = "telegram"
+    template_preview: bool = False
+
+
+class StatusPatch(BaseModel):
     status: str
 
 
-class BulkSignalAction(BaseModel):
-    mode: str   # confirm_free | confirm_all | reset_proposed
-
-
-class DraftStatusUpdate(BaseModel):
-    status: str
-    body: str | None = None
-    subject: str | None = None
-
-
-class ImportPayload(BaseModel):
-    content: str
-    is_registry: bool = False
-    default_city: str = ""
-
-
-class PipelineActionPayload(BaseModel):
-    min_score: int = 40
-    limit: int = 15
-    provider_override: str = ""
-
-
-class AgentTaskSubmit(BaseModel):
+class AgentTaskCompletion(BaseModel):
     response_json: str
 
 
-def create_app(db_path: str | Path | None = None, config_path: str | Path | None = None) -> FastAPI:
-    def _state() -> StateManager:
-        return StateManager(db_path=db_path)
-
-    def _cfg() -> FridayConfig:
-        try:
-            return load_config(config_path)
-        except Exception:
-            return FridayConfig()
+def create_app(db_path: str | None = None) -> FastAPI:
+    state = StateManager(db_path=db_path)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
-        st = _state()
-        await st.init_db()
-        await seed_signal_catalog(st, auto_confirm_free=False)
+        # Инициализируем только схему SQLite (WAL) и каталог из 26 универсальных сигналов РФ.
+        # Никакая конкретная ниша не предзагружается: Шаг 1 задаёт сам пользователь!
+        await bootstrap_state(state, auto_confirm_core=True)
         yield
 
-    app = FastAPI(title="F.R.I.D.A.Y. Dashboard", lifespan=_lifespan)
+    app = FastAPI(
+        title="F.R.I.D.A.Y. — B2B-разведка и подготовка черновиков (РФ)",
+        version="0.2.0",
+        lifespan=_lifespan,
+    )
 
-    @app.get("/api/overview")
-    async def api_overview():
-        st = _state()
-        await st.init_db()
-        await seed_signal_catalog(st, auto_confirm_free=False)
-        cfg = _cfg()
-        env = load_env()
-        brain = Brain(st, brain_config=cfg.brain, env=env)
-        ok, msg = await brain.preflight()
-        summary = await st.get_state_summary()
+    @app.middleware("http")
+    async def _preview_headers(request: Request, call_next):
+        resp = await call_next(request)
+        if "X-Frame-Options" in resp.headers:
+            del resp.headers["X-Frame-Options"]
+        return resp
+
+    @app.get("/api/health")
+    async def api_health():
+        cfg = load_config()
+        return {"ok": True, "version": "0.2.0", "niche_configured": is_niche_configured(cfg)}
+
+    @app.get("/api/summary")
+    async def api_summary():
+        cfg = load_config()
+        summary = await state.get_state_summary()
+        prod_skill = SKILLS_DIR / "product_knowledge.md"
+        comp_skill = SKILLS_DIR / "competitive_intel.md"
         return {
             "summary": summary,
-            "persona": cfg.persona.model_dump(),
-            "bureau": cfg.bureau.model_dump(),
-            "icp": cfg.icp.model_dump(),
-            "compliance": cfg.compliance.model_dump(),
-            "brain": {
-                "provider": cfg.brain.provider,
-                "model": cfg.brain.model,
-                "ready": ok,
-                "message": msg,
+            "niche_configured": is_niche_configured(cfg),
+            "config": cfg.model_dump(),
+            "skills": {
+                "product_knowledge_md": prod_skill.read_text(encoding="utf-8") if prod_skill.exists() else "",
+                "competitive_intel_md": comp_skill.read_text(encoding="utf-8") if comp_skill.exists() else "",
             },
-            "providers": [
-                {
-                    "key": p.key,
-                    "label": p.label,
-                    "kind": p.kind,
-                    "blurb": p.blurb,
-                    "cost_per_query_rub": p.cost_per_query_rub,
-                    "configured": p.configured(env),
-                    "missing_keys": p.missing_keys(env),
-                }
-                for p in PROVIDERS.values()
-            ],
         }
 
+    # ── Шаг 1: Ниша и продукт ──
+
+    @app.get("/api/niche/presets")
+    async def api_niche_presets():
+        return {"items": NICHE_TEMPLATES_RU}
+
+    @app.post("/api/niche/save")
+    async def api_niche_save(req: NicheSaveRequest):
+        cfg = load_config()
+        saved = apply_niche_setup(req.model_dump(), base_config=cfg)
+        new_cfg = load_config()
+        return {
+            "ok": True,
+            "saved": saved,
+            "niche_configured": is_niche_configured(new_cfg),
+            "config": new_cfg.model_dump(),
+        }
+
+    @app.post("/api/niche/train")
+    async def api_niche_train(req: NicheTrainRequest):
+        if not req.website.strip() and not req.brief.strip() and not req.niche_hint.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Укажите сайт вашего продукта или краткое описание ниши и оффера",
+            )
+        cfg = load_config()
+        crawl = await crawl_product_site(req.website) if req.website.strip() else {"url": "", "pages": [], "error": ""}
+        sys_prompt = "\n\n".join(
+            p for p in [load_prompt("system"), load_prompt("train"), load_skills(["ru_compliance"])] if p
+        )
+        user_prompt = build_train_prompt_context(
+            website_crawl=crawl,
+            user_brief=req.brief,
+            target_niche_hint=req.niche_hint,
+            cities_hint=req.cities or None,
+        )
+        tid, tfile = await enqueue_agent_task(
+            state,
+            cfg,
+            kind="train_niche",
+            payload={
+                "website": req.website.strip(),
+                "brief": req.brief.strip(),
+                "niche_hint": req.niche_hint.strip(),
+                "cities": req.cities,
+                "pages_crawled": len(crawl.get("pages") or []),
+            },
+            system_prompt=sys_prompt,
+            user_prompt=user_prompt,
+        )
+        return {
+            "ok": True,
+            "task_id": tid,
+            "task_file": tfile,
+            "pages_crawled": len(crawl.get("pages") or []),
+            "crawl_error": crawl.get("error", ""),
+        }
+
+    # ── Сигналы, Компании, ЛПР, Черновики ──
+
     @app.get("/api/signals")
-    async def api_signals():
-        st = _state()
-        await st.init_db()
-        await seed_signal_catalog(st, auto_confirm_free=False)
-        codes = await st.list_signal_codes()
-        for c in codes:
-            c["is_free"] = c["code"] in FREE_SIGNAL_CODES
-        return {"signals": codes}
+    async def api_signals(status: str | None = None):
+        return {"items": await state.list_signal_codes(status=status)}
 
-    @app.post("/api/signals/bulk")
-    async def api_signals_bulk(req: BulkSignalAction):
-        st = _state()
-        await st.init_db()
-        all_codes = await st.list_signal_codes()
-        updated = 0
-        for row in all_codes:
-            code = row["code"]
-            if req.mode == "confirm_free" and code in FREE_SIGNAL_CODES:
-                await st.set_signal_status(code, "confirmed")
-                updated += 1
-            elif req.mode == "confirm_all":
-                await st.set_signal_status(code, "confirmed")
-                updated += 1
-            elif req.mode == "reset_proposed":
-                await st.set_signal_status(code, "proposed")
-                updated += 1
-        return {"updated": updated}
-
-    @app.post("/api/signals/{code}")
-    async def api_signal_set(code: str, req: SignalStatusUpdate):
-        st = _state()
-        await st.init_db()
+    @app.patch("/api/signals/{code}")
+    async def api_patch_signal(code: str, patch: StatusPatch):
         try:
-            changed = await st.set_signal_status(code, req.status)
+            ok = await state.set_signal_status(code.upper(), patch.status)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if not changed:
-            raise HTTPException(status_code=404, detail="Сигнал не найден")
-        return {"ok": True, "code": code, "status": req.status}
+        if not ok:
+            raise HTTPException(status_code=404, detail="Код сигнала не найден")
+        return {"ok": True, "code": code.upper(), "status": patch.status}
 
     @app.get("/api/companies")
-    async def api_companies():
-        st = _state()
-        await st.init_db()
-        cfg = _cfg()
-        rows = await build_company_register(st, cfg)
-        return {"companies": rows}
+    async def api_companies(require: str = "", exclude: str = "", limit: int = 200):
+        req_codes = [c.strip().upper() for c in require.split(",") if c.strip()]
+        exc_codes = [c.strip().upper() for c in exclude.split(",") if c.strip()]
+        if req_codes or exc_codes:
+            companies = await state.cohort(require=req_codes, exclude=exc_codes)
+        else:
+            companies = await state.get_companies(limit=limit)
+
+        out = []
+        for c in companies[:limit]:
+            obs = await state.get_observations(company_id=c.id)
+            d = asdict(c)
+            d["observations"] = obs
+            out.append(d)
+        return {"items": out}
+
+    @app.get("/api/prospects")
+    async def api_prospects(min_score: int = 0, status: str | None = None, limit: int = 200):
+        prospects = await state.get_prospects(status=status, min_score=min_score, limit=limit)
+        out = []
+        for p in prospects:
+            d = asdict(p)
+            d["full_name"] = p.full_name
+            d["polite_greeting"] = p.polite_greeting
+            out.append(d)
+        return {"items": out}
 
     @app.get("/api/drafts")
     async def api_drafts(status: str | None = None, channel: str | None = None):
-        st = _state()
-        await st.init_db()
-        items = await st.list_drafts(status=status, channel=channel, limit=300)
-        return {"drafts": items}
+        return {"items": await state.list_drafts(status=status, channel=channel, limit=300)}
 
-    @app.post("/api/drafts/{draft_id}")
-    async def api_update_draft(draft_id: str, req: DraftStatusUpdate):
-        st = _state()
-        await st.init_db()
-        cfg = _cfg()
-        existing = [d for d in await st.list_drafts(limit=500) if d["id"] == draft_id]
-        if not existing:
+    @app.patch("/api/drafts/{draft_id}")
+    async def api_patch_draft(draft_id: str, patch: StatusPatch):
+        try:
+            ok = await state.set_draft_status(draft_id, patch.status)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not ok:
             raise HTTPException(status_code=404, detail="Черновик не найден")
-        cur = existing[0]
+        return {"ok": True, "id": draft_id, "status": patch.status}
 
-        # Если текст отредактировали вручную — прогоняем через комплаенс-фильтр Gate
-        if req.body is not None or req.subject is not None:
-            from friday.gate import check_draft
-            from friday.models import Draft
+    # ── Этапы конвейера ──
 
-            new_body = req.body if req.body is not None else cur["body"]
-            new_subj = req.subject if req.subject is not None else cur["subject"]
-            gate = check_draft(
-                channel=cur["channel"],
-                subject=new_subj,
-                body=new_body,
-                config=cfg,
-                domain=cur.get("domain") or "",
-                email=cur.get("email") or "",
-                telegram=cur.get("prospect_telegram") or cur.get("company_telegram") or "",
+    @app.post("/api/run/discover")
+    async def api_run_discover(req: DiscoverRequest):
+        cfg = load_config()
+        q = req.query.strip() or (cfg.icp.search_queries[0] if cfg.icp.search_queries else "")
+        c = req.city.strip() or (cfg.icp.cities[0] if cfg.icp.cities else "Москва")
+        if not q:
+            raise HTTPException(
+                status_code=400,
+                detail="Укажите поисковый запрос или настройте нишу на вкладке «1. Ниша и продукт»",
             )
-            if not gate.ok and req.status in ("approved", "sent_manually"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Фильтр ФЗ-38 / КПЭА отклонил правку: " + "; ".join(gate.reasons),
-                )
-            await st.upsert_draft(
-                Draft(
-                    id=draft_id,
-                    prospect_id=cur["prospect_id"],
-                    company_id=cur["company_id"],
-                    channel=cur["channel"],
-                    subject=new_subj,
-                    body=new_body,
-                    audit_summary=cur.get("audit_summary") or "",
-                    signal_used=cur.get("signal_used") or "",
-                    status=req.status if gate.ok or req.status == "rejected" else "gate_blocked",
-                    gate_notes=[*gate.reasons, *(f"предупреждение: {w}" for w in gate.warnings)],
-                    brain_provider=cur.get("brain_provider") or "manual_edit",
-                )
+        return await run_discover(
+            state,
+            query=q,
+            city=c,
+            provider=req.provider,
+            limit=req.limit,
+            config=cfg,
+        )
+
+    @app.post("/api/import/upload")
+    async def api_import_upload(
+        file: UploadFile = File(...),
+        city: str = Form(default=""),
+        industry: str = Form(default=""),
+    ):
+        cfg = load_config()
+        suffix = Path(file.filename or "upload.csv").suffix.lower()
+        if suffix not in (".csv", ".json", ".jsonl", ".txt"):
+            raise HTTPException(status_code=400, detail="Поддерживаются форматы .csv, .json, .jsonl, .txt")
+        raw_bytes = await file.read()
+        if len(raw_bytes) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Файл превышает лимит 10 МБ")
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(raw_bytes)
+            tmp_path = Path(tmp.name)
+        try:
+            parsed = parse_import_file(
+                tmp_path,
+                default_city=city.strip() or (cfg.icp.cities[0] if cfg.icp.cities else ""),
+                default_industry=industry.strip() or cfg.icp.niche,
             )
-            return {"ok": True}
+            stats = await persist_discovered_items(state, parsed, config=cfg, run_id="web_upload")
+            return {"ok": True, "filename": file.filename, **stats}
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
+    @app.post("/api/run/profile")
+    async def api_run_profile():
+        return await run_profile(state, limit=30)
+
+    @app.post("/api/run/prospects")
+    async def api_run_prospects():
+        cfg = load_config()
+        return await run_people(state, limit=30, config=cfg)
+
+    @app.post("/api/run/score")
+    async def api_run_score(use_ai: bool = False):
+        cfg = load_config()
+        return await score_all_prospects(state, use_ai=use_ai, limit=200, config=cfg)
+
+    @app.post("/api/run/drafts")
+    async def api_run_drafts(req: DraftsRequest):
+        cfg = load_config()
+        return await run_drafts(
+            state,
+            channel=req.channel,
+            min_score=req.min_score,
+            limit=req.limit,
+            mode_override="template" if req.template_preview else None,
+            config=cfg,
+        )
+
+    @app.post("/api/run/draft-single")
+    async def api_run_draft_single(req: SingleDraftRequest):
+        p = await state.get_prospect(req.prospect_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="ЛПР не найден")
+        cfg = load_config()
+        return await generate_draft_for_prospect(
+            state,
+            p,
+            channel=req.channel,
+            mode_override="template" if req.template_preview else None,
+            config=cfg,
+        )
+
+    @app.post("/api/run/sample")
+    async def api_run_sample():
+        cfg = load_config()
+        return await seed_sample_for_active_niche(state, config=cfg)
+
+    # ── Очередь задач Мозга (Вариант А — ИИ-агент рабочей среды) ──
+
+    @app.get("/api/agent-tasks")
+    async def api_agent_tasks(status: str = "pending"):
+        return {"items": await state.list_agent_tasks(status=status)}
+
+    @app.post("/api/agent-tasks/{task_id}/complete")
+    async def api_complete_agent_task(task_id: str, body: AgentTaskCompletion):
+        cfg = load_config()
         try:
-            await st.set_draft_status(draft_id, req.status)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"ok": True}
-
-    @app.post("/api/import")
-    async def api_import(req: ImportPayload):
-        if not req.content.strip():
-            raise HTTPException(status_code=400, detail="Пустые данные для импорта")
-        st = _state()
-        await st.init_db()
-        await seed_signal_catalog(st, auto_confirm_free=False)
-        cfg = _cfg()
-        tag = "discover:minjust_registry" if req.is_registry else "import:custom_list"
-        items = parse_import_text(
-            req.content, source_tag=tag, default_city=req.default_city.strip()
-        )
-        rep = await persist_discovered_practices(st, items, config=cfg)
-        return rep.as_dict()
-
-    @app.post("/api/pipeline/prepare")
-    async def api_prepare_pipeline(req: PipelineActionPayload):
-        """Профилировать непроверенные сайты, оценить контакты и подготовить черновики."""
-        st = _state()
-        await st.init_db()
-        cfg = _cfg()
-        if req.provider_override in ("claude", "agent", "openai_compatible", "template"):
-            cfg.brain.provider = req.provider_override  # type: ignore[assignment]
-        env = load_env()
-
-        comp_cnt, obs_cnt, prosp_cnt, _ = await run_profile_stage(st, config=cfg, limit=25)
-        brain = Brain(st, brain_config=cfg.brain, env=env)
-        scout = Scout(brain=brain, state=st, config=cfg)
-        scout_res = await scout.score_pending_prospects(limit=req.limit, rescore_all=False)
-        writer = Writer(brain=brain, state=st, config=cfg)
-        writer_res = await writer.generate_drafts(min_score=req.min_score, limit=req.limit)
-        return {
-            "profiled_companies": comp_cnt,
-            "profile_observations": obs_cnt,
-            "new_prospects": prosp_cnt,
-            "scout": scout_res,
-            "writer": writer_res,
-        }
-
-    @app.get("/api/tasks")
-    async def api_tasks(status: str = "pending"):
-        st = _state()
-        await st.init_db()
-        return {"tasks": await st.list_agent_tasks(status=status)}
-
-    @app.post("/api/tasks/{task_id}/apply")
-    async def api_task_apply(task_id: str, req: AgentTaskSubmit):
-        st = _state()
-        await st.init_db()
-        cfg = _cfg()
-        try:
-            res = await apply_agent_task_result(st, cfg, task_id, req.response_json)
-            return res
-        except ValueError as exc:
+            outcome = await apply_agent_task_result(state, task_id, body.response_json, cfg=cfg)
+            return {"ok": True, "outcome": outcome}
+        except BrainError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get("/api/export/prospects.csv")
-    async def api_export_csv(excel_ru: bool = True):
-        st = _state()
-        await st.init_db()
-        cfg = _cfg()
-        _, csv_text = await export_prospects_csv(st, cfg, excel_ru=excel_ru)
+    # ── Экспорт ──
+
+    @app.get("/api/export/csv")
+    async def api_export_csv(status: str | None = None):
+        content = await export_drafts_csv(state, status=status)
         return Response(
-            content="\ufeff" + csv_text,
+            content=content.encode("utf-8"),
             media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": 'attachment; filename="friday_prospects.csv"'},
+            headers={"Content-Disposition": 'attachment; filename="friday_drafts_ru.csv"'},
         )
 
-    @app.get("/api/export/companies.csv")
-    async def api_export_companies():
-        st = _state()
-        await st.init_db()
-        cfg = _cfg()
-        rows = await build_company_register(st, cfg)
-        csv_text = register_to_csv(rows)
-        return Response(
-            content="\ufeff" + csv_text,
-            media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": 'attachment; filename="friday_companies.csv"'},
-        )
+    @app.get("/api/export/markdown")
+    async def api_export_md(status: str | None = None):
+        content = await export_drafts_markdown(state, status=status)
+        return PlainTextResponse(content)
 
-    @app.get("/api/export/dossiers.md")
-    async def api_export_dossiers():
-        st = _state()
-        await st.init_db()
-        cfg = _cfg()
-        _, md = await export_dossiers_markdown(st, cfg, min_score=0)
-        return PlainTextResponse(
-            content=md,
-            headers={"Content-Disposition": 'attachment; filename="friday_dossiers.md"'},
-        )
-
-    @app.get("/app.css")
-    async def serve_css():
-        return FileResponse(WEB_DIR / "app.css", media_type="text/css; charset=utf-8")
-
-    @app.get("/app.js")
-    async def serve_js():
-        return FileResponse(WEB_DIR / "app.js", media_type="application/javascript; charset=utf-8")
+    app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
     @app.get("/")
-    async def serve_index():
-        return FileResponse(WEB_DIR / "index.html", media_type="text/html; charset=utf-8")
+    async def index_page():
+        return FileResponse(WEB_DIR / "index.html")
 
     return app
-
-
-def start_dashboard(
-    *,
-    host: str = "127.0.0.1",
-    port: int = 5555,
-    db_path: str | Path | None = None,
-    config_path: str | Path | None = None,
-) -> None:
-    app = create_app(db_path=db_path, config_path=config_path)
-    display_host = "127.0.0.1" if host == "0.0.0.0" else host
-    print(f"\n  F.R.I.D.A.Y. Веб-панель запущена: http://{display_host}:{port}\n")
-    uvicorn.run(app, host=host, port=port, log_level="info")

@@ -1,337 +1,315 @@
-"""Writer — генерация аналитического досье и персональных черновиков для ручного захода.
+"""Агент-автор (Writer): подготовка персонализированных черновиков B2B-писем (Telegram / Email / WhatsApp).
 
-Никакой автоматической рассылки: каждый черновик проходит детерминированный `gate.check_draft`
-(проверка 38-ФЗ «О рекламе», ст. 17 КПЭА, стоп-листа и анти-спама) и попадает в очередь
-`pending_review` для просмотра и ручной отправки человеком.
+Вариант А (`brain.mode = "agent"` — по умолчанию):
+- Собирает карточку компании, ЛПР, подтверждённые сигналы из `observations` (изолированные в `<untrusted>`),
+  настройки продукта из `friday.local.yaml` и `skills/product_knowledge.md`, а также правила ФЗ-38.
+- Создаёт структурированные задачи `writer_draft` для ИИ-агента рабочей среды (`data/agent_tasks/`).
+- Когда ИИ-агент применяет готовый текст через `friday tasks apply`, каждый черновик в обязательном
+  порядке проходит детерминированный шлюз `friday.gate.validate_draft` (ФЗ-38 ст. 5 + нишевые запреты).
+
+Режим `template` (`brain.mode = "template"` или `mode_override="template"`):
+- Мгновенно собирает аккуратный предпросмотровый черновик по фактическому сигналу без ожидания агента.
 """
 
 from __future__ import annotations
 
-import json
-import logging
-
-from friday.brain import AgentTaskQueued, Brain
-from friday.config import FridayConfig
-from friday.fit import pick_primary_signal
-from friday.gate import check_draft, match_do_not_contact
-from friday.models import Company, Draft, Prospect
+from friday.brain import enqueue_agent_task, load_prompt, load_skills
+from friday.config import FridayConfig, load_config
+from friday.gate import validate_draft
+from friday.models.company import Company
+from friday.models.draft import Draft
+from friday.models.prospect import Prospect
 from friday.state import StateManager
-from friday.untrusted import UNTRUSTED_RULE, fence
+from friday.untrusted import UNTRUSTED_RULE, wrap_untrusted
 
-logger = logging.getLogger("friday.writer")
-
-
-class Writer:
-    def __init__(self, brain: Brain, state: StateManager, config: FridayConfig):
-        self.brain = brain
-        self.state = state
-        self.config = config
-
-    async def generate_drafts(
-        self,
-        *,
-        min_score: int = 45,
-        limit: int = 10,
-        channels: list[str] | None = None,
-    ) -> dict:
-        """Создать черновики для лучших оценённых контактов со статусом `new`."""
-        target_channels = channels or list(self.config.bureau.primary_channels) or ["telegram", "email"]
-        prospects = await self.state.get_prospects(status="new", min_score=min_score, limit=limit * 2)
-
-        created = 0
-        blocked = 0
-        queued_tasks: list[str] = []
-        dnc = self.config.compliance.do_not_contact
-
-        selected: list[tuple[Prospect, Company | None, list[dict]]] = []
-        for p in prospects:
-            comp = await self.state.get_company(p.company_id) if p.company_id else None
-            if match_do_not_contact(
-                domain=(comp.domain if comp else ""),
-                email=p.email,
-                telegram=p.telegram or (comp.telegram if comp else ""),
-                entries=dnc,
-            ):
-                continue
-            obs = await self.state.get_observations(company_id=p.company_id) if p.company_id else []
-            selected.append((p, comp, obs))
-            if len(selected) >= limit:
-                break
-
-        for p, comp, obs in selected:
-            sig_code, sig_desc = pick_primary_signal(obs)
-
-            if self.brain.provider == "template":
-                result_obj = build_template_draft_bundle(
-                    prospect=p,
-                    company=comp,
-                    observations=obs,
-                    sig_code=sig_code,
-                    sig_desc=sig_desc,
-                    config=self.config,
-                )
-                c_ok, c_blk = await apply_writer_response(
-                    self.state,
-                    self.config,
-                    prospect=p,
-                    company=comp,
-                    payload=result_obj,
-                    channels=target_channels,
-                    provider_label="template",
-                )
-                created += c_ok
-                blocked += c_blk
-                continue
-
-            prompt, task_meta = self._build_writer_prompt(
-                prospect=p,
-                company=comp,
-                observations=obs,
-                sig_code=sig_code,
-                sig_desc=sig_desc,
-                channels=target_channels,
-            )
-            try:
-                parsed = await self.brain.think_json(
-                    prompt,
-                    agent="writer",
-                    task="writer_draft",
-                    task_payload=task_meta,
-                )
-            except AgentTaskQueued as queued:
-                queued_tasks.append(queued.task_id)
-                continue
-
-            if not isinstance(parsed, dict):
-                logger.warning("Writer: некорректный JSON для %s, пропуск.", p.id)
-                continue
-
-            c_ok, c_blk = await apply_writer_response(
-                self.state,
-                self.config,
-                prospect=p,
-                company=comp,
-                payload=parsed,
-                channels=target_channels,
-                provider_label=self.brain.provider,
-            )
-            created += c_ok
-            blocked += c_blk
-
-        return {
-            "drafts_ready": created,
-            "drafts_blocked_by_gate": blocked,
-            "queued_task_ids": queued_tasks,
-            "mode": self.brain.provider,
-        }
-
-    def _build_writer_prompt(
-        self,
-        *,
-        prospect: Prospect,
-        company: Company | None,
-        observations: list[dict],
-        sig_code: str,
-        sig_desc: str,
-        channels: list[str],
-    ) -> tuple[str, dict]:
-        sys_hdr = self.brain.build_system_header(self.config)
-        skills = self.brain.load_skills_for_agent("writer")
-        principles_md = "\n".join(f"- {item}" for item in self.config.bureau.principles)
-        writer_rules = self.brain.load_prompt(
-            "writer",
-            {
-                "persona_name": self.config.persona.name,
-                "persona_role": self.config.persona.role,
-                "persona_company": self.config.persona.company,
-                "persona_tone": self.config.persona.tone,
-                "bureau_description": self.config.bureau.description,
-                "bureau_principles": principles_md,
-                "entry_offer": self.config.bureau.entry_offer,
-                "max_telegram_words": str(self.config.compliance.max_telegram_words),
-                "max_email_words": str(self.config.compliance.max_email_words),
-            },
-        )
-
-        salutation = prospect.polite_salutation(self.config.persona.address_style)
-        facts = {
-            "prospect_id": prospect.id,
-            "salutation_hint": salutation or "Здравствуйте (без имени, т.к. контакт общий)",
-            "full_name": prospect.full_name(),
-            "title": prospect.title,
-            "registry_number": prospect.registry_number,
-            "company_name": company.name if company else prospect.company,
-            "legal_form": company.legal_form if company else "",
-            "city": company.city if company else prospect.city,
-            "website": company.website if company else prospect.source_url,
-            "practice_areas": company.practice_areas if company else [],
-            "tech_stack": company.tech_stack if company else [],
-            "scout_angle": prospect.personalization_notes,
-            "primary_signal_code": sig_code,
-            "primary_signal_summary": sig_desc,
-            "observations": [
-                {
-                    "code": o["signal_code"],
-                    "num": o["value_num"],
-                    "text": o["value_text"],
-                    "evidence_url": o["evidence_url"],
-                }
-                for o in observations[:10]
-            ],
-        }
-
-        schema_spec = {
-            "prospect_id": prospect.id,
-            "signal_used": sig_code or "PROFILE_OBSERVATION",
-            "audit_summary": "Краткая памятка для человека перед ручным контактом (3-4 предложения: чем сильна практика, в чём точка потери в Яндексе/картах, куда лучше написать).",
-            "drafts": {
-                ch: (
-                    {"subject": "спокойная тема 2-4 слова", "body": "текст письма"}
-                    if ch == "email"
-                    else {"subject": "", "body": "короткое сообщение без ссылок и без восклицательных знаков"}
-                )
-                for ch in channels
-            },
-        }
-
-        prompt = (
-            f"{sys_hdr}\n\n{UNTRUSTED_RULE}\n\n"
-            f"=== НАВЫКИ ===\n{skills}\n\n"
-            f"=== ПРАВИЛА WRITER ===\n{writer_rules}\n\n"
-            f"=== ФАКТЫ О ПРАКТИКЕ И АДВОКАТЕ ===\n"
-            f"{fence(json.dumps(facts, ensure_ascii=False, indent=2), 'prospect_facts')}\n\n"
-            f"Подготовьте черновики для каналов: {', '.join(channels)}.\n"
-            f"Верните СТРОГО JSON-объект по образцу:\n"
-            f"{json.dumps(schema_spec, ensure_ascii=False, indent=2)}"
-        )
-        return prompt, {"prospect_id": prospect.id, "channels": channels}
+HIGH_VALUE_SIGNALS = [
+    "HH_HIRING_ROLE",
+    "YANDEX_PAGE2_RANK",
+    "YANDEX_DIRECT_ACTIVE",
+    "NO_ONLINE_CAPTURE",
+    "NO_YANDEX_METRIKA",
+    "NO_MESSENGER_WIDGET",
+    "NO_MOBILE_VIEWPORT",
+    "LOW_MAP_RATING",
+    "NO_WEBSITE_ON_MAP",
+    "THIN_SERVICE_STRUCTURE",
+    "SSL_ISSUE",
+    "SLOW_SITE",
+]
 
 
-def build_template_draft_bundle(
-    *,
+def _pick_primary_observation(observations: list[dict]) -> dict | None:
+    by_code = {o["signal_code"]: o for o in observations}
+    for code in HIGH_VALUE_SIGNALS:
+        if code in by_code:
+            return by_code[code]
+    return observations[0] if observations else None
+
+
+def _build_template_draft(
     prospect: Prospect,
     company: Company | None,
     observations: list[dict],
-    sig_code: str,
-    sig_desc: str,
-    config: FridayConfig,
+    channel: str,
+    cfg: FridayConfig,
 ) -> dict:
-    """Построить аккуратный русскоязычный каркас досье и черновиков строго по фактам (без LLM)."""
-    salutation = prospect.polite_salutation(config.persona.address_style)
-    greeting = f"{salutation}, здравствуйте." if salutation else "Здравствуйте."
-    comp_name = (company.name if company else prospect.company) or "вашей практики"
-    city = (company.city if company else prospect.city) or ""
-    city_phrase = f" в городе {city}" if city else ""
+    greeting = prospect.polite_greeting
+    cname = company.name if company and company.name else (prospect.company or "вашей компании")
+    dom = (company.domain or company.website) if company else ""
+    city = (company.city if company and company.city else prospect.city) or "вашем регионе"
+    obs = _pick_primary_observation(observations)
+    codes = {o["signal_code"]: o for o in observations}
 
-    if sig_desc:
-        obs_sentence = f"Изучал видимость адвокатских практик{city_phrase} и обратил внимание: {sig_desc}."
+    if "HH_HIRING_ROLE" in codes and "NO_ONLINE_CAPTURE" in codes:
+        sig_code = "HH_HIRING_ROLE+NO_ONLINE_CAPTURE"
+        fact_sentence = (
+            f"Обратил внимание, что в «{cname}» сейчас открыт подбор ({codes['HH_HIRING_ROLE']['value_text']}), "
+            f"при этом на сайте {dom} пока нет быстрых форм захвата и кнопок мессенджеров."
+        )
+        audit_summary = (
+            f"1) Сигнал роста на hh.ru ({codes['HH_HIRING_ROLE']['value_text']}). "
+            f"2) На сайте {dom} отсутствует быстрый онлайн-захват обращений."
+        )
+    elif obs and obs["signal_code"] == "HH_HIRING_ROLE":
+        sig_code = "HH_HIRING_ROLE"
+        fact_sentence = (
+            f"Увидел у «{cname}» открытую вакансию на hh.ru ({obs.get('value_text', '')}) "
+            f"и решил написать напрямую."
+        )
+        audit_summary = f"1) Открытый найм на hh.ru: {obs.get('value_text', '')}."
+    elif "YANDEX_DIRECT_ACTIVE" in codes and ("NO_ONLINE_CAPTURE" in codes or "NO_YANDEX_METRIKA" in codes):
+        sig_code = "YANDEX_DIRECT_ACTIVE"
+        fact_sentence = (
+            f"Посмотрел сайт {dom}: увидел активную рекламу в Яндекс.Директе, "
+            f"но заметил точку потери части обращений на посадочной странице."
+        )
+        audit_summary = f"1) На {dom} работает реклама Яндекс.Директа. 2) Обнаружена потеря конверсии на входе."
+    elif obs and obs["signal_code"] == "YANDEX_PAGE2_RANK":
+        sig_code = "YANDEX_PAGE2_RANK"
+        fact_sentence = (
+            f"Изучал выдачу в {city}: сайт {dom} уже стоит в шаге от первой страницы Яндекса "
+            f"({obs.get('value_text', '')})."
+        )
+        audit_summary = f"1) {obs.get('value_text', '')}. 2) Быстрый резерв роста органического трафика."
+    elif obs and obs["signal_code"] in ("LOW_MAP_RATING", "NO_WEBSITE_ON_MAP"):
+        sig_code = obs["signal_code"]
+        fact_sentence = (
+            f"Посмотрел карточку «{cname}» в геосервисах ({city}) — заметил конкретную точку роста "
+            f"по обращениям ({obs.get('value_text', '')})."
+        )
+        audit_summary = f"1) Карточка геосервиса: {obs.get('value_text', '')}."
+    elif obs:
+        sig_code = obs["signal_code"]
+        fact_sentence = (
+            f"Посмотрел сайт «{cname}» ({dom or city}) и отметил деталь: {obs.get('value_text', '')}."
+        )
+        audit_summary = f"1) Наблюдение: {obs.get('value_text', '')}."
     else:
-        obs_sentence = (
-            f"Посмотрел сайт и карточки «{comp_name}»{city_phrase} по профильным запросам доверителей в Яндексе."
+        sig_code = "ICP_FIT"
+        fact_sentence = (
+            f"Познакомился с деятельностью «{cname}» в {city} — мы работаем как раз с компаниями вашей сферы."
+        )
+        audit_summary = f"1) Профильная компания ниши «{cfg.icp.niche}» ({city})."
+
+    offer_line = cfg.product.description.strip()
+    cta_goal = (cfg.product.offer.entry or "прислать короткий разбор из 3 пунктов").strip()
+    sender_sign = f"{cfg.persona.name}, {cfg.persona.role}".strip(", ")
+    if cfg.persona.company and cfg.persona.company != "Ваша компания":
+        sender_sign = f"{sender_sign} ({cfg.persona.company})".strip()
+
+    if channel in ("telegram", "whatsapp"):
+        body = (
+            f"{greeting}, здравствуйте. {fact_sentence}\n\n"
+            f"{offer_line}\n"
+            f"Подскажите, актуально ли {cta_goal} прямо сюда в чат?\n\n"
+            f"С уважением, {sender_sign}"
+        )
+        subject = ""
+    else:
+        subject = f"вопрос по «{cname}» ({dom or city})"[:78]
+        body = (
+            f"{greeting}, добрый день.\n\n"
+            f"{fact_sentence}\n\n"
+            f"{offer_line}\n\n"
+            f"Подскажите, уместно ли {cta_goal} в ответном письме без лишних созвонов?\n\n"
+            f"С уважением,\n{sender_sign}"
         )
 
-    tg_body = (
-        f"{greeting}\n\n"
-        f"{obs_sentence}\n\n"
-        f"Мы профильно выстраиваем привлечение доверителей для адвокатов и коллегий по правилам "
-        f"ст. 17 КПЭА и ФЗ «О рекламе», все кабинеты и аналитика остаются на стороне доверителя. "
-        f"Подскажите, задача по системной загрузке практики сейчас для вас актуальна?"
-    )
-
-    email_subject = f"видимость практики в яндексе"
-    email_body = (
-        f"{greeting}\n\n"
-        f"{obs_sentence}\n\n"
-        f"Мы работаем с адвокатскими бюро и коллегиями: настраиваем поиск Яндекса, Директ и карточки "
-        f"в Яндекс Картах и 2ГИС строго в рамках ст. 17 КПЭА и 38-ФЗ, без пустых обещаний и с оформлением "
-        f"всех доступов на доверителя.\n\n"
-        f"Если тема привлечения доверителей актуальна, могу прислать сюда короткий текстовый разбор "
-        f"из 5 пунктов по вашей практике без созвонов и презентаций. Прислать?"
-    )
-
-    codes_list = ", ".join(sorted({o["signal_code"] for o in observations})) or "базовый профиль"
-    rec_channel = (
-        f"Telegram ({prospect.telegram or (company.telegram if company else '')})"
-        if (prospect.telegram or (company and company.telegram))
-        else (f"Email ({prospect.email})" if prospect.email else "форма на сайте / телефон")
-    )
-    audit_summary = (
-        f"Практика: {comp_name} ({(company.legal_form if company else '') or 'форма не уточнена'}, {city or 'регион РФ'}).\n"
-        f"Контакт: {prospect.full_name() or 'Общий контакт'} ({prospect.title or 'Адвокат'}).\n"
-        f"Главный сигнал: {sig_desc or 'профильное соответствие ICP'} [всего сигналов: {codes_list}].\n"
-        f"Рекомендуемый ручной канал: {rec_channel}."
-    )
-
     return {
-        "prospect_id": prospect.id,
-        "signal_used": sig_code or "ICP_MATCH",
+        "subject": subject,
+        "body": body,
         "audit_summary": audit_summary,
-        "drafts": {
-            "telegram": {"subject": "", "body": tg_body},
-            "tenchat": {"subject": "", "body": tg_body},
-            "email": {"subject": email_subject, "body": email_body},
-        },
+        "signal_used": sig_code,
     }
 
 
-async def apply_writer_response(
+async def generate_draft_for_prospect(
     state: StateManager,
-    config: FridayConfig,
-    *,
     prospect: Prospect,
-    company: Company | None,
-    payload: dict,
-    channels: list[str],
-    provider_label: str,
-) -> tuple[int, int]:
-    """Проверить каждый черновик через `gate.check_draft` и сохранить в таблицу `drafts`."""
-    drafts_map = payload.get("drafts") or {}
-    audit_summary = str(payload.get("audit_summary") or "").strip()
-    signal_used = str(payload.get("signal_used") or "").strip()
+    *,
+    channel: str = "telegram",
+    mode_override: str | None = None,
+    config: FridayConfig | None = None,
+) -> dict:
+    cfg = config or load_config()
+    effective_mode = mode_override or cfg.brain.mode
 
-    ready = 0
+    company = await state.get_company(prospect.company_id) if prospect.company_id else None
+    observations = await state.get_observations(company_id=prospect.company_id) if prospect.company_id else []
+
+    if effective_mode == "agent":
+        # Не плодим дубликаты ожидающих задач для одного и того же ЛПР и канала
+        pending = await state.list_agent_tasks(status="pending")
+        for existing in pending:
+            if existing["kind"] == "writer_draft":
+                pl = existing.get("payload") or {}
+                if pl.get("prospect_id") == prospect.id and pl.get("channel") == channel:
+                    return {
+                        "queued": True,
+                        "already_pending": True,
+                        "task_id": existing["id"],
+                        "prospect_id": prospect.id,
+                        "channel": channel,
+                    }
+
+        sys_prompt = "\n\n".join(
+            p
+            for p in [
+                load_prompt("system"),
+                load_prompt("writer"),
+                load_skills(["product_knowledge", "competitive_intel", "ru_compliance", "outreach_frameworks_ru"]),
+                UNTRUSTED_RULE,
+            ]
+            if p
+        )
+        obs_lines = "\n".join(
+            f"- {o['signal_code']}: {o.get('value_text', '')} ({o.get('evidence_url', '')})"
+            for o in observations
+        ) or "- Нет дополнительных технических наблюдений"
+
+        untrusted_context = wrap_untrusted(
+            f"Компания: {company.name if company else prospect.company}\n"
+            f"Отрасль: {company.industry if company else prospect.industry}\n"
+            f"ИНН: {company.inn if company else ''}\n"
+            f"Домен: {company.domain if company else ''}\n"
+            f"Город: {prospect.city}\n"
+            f"Описание сайта: {company.description if company else ''}\n"
+            f"Технологический стек: {', '.join(company.tech_stack) if company else ''}\n"
+            f"Получатель (ЛПР): {prospect.full_name} (обращение: «{prospect.polite_greeting}»)\n"
+            f"Должность: {prospect.title}\n"
+            f"Заметки разведки: {prospect.personalization_notes}\n"
+            f"Подтверждённые сигналы:\n{obs_lines}",
+            source="prospect_card",
+        )
+        user_prompt = (
+            f"Канал сообщения: {channel}\n"
+            f"Регулируемая ниша комплаенса: {cfg.compliance.regulated_niche}\n"
+            f"Отправитель: {cfg.persona.name}, {cfg.persona.role} ({cfg.persona.company})\n"
+            f"Продукт отправителя: {cfg.product.name} ({cfg.product.category})\n"
+            f"Описание продукта: {cfg.product.description}\n"
+            f"Условия / цена: {cfg.product.pricing}\n"
+            f"Мягкий первый шаг (Entry Offer): {cfg.product.offer.entry}\n\n"
+            f"{untrusted_context}\n\n"
+            'Сформируй персональный черновик строго в формате JSON: {"subject": "...", "body": "...", "audit_summary": "...", "signal_used": "..."}.'
+        )
+        tid, tfile = await enqueue_agent_task(
+            state,
+            cfg,
+            kind="writer_draft",
+            payload={"prospect_id": prospect.id, "company_id": prospect.company_id, "channel": channel},
+            system_prompt=sys_prompt,
+            user_prompt=user_prompt,
+        )
+        return {
+            "queued": True,
+            "task_id": tid,
+            "task_file": tfile,
+            "prospect_id": prospect.id,
+            "channel": channel,
+        }
+
+    # Детерминированный режим предпросмотра (`template`)
+    generated = _build_template_draft(prospect, company, observations, channel, cfg)
+    subject = str(generated.get("subject", "")).strip()
+    body = str(generated.get("body", "")).strip()
+    audit_summary = str(generated.get("audit_summary", "")).strip()
+    signal_used = str(generated.get("signal_used", "")).strip()
+
+    gate_res = validate_draft(
+        channel=channel,
+        subject=subject,
+        body=body,
+        company_domain=company.domain if company else "",
+        prospect_email=prospect.email,
+        prospect_telegram=prospect.telegram or (company.telegram if company else ""),
+        config=cfg,
+    )
+    status = "pending_review" if gate_res.passed else "gate_blocked"
+    notes = [*gate_res.reasons, *gate_res.warnings]
+
+    draft = Draft(
+        prospect_id=prospect.id,
+        company_id=prospect.company_id,
+        channel=channel,
+        subject=subject,
+        body=body,
+        audit_summary=audit_summary,
+        signal_used=signal_used,
+        status=status,
+        gate_notes=notes,
+        brain_provider="template",
+    )
+    did = await state.upsert_draft(draft)
+    if gate_res.passed and prospect.status == "new":
+        await state.set_prospect_status(prospect.id, "draft_ready")
+
+    return {
+        "queued": False,
+        "draft_id": did,
+        "prospect_id": prospect.id,
+        "channel": channel,
+        "status": status,
+        "gate_passed": gate_res.passed,
+        "gate_notes": notes,
+        "provider": "template",
+    }
+
+
+async def run_drafts(
+    state: StateManager,
+    *,
+    channel: str = "telegram",
+    min_score: int | None = None,
+    limit: int = 20,
+    mode_override: str | None = None,
+    config: FridayConfig | None = None,
+) -> dict:
+    cfg = config or load_config()
+    threshold = min_score if min_score is not None else cfg.icp.min_fit_score
+    prospects = await state.get_prospects(min_score=threshold, limit=limit)
+
+    created = 0
     blocked = 0
-    for ch in channels:
-        item = drafts_map.get(ch)
-        if not isinstance(item, dict):
-            continue
-        subj = str(item.get("subject") or "").strip()
-        body = str(item.get("body") or "").strip()
-        if not body:
-            continue
+    queued = 0
 
-        gate_res = check_draft(
-            channel=ch,
-            subject=subj,
-            body=body,
-            config=config,
-            domain=(company.domain if company else ""),
-            email=prospect.email,
-            telegram=prospect.telegram or (company.telegram if company else ""),
+    for p in prospects:
+        res = await generate_draft_for_prospect(
+            state,
+            p,
+            channel=channel,
+            mode_override=mode_override,
+            config=cfg,
         )
-        status = "pending_review" if gate_res.ok else "gate_blocked"
-        notes = [*gate_res.reasons, *(f"предупреждение: {w}" for w in gate_res.warnings)]
-
-        await state.upsert_draft(
-            Draft(
-                prospect_id=prospect.id,
-                company_id=prospect.company_id,
-                channel=ch,
-                subject=subj,
-                body=body,
-                audit_summary=audit_summary,
-                signal_used=signal_used,
-                status=status,
-                gate_notes=notes,
-                brain_provider=provider_label,
-            )
-        )
-        if gate_res.ok:
-            ready += 1
+        if res.get("queued"):
+            queued += 1
+        elif res.get("gate_passed"):
+            created += 1
         else:
             blocked += 1
 
-    if ready > 0:
-        await state.set_prospect_status(prospect.id, "drafted")
-
-    return ready, blocked
+    return {
+        "processed": len(prospects),
+        "drafts_ready": created,
+        "gate_blocked": blocked,
+        "queued_agent_tasks": queued,
+    }

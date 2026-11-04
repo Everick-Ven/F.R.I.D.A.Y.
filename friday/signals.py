@@ -1,156 +1,167 @@
-"""Управляемый словарь сигналов F.R.I.D.A.Y. для российского юридического рынка.
+"""Универсальный каталог сигналов F.R.I.D.A.Y. для любой ниши российского рынка (26 сигналов).
 
-Ключевой принцип архитектуры (унаследованный от Harvey):
-- Каждый факт о практике или адвокате хранится как строка-наблюдение (`observations`),
-  а не как жёсткая колонка таблицы.
-- Новый сигнал не требует миграции БД, повторный сбор создаёт временной ряд,
-  а вместе с фактом всегда сохраняется `evidence_url` и уверенность (`confidence`).
-- F.R.I.D.A.Y. предлагает каталог сигналов со статусом `proposed`; в сбор идут
-  только те сигналы, которые человек явно подтвердил (`status = 'confirmed'`).
+Архитектурный принцип (как в Harvey):
+- Каждый собранный факт записывается строкой в `observations` с уровнем уверенности и `evidence_url`.
+- Триггер `trg_observations_signal_known` в SQLite защищает от незарегистрированных кодов.
+- В сбор идут только сигналы, имеющие статус `confirmed`.
 """
 
 from __future__ import annotations
 
 SIGNAL_CATALOG: list[dict] = [
-    # ── DISCOVERY: поисковая выдача Яндекса, карты и реестры ──
+    # ── DISCOVERY: HeadHunter (hh.ru), Яндекс Поиск, 2ГИС, Яндекс Карты ──
     {
-        "code": "YANDEX_SERP_RANK",
-        "label": "Позиция в органической выдаче Яндекса",
+        "code": "HH_HIRING_ROLE",
+        "label": "Активная вакансия на HeadHunter (hh.ru)",
         "description": (
-            "Позиция сайта в поиске Яндекса по запросу «<практика> <город>» (фраза сохраняется "
-            "вместе с наблюдением). Позиции 11–30 — главная точка роста: практика уже пытается "
-            "привлекать доверителей из поиска, но находится за пределами первой страницы."
+            "Компания прямо сейчас ищет сотрудника на сигнальную роль (`icp.hiring_signals`) на hh.ru — "
+            "сильнейший признак роста и готовности инвестировать в B2B-решения."
         ),
-        "category": "discovery",
-        "value_type": "num",
-        "collector": "discover",
-        "cost_note": "платно при использовании Yandex Search API / XML (~0.1–0.5 ₽ за запрос)",
-        "is_free": False,
-        "confidence_floor": 0.0,
-    },
-    {
-        "code": "FOUND_IN_YANDEX",
-        "label": "Найден в поиске по целевому запросу",
-        "description": "По какому именно юридическому запросу и городу практика попала в выборку.",
         "category": "discovery",
         "value_type": "text",
-        "collector": "discover",
-        "cost_note": "включено в поисковый запрос",
+        "collector": "hh_ru",
+        "cost_note": "бесплатно (публичный API api.hh.ru без ключа)",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
-        "code": "YANDEX_MAPS_RATING",
-        "label": "Рейтинг карточки в Яндекс Картах",
-        "description": (
-            "Средняя оценка организации в Яндекс Картах. Высокий рейтинг при малом числе отзывов "
-            "или без сайта означает хорошую репутацию при слабой упаковке трафика."
-        ),
+        "code": "HH_OPEN_ROLES",
+        "label": "Количество открытых вакансий компании на hh.ru",
+        "description": "Общее число активных вакансий работодателя на hh.ru — индикатор масштаба и бюджета.",
         "category": "discovery",
         "value_type": "num",
-        "collector": "discover",
-        "cost_note": "включено в запрос Яндекс Карт / импорт",
+        "collector": "hh_ru",
+        "cost_note": "бесплатно (api.hh.ru)",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
-        "code": "YANDEX_MAPS_REVIEWS",
-        "label": "Количество оценок/отзывов в Яндекс Картах",
-        "description": "Число отзывов в карточке Яндекс Карт — индикатор локальной видимости практики.",
+        "code": "YANDEX_PAGE2_RANK",
+        "label": "Позиция 11–30 в органике Яндекса (2–3 страница)",
+        "description": "Сайт компании уже вложился в контент, но застрял в шаге от первой страницы Яндекса.",
         "category": "discovery",
         "value_type": "num",
-        "collector": "discover",
-        "cost_note": "включено в запрос Яндекс Карт / импорт",
+        "collector": "yandex_search",
+        "cost_note": "платно через Yandex Search API (~0.1–0.5 ₽ за запрос)",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
         "code": "TWOGIS_RATING",
-        "label": "Рейтинг карточки в 2ГИС",
-        "description": "Средний рейтинг адвокатского образования или юрфирмы в справочнике 2ГИС.",
+        "label": "Рейтинг компании в 2ГИС",
+        "description": "Средний рейтинг филиала или организации в справочнике 2ГИС.",
         "category": "discovery",
         "value_type": "num",
-        "collector": "discover",
-        "cost_note": "включено в запрос 2ГИС API / импорт",
+        "collector": "twogis",
+        "cost_note": "включено в запрос 2ГИС / импорт",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
         "code": "TWOGIS_REVIEWS",
         "label": "Количество отзывов в 2ГИС",
-        "description": "Число отзывов в карточке 2ГИС (в городах-миллионниках РФ — один из главных источников локального трафика).",
+        "description": "Число отзывов в карточке 2ГИС.",
         "category": "discovery",
         "value_type": "num",
-        "collector": "discover",
-        "cost_note": "включено в запрос 2ГИС API / импорт",
+        "collector": "twogis",
+        "cost_note": "включено в запрос 2ГИС / импорт",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
-        "code": "NO_WEBSITE",
-        "label": "Нет собственного сайта",
-        "description": (
-            "У адвокатского образования есть запись в 2ГИС, Яндекс Картах или реестре, указан телефон, "
-            "но отсутствует собственный сайт."
-        ),
+        "code": "YANDEX_MAPS_RATING",
+        "label": "Рейтинг организации в Яндекс Картах",
+        "description": "Средняя оценка организации в Яндекс Картах.",
         "category": "discovery",
-        "value_type": "bool",
-        "collector": "discover",
-        "cost_note": "бесплатно (из карточки организации или реестра)",
+        "value_type": "num",
+        "collector": "yandex_maps",
+        "cost_note": "включено в запрос Яндекс Карт / импорт",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
-        "code": "UNCLAIMED_OR_EMPTY_CARD",
-        "label": "Незаполненная карточка в Яндекс Картах / 2ГИС",
-        "description": (
-            "В карточке справочника отсутствуют ключевые поля (не привязан сайт, нет графика работы, "
-            "мессенджеров или профильных рубрик) — локальный спрос теряется."
-        ),
+        "code": "LOW_MAP_RATING",
+        "label": "Просадка рейтинга в геосервисах (< 4.3)",
+        "description": "Оценка в 2ГИС или Яндекс Картах ниже 4.3 — потеря горячих локальных клиентов.",
         "category": "discovery",
-        "value_type": "bool",
+        "value_type": "num",
+        "collector": "twogis",
+        "cost_note": "бесплатно (расчёт по карточке)",
+        "is_free": True,
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "NO_WEBSITE_ON_MAP",
+        "label": "В карточке геосервиса отсутствует сайт",
+        "description": "В карточке 2ГИС, Яндекс Карт или OpenStreetMap не привязан сайт организации.",
+        "category": "discovery",
+        "value_type": "text",
         "collector": "discover",
         "cost_note": "бесплатно (из карточки организации)",
         "is_free": True,
         "confidence_floor": 0.0,
     },
-    {
-        "code": "MINJUST_REGISTRY_ACTIVE",
-        "label": "Действующий статус в реестре адвокатов РФ",
-        "description": (
-            "Подтверждён реестровый номер адвоката (формат СС/NNNNN) и действующий статус "
-            "по данным реестра Минюста РФ / Адвокатской палаты субъекта."
-        ),
-        "category": "discovery",
-        "value_type": "text",
-        "collector": "discover",
-        "cost_note": "бесплатно (открытые данные реестров / сайта)",
-        "is_free": True,
-        "confidence_floor": 0.0,
-    },
 
-    # ── PROFILE: разбор сайта практики ($0 — прямой HTTP без LLM) ──
+    # ── PROFILE: разбор сайта российской компании ($0 HTTP без расхода токенов) ──
     {
         "code": "NO_YANDEX_METRIKA",
-        "label": "Отсутствует счётчик Яндекс.Метрики",
-        "description": (
-            "На главной странице не обнаружен код Яндекс.Метрики (mc.yandex.ru/metrika). "
-            "Практика не отслеживает конверсию заявок и поисковые запросы доверителей."
-        ),
+        "label": "Не установлен счётчик Яндекс.Метрики",
+        "description": "На главной странице не найден код Яндекс.Метрики — бизнес не измеряет конверсию сайта.",
         "category": "profile",
-        "value_type": "bool",
+        "value_type": "text",
         "collector": "profile",
         "cost_note": "бесплатно (HTML главной страницы)",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
-        "code": "RUNNING_YANDEX_DIRECT",
-        "label": "Признаки платного трафика / коллтрекинга (Яндекс.Директ, Calltouch, Roistat)",
-        "description": (
-            "На сайте установлены скрипты РСЯ/Яндекс.Директа, Calltouch, Roistat, CoMagic, Yagla или Marquiz — "
-            "практика уже инвестирует бюджет в платное привлечение доверителей."
-        ),
+        "code": "YANDEX_DIRECT_ACTIVE",
+        "label": "Активная реклама в Яндекс.Директе / РСЯ",
+        "description": "На сайте обнаружены скрипты рекламной экосистемы Яндекса — компания уже тратит бюджет на трафик.",
+        "category": "profile",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "бесплатно (HTML главной страницы)",
+        "is_free": True,
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "VK_PIXEL_ACTIVE",
+        "label": "Установлен пиксель VK Рекламы",
+        "description": "Компания использует таргетированную рекламу и ретаргетинг ВКонтакте / VK Рекламы.",
+        "category": "profile",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "бесплатно (HTML главной страницы)",
+        "is_free": True,
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "CALLTRACKING_ACTIVE",
+        "label": "Подключён коллтрекинг / сквозная аналитика (Calltouch, Roistat, UIS, Mango)",
+        "description": "Признак зрелого отдела маркетинга и продаж с измеримым потоком обращений.",
+        "category": "profile",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "бесплатно (HTML главной страницы)",
+        "is_free": True,
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "CRM_WIDGET_ACTIVE",
+        "label": "Установлен виджет CRM / чата / квиза (Битрикс24, amoCRM, Jivo, Marquiz, Envybox)",
+        "description": "Показывает текущий стек захвата и обработки лидов на сайте.",
+        "category": "profile",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "бесплатно (HTML главной страницы)",
+        "is_free": True,
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "ONLINE_BOOKING_ACTIVE",
+        "label": "Виджет онлайн-записи / бронирования (YCLIENTS, DIKIDI, MedFlex, Bnovo)",
+        "description": "Характерный маркер сферы услуг, медицины, бьюти и гостеприимства.",
         "category": "profile",
         "value_type": "text",
         "collector": "profile",
@@ -160,11 +171,8 @@ SIGNAL_CATALOG: list[dict] = [
     },
     {
         "code": "TECH_STACK_RU",
-        "label": "Платформа сайта, CRM и виджеты",
-        "description": (
-            "Обнаруженный стек российского сайта: Tilda, 1С-Битрикс, WordPress, Яндекс.Метрика, "
-            "Битрикс24, amoCRM, Jivo, Calltouch, Roistat, Marquiz и др."
-        ),
+        "label": "CMS / платформа сайта (Tilda, 1С-Битрикс, InSales, WordPress, MODX, OpenCart)",
+        "description": "Позволяет учитывать технические возможности и ограничения текущей платформы клиента.",
         "category": "profile",
         "value_type": "text",
         "collector": "profile",
@@ -173,160 +181,146 @@ SIGNAL_CATALOG: list[dict] = [
         "confidence_floor": 0.0,
     },
     {
-        "code": "MISSING_PRACTICE_PAGES",
-        "label": "Нет отдельных посадочных страниц по специализациям",
-        "description": (
-            "На сайте не найдены отдельные разделы под конкретные категории дел (уголовные, семейные, "
-            "арбитраж, банкротство, наследство и т.д.) — всё сведено на одну общую страницу, "
-            "из-за чего сайт теряет органический трафик в Яндексе."
-        ),
-        "category": "profile",
-        "value_type": "bool",
-        "collector": "profile",
-        "cost_note": "бесплатно (навигация сайта + sitemap.xml)",
-        "is_free": True,
-        "confidence_floor": 0.0,
-    },
-    {
-        "code": "WEAK_TRUST_TRANSPARENCY",
-        "label": "Не указаны реестровые номера / форма адвокатского образования / практика",
-        "description": (
-            "На сайте отсутствуют явные маркеры прозрачности для осторожного доверителя: "
-            "реестровый номер в палате, точная форма образования (коллегия/бюро/кабинет) или раздел судебной практики."
-        ),
-        "category": "profile",
-        "value_type": "bool",
-        "collector": "profile",
-        "cost_note": "бесплатно (HTML сайта)",
-        "is_free": True,
-        "confidence_floor": 0.0,
-    },
-    {
-        "code": "COMPLIANCE_RISK_ON_SITE",
-        "label": "Рискованные формулировки по 38-ФЗ «О рекламе» или ст. 17 КПЭА на сайте",
-        "description": (
-            "На сайте самой практики встретились триггеры риска (обещания «100% гарантии выигрыша», "
-            "«лучший адвокат», блок клиентских отзывов на сайте адвокатского образования), "
-            "которые мешают модерации в Яндекс.Директе и несут дисциплинарные риски по КПЭА."
-        ),
+        "code": "NO_ONLINE_CAPTURE",
+        "label": "Нет онлайн-захвата заявок (форм, квиза, чата и кнопок мессенджеров)",
+        "description": "Клиентам приходится только звонить вручную — нерабочие часы и мобильный трафик теряются.",
         "category": "profile",
         "value_type": "text",
         "collector": "profile",
-        "cost_note": "бесплатно (HTML сайта)",
+        "cost_note": "бесплатно (HTML главной страницы)",
         "is_free": True,
-        "confidence_floor": 0.7,
+        "confidence_floor": 0.0,
     },
     {
-        "code": "NO_FAST_MESSENGER_CTA",
-        "label": "Нет быстрого перехода в Telegram / WhatsApp",
-        "description": (
-            "На сайте нет прямой кнопки быстрой связи в мессенджере — доверители со смартфона "
-            "вынуждены звонить или заполнять длинную форму."
-        ),
+        "code": "NO_MESSENGER_WIDGET",
+        "label": "Нет быстрого перехода в Telegram / WhatsApp и онлайн-чата",
+        "description": "Потеря мобильной аудитории, предпочитающей написать в мессенджер вместо звонка.",
         "category": "profile",
-        "value_type": "bool",
+        "value_type": "text",
         "collector": "profile",
         "cost_note": "бесплатно (HTML главной страницы)",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
-        "code": "NO_SCHEMA_MARKUP",
-        "label": "Отсутствует микроразметка Schema.org",
-        "description": "Нет JSON-LD / Schema.org разметки (LegalService / Attorney / Organization) для поисковых сниппетов Яндекса.",
+        "code": "THIN_SERVICE_STRUCTURE",
+        "label": "Узкая структура сайта без отдельных посадочных под услуги/товары",
+        "description": "Мало внутренних разделов — сайт недобирает коммерческий спрос в поиске Яндекса.",
         "category": "profile",
-        "value_type": "bool",
+        "value_type": "num",
+        "collector": "profile",
+        "cost_note": "бесплатно (внутренние ссылки главной)",
+        "is_free": True,
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "NO_MOBILE_VIEWPORT",
+        "label": "Отсутствует мобильная адаптация (viewport)",
+        "description": "Сайт неудобен со смартфонов и теряет позиции в мобильной выдаче.",
+        "category": "profile",
+        "value_type": "text",
         "collector": "profile",
         "cost_note": "бесплатно (HTML главной страницы)",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
-        "code": "NO_SSL_OR_MOBILE_ISSUES",
-        "label": "Проблемы с HTTPS или мобильной адаптацией (viewport)",
-        "description": "Сайт открывается без SSL или не содержит meta viewport — критично для мобильной выдачи Яндекса.",
+        "code": "NO_HTTPS_REDIRECT",
+        "label": "HTTP-версия не перенаправляет на HTTPS",
+        "description": "Техническая ошибка индексации и безопасности соединения.",
         "category": "profile",
-        "value_type": "bool",
+        "value_type": "text",
         "collector": "profile",
         "cost_note": "бесплатно (HTTP-запрос)",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
-        "code": "SITE_PAGE_COUNT",
-        "label": "Размер сайта (число страниц в sitemap.xml)",
-        "description": "Количество страниц в карте сайта: 1–3 страницы говорят о сайте-визитке без SEO-охвата.",
-        "category": "profile",
-        "value_type": "num",
-        "collector": "profile",
-        "cost_note": "бесплатно (sitemap.xml)",
-        "is_free": True,
-        "confidence_floor": 0.0,
-    },
-    {
-        "code": "BLOG_STALE",
-        "label": "Давно не обновлялись публикации / практика (дней)",
-        "description": "Сколько дней назад в sitemap.xml обновлялись материалы (признак заброшенного контент-маркетинга).",
-        "category": "profile",
-        "value_type": "num",
-        "collector": "profile",
-        "cost_note": "бесплатно (sitemap.xml)",
-        "is_free": True,
-        "confidence_floor": 0.0,
-    },
-    {
-        "code": "INCUMBENT_AGENCY",
-        "label": "Текущий подрядчик по сайту / маркетингу в подвале",
-        "description": "В подвале сайта явно указано агентство («Разработка / продвижение сайта — ...»).",
+        "code": "SSL_ISSUE",
+        "label": "Проблема с SSL-сертификатом",
+        "description": "Браузеры предупреждают посетителей о небезопасном соединении.",
         "category": "profile",
         "value_type": "text",
         "collector": "profile",
-        "cost_note": "бесплатно (подвал сайта)",
+        "cost_note": "бесплатно (TLS-соединение)",
         "is_free": True,
-        "confidence_floor": 0.75,
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "SLOW_SITE",
+        "label": "Медленный ответ сайта (> 3.5 сек)",
+        "description": "Высокий показатель отказов на платном и мобильном трафике.",
+        "category": "profile",
+        "value_type": "num",
+        "collector": "profile",
+        "cost_note": "бесплатно (замер TTFB)",
+        "is_free": True,
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "OUTDATED_COPYRIGHT",
+        "label": "Устаревший год копирайта в подвале сайта",
+        "description": "Косвенный признак того, что сайтом давно не занимались.",
+        "category": "profile",
+        "value_type": "num",
+        "collector": "profile",
+        "cost_note": "бесплатно (HTML подвала)",
+        "is_free": True,
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "SITE_UNREACHABLE",
+        "label": "Сайт недоступен (ошибка сети или HTTP 4xx/5xx)",
+        "description": "Домен компании не открывается.",
+        "category": "profile",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "бесплатно (HTTP-ответ)",
+        "is_free": True,
+        "confidence_floor": 0.0,
     },
 
-    # ── PEOPLE & CONTACTS: кто принимает решение и как связаться вручную ──
+    # ── PEOPLE & CONTACTS: ЛПР и прямые каналы связи ──
+    {
+        "code": "TELEGRAM_PUBLIC",
+        "label": "Публичный рабочий Telegram на сайте / в карточке",
+        "description": "Доступен прямой канал для деликатного делового сообщения в Telegram.",
+        "category": "people",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "бесплатно (HTML / карточка)",
+        "is_free": True,
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "WHATSAPP_PUBLIC",
+        "label": "Публичный рабочий WhatsApp",
+        "description": "На сайте размещена прямая ссылка wa.me / api.whatsapp.com.",
+        "category": "people",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "бесплатно (HTML / карточка)",
+        "is_free": True,
+        "confidence_floor": 0.0,
+    },
     {
         "code": "DECISION_MAKER_FOUND",
-        "label": "Найден ЛПР (управляющий партнёр / председатель / адвокат)",
-        "description": "На сайте определены ФИО и должность руководителя адвокатского образования или профильного партнёра.",
+        "label": "Найдены ФИО и должность ЛПР",
+        "description": "Извлечены Фамилия Имя Отчество и должность руководителя / собственника / профильного директора.",
         "category": "people",
         "value_type": "text",
         "collector": "people",
-        "cost_note": "бесплатно (страницы «О коллегии / Команда / Адвокаты»)",
+        "cost_note": "бесплатно (страницы «О компании / Команда / Реквизиты»)",
         "is_free": True,
         "confidence_floor": 0.0,
     },
     {
-        "code": "TELEGRAM_CONTACT",
-        "label": "Публичный контакт в Telegram",
-        "description": "На сайте или в карточке указан публичный Telegram для связи или канал практики.",
+        "code": "PERSONAL_EMAIL_FOUND",
+        "label": "Найден персональный корпоративный e-mail ЛПР",
+        "description": "Адрес электронной почты руководителя (не общий info@/sales@).",
         "category": "people",
         "value_type": "text",
-        "collector": "profile",
-        "cost_note": "бесплатно (HTML сайта / карточка)",
-        "is_free": True,
-        "confidence_floor": 0.0,
-    },
-    {
-        "code": "PUBLIC_EMAIL_CONTACT",
-        "label": "Опубликованный рабочий email",
-        "description": "Публично размещённый на сайте или в реестре адрес электронной почты (без угадывания чужих адресов).",
-        "category": "people",
-        "value_type": "text",
-        "collector": "profile",
-        "cost_note": "бесплатно (HTML сайта / карточка)",
-        "is_free": True,
-        "confidence_floor": 0.0,
-    },
-    {
-        "code": "CONTACT_FORM_URL",
-        "label": "Страница контактов / форма обратной связи",
-        "description": "URL страницы контактов или формы обращения на сайте практики.",
-        "category": "people",
-        "value_type": "text",
-        "collector": "profile",
+        "collector": "people",
         "cost_note": "бесплатно (HTML сайта)",
         "is_free": True,
         "confidence_floor": 0.0,
@@ -339,8 +333,8 @@ FREE_SIGNAL_CODES: frozenset[str] = frozenset(
 ALL_SIGNAL_CODES: frozenset[str] = frozenset(sig["code"] for sig in SIGNAL_CATALOG)
 
 
-async def seed_signal_catalog(state, auto_confirm_free: bool = False) -> int:
-    """Зарегистрировать словарь сигналов в БД без перезаписи пользовательских решений."""
+async def ensure_signal_catalog(state, auto_confirm_core: bool = True) -> int:
+    """Зарегистрировать универсальный каталог сигналов РФ в БД без перезаписи решений пользователя."""
     for sig in SIGNAL_CATALOG:
         await state.upsert_signal_code(
             sig["code"],
@@ -352,9 +346,12 @@ async def seed_signal_catalog(state, auto_confirm_free: bool = False) -> int:
             cost_note=sig["cost_note"],
             confidence_floor=sig.get("confidence_floor", 0.0),
         )
-    if auto_confirm_free:
+    if auto_confirm_core:
         for code in FREE_SIGNAL_CODES:
             cur = await state.get_signal_code(code)
             if cur and cur.get("status") == "proposed":
                 await state.set_signal_status(code, "confirmed")
     return len(SIGNAL_CATALOG)
+
+
+seed_signal_catalog = ensure_signal_catalog

@@ -135,3 +135,31 @@ def public_http_client(
         follow_redirects=True,
         max_redirects=8,
     )
+
+
+class PublicHttpError(RuntimeError):
+    """Унифицированная ошибка безопасного публичного HTTP-клиента."""
+
+
+class SafePublicHttpClient:
+    """Удобная обёртка над `public_http_client`, выбрасывающая `PublicHttpError` при сетевых/SSRF сбоях."""
+
+    def __init__(self, *, timeout: float = 12.0):
+        self._client = public_http_client(
+            timeout=timeout,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; FRIDAY-B2B-Scout/0.2; +https://github.com/Everick-Ven/F.R.I.D.A.Y.)"
+                ),
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
+            },
+        )
+
+    async def get(self, url: str) -> httpx.Response:
+        try:
+            return await self._client.get(url)
+        except (UnsafeURLError, httpx.HTTPError, OSError) as exc:
+            raise PublicHttpError(str(exc)) from exc
+
+    async def close(self) -> None:
+        await self._client.aclose()

@@ -1,407 +1,643 @@
-const state = {
-  overview: null,
-  companies: [],
-  drafts: [],
-  signals: [],
-  tasks: [],
-};
+/* F.R.I.D.A.Y. v0.2 UI — относительные URL (/api/*), совместимо с любым Live Preview прокси */
+
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+let hasAutoSwitchedTab = false;
 
 function showToast(msg) {
-  const el = document.getElementById("toast");
+  const el = $("#toast");
   el.textContent = msg;
   el.classList.remove("hidden");
-  setTimeout(() => el.classList.add("hidden"), 3200);
-}
-
-function esc(str) {
-  const div = document.createElement("div");
-  div.textContent = str == null ? "" : String(str);
-  return div.innerHTML;
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => el.classList.add("hidden"), 4200);
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-    ...opts,
-  });
+  const headers = opts.body instanceof FormData
+    ? (opts.headers || {})
+    : { "Content-Type": "application/json", ...(opts.headers || {}) };
+  const res = await fetch(path, { ...opts, headers });
   if (!res.ok) {
-    let detail = res.statusText;
+    let txt = await res.text();
     try {
-      const err = await res.json();
-      detail = err.detail || JSON.stringify(err);
+      const parsed = JSON.parse(txt);
+      if (parsed.detail) txt = parsed.detail;
     } catch (_) {}
-    throw new Error(detail);
+    throw new Error(txt || `HTTP ${res.status}`);
   }
   return res.json();
 }
 
-// Переключение вкладок
-document.getElementById("main-tabs").addEventListener("click", (e) => {
-  const btn = e.target.closest(".tab");
-  if (!btn) return;
-  document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
-  document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
-  btn.classList.add("active");
-  document.getElementById(`view-${btn.dataset.tab}`).classList.add("active");
+function esc(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function statusBadge(status) {
+  const map = {
+    pending_review: ["На проверке", "badge-warn"],
+    approved: ["Одобрено к ручной отправке", "badge-ok"],
+    sent_manually: ["Отправлено вручную", "badge-ok"],
+    gate_blocked: ["Заблокировано шлюзом ФЗ-38", "badge-danger"],
+    rejected: ["Отклонено", "badge-danger"],
+    confirmed: ["confirmed", "badge-ok"],
+    proposed: ["proposed", "badge-warn"],
+    pending: ["Ожидает ИИ-агента", "badge-warn"],
+    completed: ["Выполнена", "badge-ok"],
+  };
+  const [label, cls] = map[status] || [status, ""];
+  return `<span class="badge ${cls}">${esc(label)}</span>`;
+}
+
+function switchTab(target) {
+  $$("#mainTabs .tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === target));
+  $$(".panel").forEach((p) => p.classList.toggle("active", p.id === `tab-${target}`));
+}
+
+$$("#mainTabs .tab").forEach((btn) => {
+  btn.addEventListener("click", () => switchTab(btn.dataset.tab));
 });
 
-async function refreshAll() {
-  const [ov, comp, dr, sig, tsk] = await Promise.all([
-    api("/api/overview"),
-    api("/api/companies"),
-    api(buildDraftsUrl()),
-    api("/api/signals"),
-    api("/api/tasks?status=pending"),
-  ]);
-  state.overview = ov;
-  state.companies = comp.companies || [];
-  state.drafts = dr.drafts || [];
-  state.signals = sig.signals || [];
-  state.tasks = tsk.tasks || [];
-
-  renderOverview();
-  renderCompanies();
-  renderDrafts();
-  renderSignals();
-  renderProviders();
-  renderTasks();
+function splitComma(val) {
+  return String(val || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
-function buildDraftsUrl() {
-  const st = document.getElementById("draft-status-filter").value;
-  const ch = document.getElementById("draft-channel-filter").value;
-  const params = new URLSearchParams();
-  if (st) params.set("status", st);
-  if (ch) params.set("channel", ch);
-  const qs = params.toString();
-  return "/api/drafts" + (qs ? `?${qs}` : "");
+function splitLinesOrComma(val) {
+  return String(val || "")
+    .split(/[\n,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
-function renderOverview() {
-  const ov = state.overview;
-  if (!ov) return;
-  const s = ov.summary;
-  const confirmedSigs = (s.signals_by_status && s.signals_by_status.confirmed) || 0;
-  const pendingDrafts = (s.drafts_by_status && s.drafts_by_status.pending_review) || 0;
-  const approvedDrafts = (s.drafts_by_status && s.drafts_by_status.approved) || 0;
+function fillNicheForm(cfg) {
+  const per = cfg.persona || {};
+  const prod = cfg.product || {};
+  const icp = cfg.icp || {};
+  const comp = cfg.compliance || {};
 
-  document.getElementById("tab-count-companies").textContent = s.companies_total || 0;
-  document.getElementById("tab-count-drafts").textContent = s.drafts_total || 0;
-  document.getElementById("tab-count-tasks").textContent = s.pending_agent_tasks || 0;
+  $("#nsBizName").value = per.company && per.company !== "Ваша компания" ? per.company : "";
+  $("#nsBizWebsite").value = per.website || "";
+  $("#nsProdName").value = prod.name && prod.name !== "Ваш продукт или услуга" ? prod.name : "";
+  $("#nsProdDesc").value =
+    prod.description && !prod.description.startsWith("Опишите, что делает") ? prod.description : "";
+  $("#nsProdBenefits").value = (prod.key_benefits || []).join("\n");
+  $("#nsProdEntry").value = (prod.offer && prod.offer.entry) || "";
+  $("#nsProdPricing").value = prod.pricing || "";
+  $("#nsRegulated").value = comp.regulated_niche || "none";
 
-  const badge = document.getElementById("brain-badge");
-  badge.textContent = `Brain: ${ov.brain.provider}${ov.brain.model ? " (" + ov.brain.model + ")" : ""}`;
-  badge.className = "badge " + (ov.brain.ready ? "badge-ok" : "badge-warn");
+  $("#nsIcpNiche").value = icp.niche || "";
+  $("#nsIcpIndustries").value = (icp.industries || []).join(", ");
+  $("#nsIcpQueries").value = (icp.search_queries || []).join("\n");
+  $("#nsIcpCities").value = (icp.cities || []).join(", ");
+  $("#nsIcpTitles").value = (icp.decision_maker_titles || []).join(", ");
+  $("#nsIcpHiring").value = (icp.hiring_signals || []).join(", ");
 
-  const kpis = [
-    { label: "Практик в реестре", value: s.companies_total, sub: `Непрофилировано сайтов: ${s.unprofiled_companies}` },
-    { label: "Контактов адвокатов / ЛПР", value: s.prospects_total, sub: `Новых: ${(s.prospects_by_status && s.prospects_by_status.new) || 0}` },
-    { label: "Подтверждено сигналов", value: confirmedSigs, sub: `Фактов-наблюдений в БД: ${s.observations_total}` },
-    { label: "Черновиков к ручному заходу", value: pendingDrafts + approvedDrafts, sub: `Одобрено: ${approvedDrafts} · Ждут проверки: ${pendingDrafts}` },
-  ];
+  if (per.name && per.name !== "Ваше имя") $("#nsSenderName").value = per.name;
+  if (per.role) $("#nsSenderTitle").value = per.role;
+  if (per.telegram) $("#nsSenderTg").value = per.telegram;
 
-  document.getElementById("kpi-grid").innerHTML = kpis
+  if (!$("#inpQuery").value && (icp.search_queries || []).length > 0) {
+    $("#inpQuery").value = icp.search_queries[0];
+  }
+  if (!$("#inpCity").value && (icp.cities || []).length > 0) {
+    $("#inpCity").value = icp.cities[0];
+  }
+}
+
+async function loadPresets() {
+  const { items } = await api("/api/niche/presets");
+  const wrap = $("#presetList");
+  wrap.innerHTML = items.map((tpl, idx) => `
+    <button type="button" class="preset-item" data-preset-idx="${idx}">
+      <strong>${esc(tpl.label)}</strong>
+      <span>Целевая ниша: ${esc(tpl.icp.niche)}</span>
+    </button>
+  `).join("");
+
+  $$("#presetList .preset-item").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tpl = items[Number(btn.dataset.presetIdx)];
+      fillNicheForm({
+        persona: tpl.persona,
+        product: tpl.product,
+        icp: tpl.icp,
+        compliance: { regulated_niche: tpl.regulated_niche || "none" },
+      });
+      showToast(`Подставлен шаблон «${tpl.label}» — нажмите «Сохранить нишу и продукт» ниже`);
+    });
+  });
+}
+
+async function loadSummary() {
+  const { summary, niche_configured, config, skills } = await api("/api/summary");
+  const d = summary.drafts_by_status || {};
+
+  $("#tabAgentCnt").textContent = summary.pending_agent_tasks ?? 0;
+  $("#tabDraftsCnt").textContent = (d.pending_review ?? 0) + (d.approved ?? 0);
+
+  const badgeWrap = $("#headerBadges");
+  const badgeTxt = $("#nicheBadgeText");
+  const callout = $("#nicheCallout");
+
+  if (niche_configured) {
+    badgeWrap.classList.remove("unconfigured");
+    badgeTxt.textContent = `Ниша: ${config.persona.company} → ${config.icp.niche}`;
+    callout.classList.add("ready");
+    $("#nicheCalloutTitle").textContent = `Активная ниша настроена: ${config.persona.company} (${config.product.name})`;
+    $("#nicheCalloutDesc").textContent =
+      `Целевая аудитория (ICP): ${config.icp.niche}. Вы можете в любой момент переобучить систему под другой продукт или перейти на вкладку «2. Конвейер и сбор».`;
+    if (!hasAutoSwitchedTab && summary.companies_total > 0) {
+      hasAutoSwitchedTab = true;
+      switchTab("overview");
+    }
+  } else {
+    badgeWrap.classList.add("unconfigured");
+    badgeTxt.textContent = "Шаг 1: настройте нишу и продукт";
+    callout.classList.remove("ready");
+    hasAutoSwitchedTab = true;
+  }
+
+  fillNicheForm(config);
+
+  if (skills && skills.product_knowledge_md) {
+    $("#productSkillPreview").textContent = skills.product_knowledge_md;
+  }
+
+  $("#kpiGrid").innerHTML = [
+    ["Компаний в базе", summary.companies_total],
+    ["ЛПР / Контактов", summary.prospects_total],
+    ["Сигналов зафиксировано", summary.observations_total],
+    ["Черновиков на проверке", d.pending_review || 0],
+    ["Одобрено к отправке", d.approved || 0],
+    ["Задач ИИ-агенту (Мозг)", summary.pending_agent_tasks || 0],
+  ]
     .map(
-      (k) => `
-    <div class="kpi-card">
-      <div class="kpi-label">${esc(k.label)}</div>
-      <div class="kpi-value">${esc(k.value)}</div>
-      <div class="kpi-sub">${esc(k.sub)}</div>
-    </div>`
+      ([label, val]) => `
+      <div class="kpi">
+        <div class="label">${esc(label)}</div>
+        <div class="value">${esc(val)}</div>
+      </div>`
     )
     .join("");
-
-  document.getElementById("brain-details").innerHTML = `
-    <div><strong>Провайдер анализа:</strong> <code>${esc(ov.brain.provider)}</code> — ${esc(ov.brain.message)}</div>
-    <div><strong>Бюро:</strong> ${esc(ov.persona.company)} (${esc(ov.persona.name)})</div>
-    <div><strong>Города ICP:</strong> ${esc((ov.icp.cities || []).join(", "))}</div>
-    <div><strong>Специализации ICP:</strong> ${esc((ov.icp.practice_areas || []).join(", "))}</div>
-    <div><strong>Правовой контур:</strong> Режим «Разведка + черновики» (автоотправка отключена по ст. 18 ФЗ-38; фильтр ФЗ-38 и ст. 17 КПЭА включён)</div>
-  `;
 }
 
-function fitBadgeClass(score) {
-  if (score >= 70) return "badge-ok";
-  if (score >= 45) return "badge-warn";
-  return "badge-neutral";
-}
+async function loadDrafts() {
+  const st = $("#fltDraftStatus").value;
+  const ch = $("#fltDraftChannel").value;
+  const qs = new URLSearchParams();
+  if (st) qs.set("status", st);
+  if (ch) qs.set("channel", ch);
+  const { items } = await api(`/api/drafts?${qs.toString()}`);
 
-function renderCompanies() {
-  const q = (document.getElementById("company-search").value || "").toLowerCase().trim();
-  const rows = state.companies.filter((c) => {
-    if (!q) return true;
-    const hay = `${c.company} ${c.city} ${c.legal_form} ${c.contacts} ${c.signals} ${c.why_fit}`.toLowerCase();
-    return hay.includes(q);
-  });
-
-  const tbody = document.getElementById("companies-tbody");
-  if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="muted">Практики пока не добавлены. Импортируйте список во вкладке «Импорт и источники» или запустите <code>friday discover</code>.</td></tr>`;
+  if (!items.length) {
+    $("#draftsList").innerHTML = `<div class="card muted">Черновики пока отсутствуют. Соберите компании на вкладке «2. Конвейер и сбор» и поставьте подготовку черновиков ИИ-агенту рабочей среды.</div>`;
     return;
   }
 
-  tbody.innerHTML = rows
+  $("#draftsList").innerHTML = items
+    .map((r) => {
+      const fio = [r.last_name, r.first_name, r.middle_name].filter(Boolean).join(" ") || "Руководитель / представитель";
+      const tg = r.prospect_telegram || r.company_telegram || "";
+      const gateNotes = (r.gate_notes || [])
+        .map((n) => `<span class="badge badge-danger">${esc(n)}</span>`)
+        .join("");
+
+      return `
+      <div class="draft-card">
+        <div class="draft-head">
+          <div>
+            <strong>${esc(r.company_name || r.domain)}</strong>
+            ${r.industry ? `<span class="badge">${esc(r.industry)}</span>` : ""}
+            · ${esc(fio)} ${r.title ? `(${esc(r.title)})` : ""}
+            <div class="draft-meta">
+              Город: ${esc(r.city || "—")} · Канал: <strong>${esc(r.channel)}</strong> ·
+              Балл ICP: <strong>${esc(r.score)}/100</strong> ·
+              Сигнал: <span class="badge">${esc(r.signal_used || "—")}</span> ·
+              Мозг: <span class="badge">${esc(r.brain_provider || "agent")}</span>
+            </div>
+          </div>
+          <div>${statusBadge(r.status)}</div>
+        </div>
+        ${r.subject ? `<div class="draft-meta"><strong>Тема:</strong> ${esc(r.subject)}</div>` : ""}
+        <div class="draft-body" id="draft-body-${esc(r.id)}">${esc(r.body)}</div>
+        ${r.audit_summary ? `<div class="draft-meta"><strong>Шпаргалка разбора (2–3 факта):</strong> ${esc(r.audit_summary)}</div>` : ""}
+        ${gateNotes ? `<div style="margin-bottom:8px">${gateNotes}</div>` : ""}
+        <div class="draft-meta">
+          Контакты для ручной отправки 1-на-1:
+          ${tg ? `<a href="${esc(tg)}" target="_blank" rel="noopener">${esc(tg)}</a>` : "Telegram —"} ·
+          Email: ${esc(r.email || "—")} · Тел.: ${esc(r.prospect_phone || "—")}
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-sm btn-primary" data-copy="${esc(r.id)}">Скопировать текст</button>
+          <button class="btn btn-sm btn-ok" data-draft-status="${esc(r.id)}:approved">Одобрить</button>
+          <button class="btn btn-sm" data-draft-status="${esc(r.id)}:sent_manually">Отметить отправленным вручную</button>
+          <button class="btn btn-sm btn-danger" data-draft-status="${esc(r.id)}:rejected">Отклонить</button>
+        </div>
+      </div>`;
+    })
+    .join("");
+
+  $$("[data-copy]").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const id = b.dataset.copy;
+      const text = $(`#draft-body-${id}`)?.textContent || "";
+      await navigator.clipboard.writeText(text);
+      showToast("Текст скопирован в буфер обмена для ручной отправки 1-на-1");
+    });
+  });
+
+  $$("[data-draft-status]").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const [id, st] = b.dataset.draftStatus.split(":");
+      await api(`/api/drafts/${id}`, { method: "PATCH", body: JSON.stringify({ status: st }) });
+      showToast(`Статус черновика обновлён: ${st}`);
+      await refreshAll();
+    });
+  });
+}
+
+async function loadCompaniesAndProspects() {
+  const req = $("#inpCohortRequire").value.trim();
+  const exc = $("#inpCohortExclude").value.trim();
+  const qs = new URLSearchParams();
+  if (req) qs.set("require", req);
+  if (exc) qs.set("exclude", exc);
+
+  const [{ items: companies }, { items: prospects }] = await Promise.all([
+    api(`/api/companies?${qs.toString()}`),
+    api("/api/prospects"),
+  ]);
+
+  $("#cntCompanies").textContent = companies.length;
+  $("#tblCompanies tbody").innerHTML = companies
+    .map((c) => {
+      const links = [
+        c.website ? `<a href="${esc(c.website)}" target="_blank" rel="noopener">${esc(c.domain || c.website)}</a>` : "",
+        c.hh_url ? `<a href="${esc(c.hh_url)}" target="_blank" rel="noopener">hh.ru</a>` : "",
+        c.telegram ? `<a href="${esc(c.telegram)}" target="_blank" rel="noopener">TG</a>` : "",
+        c.twogis_url ? `<a href="${esc(c.twogis_url)}" target="_blank" rel="noopener">2ГИС</a>` : "",
+        c.ymaps_url ? `<a href="${esc(c.ymaps_url)}" target="_blank" rel="noopener">Я.Карты</a>` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      const stack = (c.tech_stack || []).map((t) => `<span class="badge">${esc(t)}</span>`).join("") || "—";
+      const sigs = (c.observations || [])
+        .map((o) => `<span class="badge" title="${esc(o.value_text)}">${esc(o.signal_code)}</span>`)
+        .join("") || "—";
+      return `
+      <tr>
+        <td>
+          <strong>${esc(c.name)}</strong>
+          ${c.inn ? `<div class="muted">ИНН ${esc(c.inn)}</div>` : ""}
+        </td>
+        <td>${esc(c.industry || "—")}</td>
+        <td>${esc(c.city || "—")}</td>
+        <td>${links || "—"}</td>
+        <td>${stack}</td>
+        <td>${sigs}</td>
+      </tr>`;
+    })
+    .join("");
+
+  $("#cntProspects").textContent = prospects.length;
+  $("#tblProspects tbody").innerHTML = prospects
+    .map((p) => {
+      const contacts = [
+        p.telegram ? `<a href="${esc(p.telegram)}" target="_blank" rel="noopener">Telegram</a>` : "",
+        p.email ? esc(p.email) : "",
+        p.phone ? esc(p.phone) : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      return `
+      <tr>
+        <td><strong>${esc(p.score)}</strong></td>
+        <td>
+          <strong>${esc(p.full_name)}</strong>
+          <div class="muted">${esc(p.title)}</div>
+        </td>
+        <td>
+          ${esc(p.company)}
+          <div class="muted">${esc(p.industry || "")} · ${esc(p.city || "")}</div>
+        </td>
+        <td>${contacts || "—"}</td>
+        <td>${esc(p.personalization_notes || "—")}</td>
+        <td>
+          <div class="btn-row">
+            <button class="btn btn-sm btn-primary" data-gen-draft="${esc(p.id)}:agent">ИИ-агенту</button>
+            <button class="btn btn-sm" data-gen-draft="${esc(p.id)}:template">Шаблон</button>
+          </div>
+        </td>
+      </tr>`;
+    })
+    .join("");
+
+  $$("[data-gen-draft]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const [pid, mode] = btn.dataset.genDraft.split(":");
+      btn.disabled = true;
+      try {
+        const res = await api("/api/run/draft-single", {
+          method: "POST",
+          body: JSON.stringify({
+            prospect_id: pid,
+            channel: "telegram",
+            template_preview: mode === "template",
+          }),
+        });
+        showToast(
+          res.queued
+            ? `Создана задача ИИ-агенту #${res.task_id} (вкладка «3. ИИ-агент»)`
+            : "Шаблонный черновик создан (вкладка «4. Черновики»)"
+        );
+        await refreshAll();
+      } catch (e) {
+        showToast(`Ошибка: ${e.message}`);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
+}
+
+async function loadSignals() {
+  const { items } = await api("/api/signals");
+  $("#tblSignals tbody").innerHTML = items
     .map(
-      (r) => `
+      (s) => `
     <tr>
-      <td><span class="fit-score ${fitBadgeClass(r.fit)}">${r.fit}</span></td>
+      <td><code>${esc(s.code)}</code></td>
+      <td>${esc(s.category)}</td>
       <td>
-        <strong>${esc(r.company)}</strong>
-        ${r.legal_form ? `<div class="muted" style="margin:2px 0">${esc(r.legal_form)}</div>` : ""}
-        ${r.website ? `<a href="${esc(r.website)}" target="_blank" rel="noopener">${esc(r.website)}</a>` : ""}
+        <strong>${esc(s.label)}</strong>
+        <div class="muted">${esc(s.description)}</div>
       </td>
-      <td>${esc(r.city || "—")}</td>
-      <td>${esc(r.contacts || "—")}</td>
+      <td>${esc(s.collector)}</td>
+      <td>${statusBadge(s.status)}</td>
       <td>
-        <div>${esc(r.signals || "—")}</div>
-        ${r.tech_stack ? `<div class="muted" style="margin:2px 0">Стек: ${esc(r.tech_stack)}</div>` : ""}
-      </td>
-      <td>
-        <span class="badge badge-neutral">${esc(r.status)}</span>
-        <div class="muted" style="margin:4px 0 0">${esc(r.status_note)}</div>
+        <div class="btn-row">
+          <button class="btn btn-sm btn-ok" data-sig="${esc(s.code)}:confirmed">Подтвердить</button>
+          <button class="btn btn-sm btn-danger" data-sig="${esc(s.code)}:rejected">Отклонить</button>
+        </div>
       </td>
     </tr>`
     )
     .join("");
-}
 
-function statusBadgeForDraft(st) {
-  const map = {
-    pending_review: ["Ждёт проверки · ФЗ-38/КПЭА ✓", "badge-ok"],
-    approved: ["Одобрен к ручной отправке", "badge-ok"],
-    sent_manually: ["Отправлено вручную", "badge-neutral"],
-    gate_blocked: ["Заблокирован фильтром ФЗ-38/КПЭА", "badge-err"],
-    rejected: ["Отклонён", "badge-neutral"],
-  };
-  return map[st] || [st, "badge-neutral"];
-}
-
-function renderDrafts() {
-  const box = document.getElementById("drafts-list");
-  if (!state.drafts.length) {
-    box.innerHTML = `<div class="card muted">Черновиков по выбранному фильтру пока нет. Нажмите «2. Оценить и собрать черновики» на вкладке Обзор.</div>`;
-    return;
-  }
-
-  box.innerHTML = state.drafts
-    .map((d) => {
-      const [stLabel, stCls] = statusBadgeForDraft(d.status);
-      const fio = [d.last_name, d.first_name, d.middle_name].filter(Boolean).join(" ") || "Общий контакт";
-      const targetContact =
-        d.channel === "email"
-          ? d.email || "email не указан"
-          : d.prospect_telegram || d.company_telegram || d.prospect_phone || "контакт на сайте";
-      const gateNotes = (d.gate_notes || []).length
-        ? `<div class="muted" style="margin-bottom:8px">Заметки фильтра: ${esc(d.gate_notes.join(" · "))}</div>`
-        : "";
-
-      return `
-      <div class="draft-card" data-id="${esc(d.id)}">
-        <div class="draft-header">
-          <div>
-            <strong>${esc(d.company_name || "Практика")}</strong> (${esc(d.city || "РФ")}) ·
-            <span>${esc(fio)}${d.title ? `, ${esc(d.title)}` : ""}</span>
-            <div class="muted" style="margin:2px 0">
-              Канал: <strong>${esc(d.channel.toUpperCase())}</strong> (${esc(targetContact)}) ·
-              Сигнал: <code>${esc(d.signal_used || "ICP")}</code> · Score: ${esc(d.score)}/100
-            </div>
-          </div>
-          <span class="badge ${stCls}">${esc(stLabel)}</span>
-        </div>
-
-        ${d.audit_summary ? `<div class="draft-dossier">${esc(d.audit_summary)}</div>` : ""}
-        ${gateNotes}
-
-        ${
-          d.channel === "email"
-            ? `<input type="text" class="input draft-subj" style="width:100%;margin-bottom:8px" value="${esc(d.subject)}" placeholder="Тема письма">`
-            : ""
-        }
-        <textarea rows="5" class="draft-body-box">${esc(d.body)}</textarea>
-
-        <div class="action-row">
-          <button class="btn btn-primary btn-sm" onclick="copyDraft('${esc(d.id)}')">Скопировать текст</button>
-          <button class="btn btn-outline btn-sm" onclick="saveDraftStatus('${esc(d.id)}', 'approved')">Сохранить и одобрить</button>
-          <button class="btn btn-outline btn-sm" onclick="saveDraftStatus('${esc(d.id)}', 'sent_manually')">Отметить: отправлено вручную</button>
-          <button class="btn btn-outline btn-sm" onclick="saveDraftStatus('${esc(d.id)}', 'rejected')">Отклонить</button>
-        </div>
-      </div>`;
-    })
-    .join("");
-}
-
-window.copyDraft = async function (id) {
-  const card = document.querySelector(`.draft-card[data-id="${id}"]`);
-  const text = card.querySelector(".draft-body-box").value;
-  await navigator.clipboard.writeText(text);
-  showToast("Текст скопирован в буфер обмена для ручной отправки");
-};
-
-window.saveDraftStatus = async function (id, status) {
-  const card = document.querySelector(`.draft-card[data-id="${id}"]`);
-  const body = card.querySelector(".draft-body-box").value;
-  const subjEl = card.querySelector(".draft-subj");
-  const subject = subjEl ? subjEl.value : undefined;
-  try {
-    await api(`/api/drafts/${id}`, {
-      method: "POST",
-      body: JSON.stringify({ status, body, subject }),
+  $$("[data-sig]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const [code, status] = btn.dataset.sig.split(":");
+      await api(`/api/signals/${code}`, { method: "PATCH", body: JSON.stringify({ status }) });
+      showToast(`Сигнал ${code} -> ${status}`);
+      await loadSignals();
     });
-    showToast("Статус черновика обновлён");
-    await refreshAll();
-  } catch (err) {
-    showToast("Ошибка: " + err.message);
-  }
-};
-
-function renderSignals() {
-  const box = document.getElementById("signals-list");
-  box.innerHTML = state.signals
-    .map((s) => {
-      const cls =
-        s.status === "confirmed" ? "badge-ok" : s.status === "rejected" ? "badge-err" : "badge-warn";
-      return `
-      <div class="card" style="padding:14px 18px">
-        <div class="draft-header" style="margin-bottom:6px">
-          <div>
-            <code>${esc(s.code)}</code> · <strong>${esc(s.label)}</strong>
-            <span class="muted">(${esc(s.category)} / ${esc(s.cost_note)})</span>
-          </div>
-          <div class="action-row">
-            <span class="badge ${cls}">${esc(s.status)}</span>
-            <button class="btn btn-outline btn-sm" onclick="setSignal('${esc(s.code)}', 'confirmed')">Подтвердить</button>
-            <button class="btn btn-outline btn-sm" onclick="setSignal('${esc(s.code)}', 'rejected')">Отклонить</button>
-          </div>
-        </div>
-        <div class="muted" style="margin:0">${esc(s.description)}</div>
-      </div>`;
-    })
-    .join("");
+  });
 }
 
-window.setSignal = async function (code, status) {
-  await api(`/api/signals/${code}`, { method: "POST", body: JSON.stringify({ status }) });
-  await refreshAll();
-};
-
-function renderProviders() {
-  if (!state.overview) return;
-  const box = document.getElementById("providers-list");
-  box.innerHTML = (state.overview.providers || [])
-    .map(
-      (p) => `
-    <div style="border:1px solid var(--border);border-radius:8px;padding:12px">
-      <div style="display:flex;justify-content:space-between;gap:8px">
-        <strong>${esc(p.label)} (<code>${esc(p.key)}</code>)</strong>
-        <span class="badge ${p.configured ? "badge-ok" : "badge-warn"}">
-          ${p.configured ? "Готов" : "Нужен ключ: " + p.missing_keys.join(", ")}
-        </span>
-      </div>
-      <div class="muted" style="margin:4px 0 0">${esc(p.blurb)}</div>
-    </div>`
-    )
-    .join("");
-}
-
-function renderTasks() {
-  const box = document.getElementById("tasks-list");
-  if (!state.tasks.length) {
-    box.innerHTML = `<div class="muted">Очередь задач пуста. Задачи появляются здесь и в <code>data/agent_tasks/</code>, когда выбран режим <code>brain.provider: agent</code>.</div>`;
+async function loadAgentTasks() {
+  const { items } = await api("/api/agent-tasks?status=pending");
+  if (!items.length) {
+    $("#agentTasksList").innerHTML = `<div class="card muted">Очередь ожидающих задач ИИ-агента пуста. Создайте задачу обучения на вкладке «1. Ниша и продукт» или поставьте черновики на вкладке «2. Конвейер и сбор».</div>`;
     return;
   }
-  box.innerHTML = state.tasks
+
+  $("#agentTasksList").innerHTML = items
     .map(
       (t) => `
     <div class="draft-card">
-      <div class="draft-header">
-        <strong>Задача <code>${esc(t.id)}</code> · тип: <code>${esc(t.kind)}</code></strong>
-        <span class="badge badge-warn">${esc(t.status)}</span>
+      <div class="draft-head">
+        <div>
+          <strong>Задача #${esc(t.id)}</strong> · <code>${esc(t.kind)}</code>
+          <div class="draft-meta">CLI: <code>friday tasks show ${esc(t.id)}</code> → <code>friday tasks apply ${esc(t.id)} '&lt;json&gt;'</code></div>
+        </div>
+        <div>${statusBadge(t.status)}</div>
       </div>
-      <details style="margin-bottom:10px">
-        <summary style="cursor:pointer;font-size:13px">Показать сгенерированный промпт с фактами</summary>
-        <pre style="white-space:pre-wrap;font-size:12px;background:var(--surface-alt);padding:10px;border-radius:6px">${esc(t.prompt_text)}</pre>
-      </details>
-      <textarea id="task-ans-${esc(t.id)}" rows="4" class="textarea" placeholder="Вставьте JSON-ответ ИИ-агента..."></textarea>
-      <button class="btn btn-primary btn-sm" onclick="submitAgentTask('${esc(t.id)}')">Применить JSON-ответ</button>
+      <div class="btn-row" style="margin-bottom:8px">
+        <button class="btn btn-sm" data-copy-prompt="${esc(t.id)}">Скопировать полный промпт задачи</button>
+      </div>
+      <div class="draft-body" id="task-prompt-${esc(t.id)}" style="max-height:200px;overflow:auto">${esc(t.prompt_text)}</div>
+      <div class="form-stack">
+        <textarea rows="3" id="task-resp-${esc(t.id)}" placeholder='Вставьте JSON-ответ ИИ-агента (или попросите агента рабочей среды выполнить friday tasks apply ${esc(t.id)})'></textarea>
+        <div>
+          <button class="btn btn-sm btn-primary" data-complete-task="${esc(t.id)}">Применить JSON-ответ (с проверкой шлюза ФЗ-38)</button>
+        </div>
+      </div>
     </div>`
     )
     .join("");
+
+  $$("[data-copy-prompt]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const tid = btn.dataset.copyPrompt;
+      const txt = $(`#task-prompt-${tid}`)?.textContent || "";
+      await navigator.clipboard.writeText(txt);
+      showToast(`Промпт задачи #${tid} скопирован в буфер обмена`);
+    });
+  });
+
+  $$("[data-complete-task]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const tid = btn.dataset.completeTask;
+      const raw = $(`#task-resp-${tid}`).value.trim();
+      if (!raw) return showToast("Вставьте JSON-ответ");
+      try {
+        await api(`/api/agent-tasks/${tid}/complete`, {
+          method: "POST",
+          body: JSON.stringify({ response_json: raw }),
+        });
+        showToast(`Задача #${tid} успешно применена!`);
+        await refreshAll();
+      } catch (e) {
+        showToast(`Ошибка: ${e.message}`);
+      }
+    });
+  });
 }
 
-window.submitAgentTask = async function (taskId) {
-  const val = document.getElementById(`task-ans-${taskId}`).value;
+async function refreshAll() {
+  await Promise.all([
+    loadSummary(),
+    loadDrafts(),
+    loadCompaniesAndProspects(),
+    loadSignals(),
+    loadAgentTasks(),
+  ]);
+}
+
+// ── Привязка событий Шага 1 (Ниша и продукт) ──
+
+$("#formSaveNiche").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const payload = {
+    persona: {
+      company: $("#nsBizName").value.trim(),
+      website: $("#nsBizWebsite").value.trim(),
+      name: $("#nsSenderName").value.trim(),
+      role: $("#nsSenderTitle").value.trim(),
+      telegram: $("#nsSenderTg").value.trim(),
+    },
+    product: {
+      name: $("#nsProdName").value.trim(),
+      description: $("#nsProdDesc").value.trim(),
+      key_benefits: splitLinesOrComma($("#nsProdBenefits").value),
+      pricing: $("#nsProdPricing").value.trim(),
+      offer: {
+        entry: $("#nsProdEntry").value.trim(),
+        goal: "send_audit",
+      },
+    },
+    icp: {
+      niche: $("#nsIcpNiche").value.trim(),
+      industries: splitComma($("#nsIcpIndustries").value),
+      search_queries: splitLinesOrComma($("#nsIcpQueries").value),
+      cities: splitComma($("#nsIcpCities").value),
+      decision_maker_titles: splitComma($("#nsIcpTitles").value),
+      hiring_signals: splitComma($("#nsIcpHiring").value),
+    },
+    compliance: {
+      regulated_niche: $("#nsRegulated").value,
+    },
+  };
   try {
-    await api(`/api/tasks/${taskId}/apply`, {
-      method: "POST",
-      body: JSON.stringify({ response_json: val }),
-    });
-    showToast("Ответ ИИ-агента успешно применён");
+    await api("/api/niche/save", { method: "POST", body: JSON.stringify(payload) });
+    showToast("Ниша и продукт сохранены в friday.local.yaml и skills/product_knowledge.md!");
     await refreshAll();
   } catch (err) {
-    showToast("Ошибка: " + err.message);
+    showToast(`Ошибка сохранения: ${err.message}`);
   }
-};
-
-// События кнопок
-document.getElementById("btn-confirm-free").addEventListener("click", async () => {
-  const r = await api("/api/signals/bulk", { method: "POST", body: JSON.stringify({ mode: "confirm_free" }) });
-  showToast(`Подтверждено бесплатных сигналов: ${r.updated}`);
-  await refreshAll();
 });
 
-document.getElementById("btn-sig-free").addEventListener("click", async () => {
-  await api("/api/signals/bulk", { method: "POST", body: JSON.stringify({ mode: "confirm_free" }) });
-  showToast("Все бесплатные сигналы подтверждены");
-  await refreshAll();
-});
-
-document.getElementById("btn-sig-all").addEventListener("click", async () => {
-  await api("/api/signals/bulk", { method: "POST", body: JSON.stringify({ mode: "confirm_all" }) });
-  showToast("Все сигналы словаря подтверждены");
-  await refreshAll();
-});
-
-async function runPrepare(providerOverride = "") {
-  const notice = document.getElementById("pipeline-result");
-  notice.textContent = "Выполняется профилирование, оценка и проверка черновиков...";
-  notice.classList.remove("hidden");
+$("#formTrainAgent").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const payload = {
+    website: $("#trWebsite").value.trim(),
+    niche_hint: $("#trNiche").value.trim(),
+    brief: $("#trBrief").value.trim(),
+    cities: splitComma($("#trCities").value),
+  };
   try {
-    const res = await api("/api/pipeline/prepare", {
-      method: "POST",
-      body: JSON.stringify({ min_score: 35, limit: 20, provider_override: providerOverride }),
-    });
-    notice.textContent =
-      `Готово: профилировано сайтов — ${res.profiled_companies}, оценено контактов — ${res.scout.scored}, ` +
-      `создано черновиков — ${res.writer.drafts_ready}` +
-      (res.writer.queued_task_ids.length ? `, поставлено задач ИИ-агенту — ${res.writer.queued_task_ids.length}` : "");
+    const res = await api("/api/niche/train", { method: "POST", body: JSON.stringify(payload) });
+    showToast(`Создана задача обучения #${res.task_id} (скачано страниц: ${res.pages_crawled})`);
     await refreshAll();
+    switchTab("agent");
   } catch (err) {
-    notice.textContent = "Ошибка: " + err.message;
+    showToast(`Ошибка: ${err.message}`);
+  }
+});
+
+// ── Привязка кнопок Конвейера и Сбора ──
+
+$("#btnRefresh").addEventListener("click", refreshAll);
+$("#fltDraftStatus").addEventListener("change", loadDrafts);
+$("#fltDraftChannel").addEventListener("change", loadDrafts);
+
+$("#btnApplyCohort").addEventListener("click", loadCompaniesAndProspects);
+$("#btnResetCohort").addEventListener("click", () => {
+  $("#inpCohortRequire").value = "";
+  $("#inpCohortExclude").value = "";
+  loadCompaniesAndProspects();
+});
+
+$("#btnCopyAgentInstruction").addEventListener("click", async () => {
+  const cmd = "Посмотри ожидающие задачи F.R.I.D.A.Y. через `.venv/bin/friday tasks next`, выполни каждую строго по JSON-контракту и примени ответы через `.venv/bin/friday tasks apply <task_id> '<json>'`.";
+  await navigator.clipboard.writeText(cmd);
+  showToast("Инструкция для ИИ-агента рабочей среды скопирована в буфер обмена!");
+});
+
+async function runStage(btn, fn, label) {
+  btn.disabled = true;
+  try {
+    const res = await fn();
+    showToast(`${label}: ${JSON.stringify(res)}`);
+    await refreshAll();
+  } catch (e) {
+    showToast(`Ошибка: ${e.message}`);
+  } finally {
+    btn.disabled = false;
   }
 }
 
-document.getElementById("btn-run-prepare").addEventListener("click", () => runPrepare(""));
-document.getElementById("btn-run-template").addEventListener("click", () => runPrepare("template"));
+$("#btnRunProfile").addEventListener("click", (e) =>
+  runStage(e.currentTarget, () => api("/api/run/profile", { method: "POST" }), "Профилирование сайтов")
+);
+$("#btnRunProspects").addEventListener("click", (e) =>
+  runStage(e.currentTarget, () => api("/api/run/prospects", { method: "POST" }), "Поиск ЛПР")
+);
+$("#btnRunScore").addEventListener("click", (e) =>
+  runStage(e.currentTarget, () => api("/api/run/score", { method: "POST" }), "Скоринг ICP")
+);
+$("#btnRunScoreAi").addEventListener("click", (e) =>
+  runStage(e.currentTarget, () => api("/api/run/score?use_ai=true", { method: "POST" }), "Очередь скоринга ИИ-агенту")
+);
+$("#btnQueueDraftsTg").addEventListener("click", (e) =>
+  runStage(
+    e.currentTarget,
+    () => api("/api/run/drafts", { method: "POST", body: JSON.stringify({ channel: "telegram", template_preview: false }) }),
+    "Постановка черновиков Telegram ИИ-агенту"
+  )
+);
+$("#btnQueueDraftsEmail").addEventListener("click", (e) =>
+  runStage(
+    e.currentTarget,
+    () => api("/api/run/drafts", { method: "POST", body: JSON.stringify({ channel: "email", template_preview: false }) }),
+    "Постановка черновиков Email ИИ-агенту"
+  )
+);
+$("#btnPreviewTemplateTg").addEventListener("click", (e) =>
+  runStage(
+    e.currentTarget,
+    () => api("/api/run/drafts", { method: "POST", body: JSON.stringify({ channel: "telegram", template_preview: true }) }),
+    "Шаблонный предпросмотр Telegram"
+  )
+);
+$("#btnSeedSample").addEventListener("click", (e) =>
+  runStage(
+    e.currentTarget,
+    () => api("/api/run/sample", { method: "POST" }),
+    "Тестовые карточки под текущую нишу"
+  )
+);
 
-document.getElementById("btn-do-import").addEventListener("click", async () => {
-  const content = document.getElementById("import-textarea").value;
-  const default_city = document.getElementById("import-city").value;
-  const is_registry = document.getElementById("import-is-registry").checked;
+$("#formDiscover").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const payload = {
+    query: $("#inpQuery").value.trim(),
+    city: $("#inpCity").value.trim(),
+    provider: $("#selProvider").value,
+    limit: Number($("#inpLimit").value || 15),
+  };
+  showToast("Запущен поиск компаний в РФ...");
   try {
-    const r = await api("/api/import", {
-      method: "POST",
-      body: JSON.stringify({ content, default_city, is_registry }),
-    });
-    showToast(`Импортировано: новых практик ${r.new_companies}, контактов ${r.new_prospects}, сигналов ${r.observations_written}`);
-    document.getElementById("import-textarea").value = "";
+    const res = await api("/api/run/discover", { method: "POST", body: JSON.stringify(payload) });
+    showToast(`Найдено новых компаний: ${res.inserted_companies} (источники: ${(res.providers_used || []).join(", ") || "—"})`);
     await refreshAll();
   } catch (err) {
-    showToast("Ошибка импорта: " + err.message);
+    showToast(`Ошибка поиска: ${err.message}`);
   }
 });
 
-document.getElementById("company-search").addEventListener("input", renderCompanies);
-document.getElementById("draft-status-filter").addEventListener("change", refreshAll);
-document.getElementById("draft-channel-filter").addEventListener("change", refreshAll);
+$("#formUpload").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fileEl = $("#inpFile");
+  if (!fileEl.files || !fileEl.files[0]) return showToast("Выберите файл");
+  const fd = new FormData();
+  fd.append("file", fileEl.files[0]);
+  fd.append("city", $("#inpCity").value.trim());
+  try {
+    const res = await api("/api/import/upload", { method: "POST", body: fd });
+    showToast(`Импортировано из ${res.filename}: +${res.inserted_companies} компаний, +${res.inserted_prospects} ЛПР`);
+    fileEl.value = "";
+    await refreshAll();
+  } catch (err) {
+    showToast(`Ошибка импорта: ${err.message}`);
+  }
+});
 
-refreshAll().catch((err) => showToast("Ошибка загрузки: " + err.message));
+Promise.all([loadPresets(), refreshAll()]).catch((e) => showToast(`Ошибка загрузки: ${e.message}`));

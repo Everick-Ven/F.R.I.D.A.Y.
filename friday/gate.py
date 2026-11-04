@@ -1,12 +1,11 @@
-"""Детерминированный комплаенс-фильтр и проверка качества черновиков (Gate).
+"""Детерминированный комплаенс-фильтр и проверка качества черновиков (Gate) для рынка РФ.
 
-Инструкции в промпте для LLM — это пожелание, а не гарантия. Поэтому каждый
-черновик F.R.I.D.A.Y. проходит жёсткую проверку в Python-коде по четырём контурам:
-1. ФЗ № 38-ФЗ «О рекламе» (ст. 5 — запрет гарантий результата и голословных «№1 / лучший»).
-2. Кодекс профессиональной этики адвоката — ст. 17 КПЭА (запрет предложений по накрутке отзывов,
-   сравнению с другими адвокатами и обещаниям выигрыша дел).
-3. Защита от спам-штампов и русскоязычных ИИ-клише («доброго времени суток», «взрывной рост» и т.п.).
-4. Стоп-лист (do_not_contact) — домены (включая кириллические .рф), email и @telegram.
+Проверяет каждый черновик в Python-коде перед показом человеку:
+1. Общие правила ФЗ № 38-ФЗ «О рекламе» (ст. 5 — запрет голословных «№1 / лучший» и обманных 100%-гарантий).
+2. Отраслевые правила для регулируемых ниш (`compliance.regulated_niche`:
+   `none` для обычного бизнеса, либо `medicine` ст. 24 ФЗ-38, `finance` ст. 28 ФЗ-38, `legal_advocates` ст. 17 КПЭА).
+3. Анти-спам и защита от русскоязычных ИИ-штампов («доброго времени суток», «взрывной рост» и т.д.).
+4. Стоп-лист `do_not_contact` — домены (включая кириллические `.рф`), email и `@telegram`.
 """
 
 from __future__ import annotations
@@ -15,70 +14,82 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
-# 1. Нарушения принципов бюро и ст. 5 ФЗ-38 «О рекламе» (гарантии результата и превосходная степень)
+# 1. Универсальные правила ФЗ-38 «О рекламе» (ст. 5) для любой ниши в РФ
 FZ38_BANNED_PATTERNS: tuple[tuple[re.Pattern, str], ...] = tuple(
     (re.compile(pat, re.I), reason)
     for pat, reason in (
         (
-            r"гарантир\w+\s+(?:результат|поток|заявк\w*|клиент\w*|доверител\w*|выигрыш|окупаемост\w*|лид\w*)",
-            "ФЗ-38 / позиционирование бюро: запрещены обещания и гарантии потока заявок или результата",
-        ),
-        (
-            r"\b100\s*%\s*(?:гарант\w*|результат\w*|выигрыш\w*|успех\w*)",
+            r"\b100\s*%\s*(?:гарант\w*|результат\w*|окупаемост\w*|успех\w*)",
             "ФЗ-38 (ст. 5): недопустимое обещание 100% гарантии результата",
         ),
         (
-            r"\b(?:лучш(?:ее|ий|ая|ие)|номер\s*один|№\s*1|#\s*1|единственн\w+)\s+(?:агентств\w*|бюро|команд\w*|на\s+рынке)",
-            "ФЗ-38 (ст. 5): некорректное превосходное сравнение без объективного подтверждения",
+            r"гарантир\w+\s+(?:удвоен\w*|рост\s+прибыли|рост\s+выручки|поток\s+клиентов\s+за)",
+            "ФЗ-38 / анти-спам: недопустимы заведомо невыполнимые гарантии роста выручки/потока",
         ),
         (
-            r"(?:удвоим|утроим|увеличим\s+в\s+\d+\s+раз\w*)\s+(?:выручк\w*|прибыл\w*|поток|доход\w*|количество\s+дел)",
-            "Позиционирование бюро: запрещены инфоцыганские обещания кратного роста выручки",
+            r"\b(?:лучш(?:ее|ий|ая|ие)|номер\s*один|№\s*1|#\s*1|единственн\w+)\s+(?:в\s+россии|на\s+рынке|компани\w*|сервис\w*|агентств\w*)",
+            "ФЗ-38 (ст. 5): некорректное превосходное сравнение («лучший / №1») без подтверждения",
         ),
     )
 )
 
-# 2. Риски нарушения ст. 17 КПЭА в предложениях адвокату
-KPEA_BANNED_PATTERNS: tuple[tuple[re.Pattern, str], ...] = tuple(
-    (re.compile(pat, re.I), reason)
-    for pat, reason in (
-        (
-            r"(?:накрут\w*|куп\w*|заказ\w*|напиш\w*)\s+(?:\w+\s+){0,2}отзыв\w*",
-            "КПЭА (ст. 17) и УК/КоАП: недопустимо предлагать покупку или накрутку отзывов",
-        ),
-        (
-            r"размест\w+\s+отзыв\w+\s+(?:клиентов|доверителей)\s+на\s+(?:вашем\s+)?сайте",
-            "КПЭА (ст. 17 п. 2): отзывы других лиц о работе адвоката на его сайте несут дисциплинарный риск",
-        ),
-        (
-            r"(?:обойд\w+|разгром\w+|лучше\s+всех)\s+других\s+адвокатов",
-            "КПЭА (ст. 17 п. 3): недопустимы сравнения с другими адвокатами и их критика",
-        ),
-        (
-            r"обеща\w+\s+(?:доверител\w+\s+)?выигрыш\w*\s+дел",
-            "КПЭА (ст. 17 п. 4): запрещены заявления, вызывающие безосновательные надежды у доверителей",
-        ),
-    )
-)
+# 2. Специальные правила для регулируемых ниш (срабатывают ТОЛЬКО если выбрана соответствующая ниша)
+REGULATED_NICHE_PATTERNS: dict[str, tuple[tuple[re.Pattern, str], ...]] = {
+    "medicine": tuple(
+        (re.compile(pat, re.I), reason)
+        for pat, reason in (
+            (
+                r"гарантир\w+\s+(?:излечени\w*|выздоровлени\w*|отсутстви\w*\s+побочн)",
+                "ФЗ-38 (ст. 24 — Медицина): запрещены гарантии положительного действия и безопасности медуслуг",
+            ),
+        )
+    ),
+    "finance": tuple(
+        (re.compile(pat, re.I), reason)
+        for pat, reason in (
+            (
+                r"гарантир\w+\s+доходност\w*",
+                "ФЗ-38 (ст. 28 — Финансы): запрещено обещать гарантированную доходность в будущем",
+            ),
+        )
+    ),
+    "legal_advocates": tuple(
+        (re.compile(pat, re.I), reason)
+        for pat, reason in (
+            (
+                r"(?:накрут\w*|куп\w*|заказ\w*)\s+(?:\w+\s+){0,2}отзыв\w*",
+                "КПЭА (ст. 17): недопустимо предлагать покупку или накрутку отзывов",
+            ),
+            (
+                r"размест\w+\s+отзыв\w+\s+(?:клиентов|доверителей)\s+на\s+(?:вашем\s+)?сайте",
+                "КПЭА (ст. 17 п. 2): размещение отзывов доверителей на сайте адвоката несёт дисциплинарный риск",
+            ),
+            (
+                r"(?:обойд\w+|разгром\w+|лучше\s+всех)\s+других\s+адвокатов",
+                "КПЭА (ст. 17 п. 3): запрещены сравнения с другими адвокатами",
+            ),
+        )
+    ),
+}
 
-# 3. Русскоязычные ИИ-клише и спам-маркеры, убивающие доверие адвокатов
+# 3. Русскоязычные ИИ-клише и спам-маркеры для любой B2B-ниши
 AI_AND_SPAM_PHRASES: tuple[str, ...] = (
     "доброго времени суток",
     "надеюсь, это письмо застанет вас",
     "надеюсь, у вас все хорошо",
     "надеюсь, у вас всё хорошо",
+    "спешу предложить",
+    "взаимовыгодное сотрудничество",
     "в современном динамично развивающемся мире",
     "в современном мире",
     "вывести на новый уровень",
-    "вывести практику на новый уровень",
+    "вывести бизнес на новый уровень",
     "взрывной рост",
     "уникальное предложение",
     "эксклюзивное предложение",
     "только сегодня",
     "успейте заказать",
-    "комплексное продвижение под ключ",
     "синергия",
-    "инновационное решение",
     "я ии-ассистент",
     "как языковая модель",
 )
@@ -97,6 +108,10 @@ class GateResult:
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
+    @property
+    def passed(self) -> bool:
+        return self.ok
+
     def __bool__(self) -> bool:
         return self.ok
 
@@ -107,7 +122,7 @@ def _clean_text(raw: object) -> str:
 
 
 def normalize_domain_idna(value: str) -> str:
-    """Нормализовать домен (включая кириллические .рф домены) в ASCII punycode без www."""
+    """Нормализовать домен (включая кириллические `.рф`) в ASCII punycode без `www.`."""
     host = _clean_text(value).strip().lower()
     host = re.sub(r"^[a-z][a-z0-9+.-]*://", "", host)
     host = re.split(r"[/?#:]", host, maxsplit=1)[0].strip(".")
@@ -125,7 +140,7 @@ def normalize_domain_idna(value: str) -> str:
 
 
 def display_domain(value: str) -> str:
-    """Человекочитаемое представление домена (декодирует xn--... в кириллицу .рф для UI)."""
+    """Человекочитаемое имя домена (декодирует `xn--...` обратно в `.рф`)."""
     ascii_host = normalize_domain_idna(value)
     if not ascii_host:
         return ""
@@ -136,7 +151,7 @@ def display_domain(value: str) -> str:
 
 
 def normalize_dnc_entry(raw: object) -> str:
-    """Нормализовать одну запись стоп-листа: email, @telegram или домен (в т.ч. .рф)."""
+    """Нормализовать запись стоп-листа: email, `@telegram` или домен (в т.ч. `.рф`)."""
     entry = _clean_text(raw).strip().lower()
     if not entry:
         return ""
@@ -159,7 +174,6 @@ def normalize_dnc_entry(raw: object) -> str:
 
 
 def normalize_dnc_list(items: object) -> list[str]:
-    """Провалидировать и нормализовать список `do_not_contact`."""
     if isinstance(items, str):
         raw_items = [x for x in re.split(r"[\s,;]+", items) if x.strip()]
     elif isinstance(items, (list, tuple, set)):
@@ -184,7 +198,6 @@ def match_do_not_contact(
     telegram: str = "",
     entries: list[str] | tuple[str, ...] | None = None,
 ) -> str:
-    """Вернуть сработавшее правило из `do_not_contact` или пустую строку."""
     if not entries:
         return ""
     norm_dom = normalize_domain_idna(domain)
@@ -222,14 +235,14 @@ def check_draft(
     email: str = "",
     telegram: str = "",
 ) -> GateResult:
-    """Проверить сгенерированный черновик по правилам ФЗ-38, КПЭА, анти-спама и стоп-листа."""
+    """Проверить сгенерированный черновик перед показом человеку."""
     reasons: list[str] = []
     warnings: list[str] = []
 
     comp = getattr(config, "compliance", None)
     dnc = getattr(comp, "do_not_contact", None) or []
     enforce_fz38 = True if comp is None else bool(comp.enforce_fz38)
-    enforce_kpea = True if comp is None else bool(comp.enforce_kpea)
+    reg_niche = getattr(comp, "regulated_niche", "none") if comp else "none"
     max_tg_words = getattr(comp, "max_telegram_words", 85) if comp else 85
     max_email_words = getattr(comp, "max_email_words", 140) if comp else 140
 
@@ -257,41 +270,33 @@ def check_draft(
     if MERGE_TAG_RE.search(combined):
         reasons.append("В тексте остались неподставленные шаблонные переменные {{...}}")
 
-    # Лимит слов по каналу
     words = clean_body.split()
     word_limit = max_email_words if channel == "email" else max_tg_words
     if len(words) > word_limit:
         reasons.append(f"Превышен лимит длины для канала '{channel}': {len(words)} слов (макс. {word_limit})")
 
-    # Восклицательные знаки и ссылки в первом заходе
     if "!" in clean_body:
         reasons.append("Восклицательные знаки в первом деловом касании запрещены")
 
     links = URL_RE.findall(clean_body)
     if len(links) > 1:
         reasons.append(f"Слишком много ссылок в первом касании ({len(links)}, максимум 0–1)")
-    elif len(links) == 1 and channel in ("telegram", "tenchat"):
+    elif len(links) == 1 and channel in ("telegram", "whatsapp", "tenchat"):
         warnings.append("Ссылка в первом сообщении в мессенджере может восприниматься настороженно")
 
-    # Проверка ФЗ-38 «О рекламе»
     if enforce_fz38:
         for pat, msg in FZ38_BANNED_PATTERNS:
             if pat.search(combined):
                 reasons.append(msg)
 
-    # Проверка ст. 17 КПЭА
-    if enforce_kpea:
-        for pat, msg in KPEA_BANNED_PATTERNS:
-            if pat.search(combined):
-                reasons.append(msg)
+    for pat, msg in REGULATED_NICHE_PATTERNS.get(reg_niche, ()):
+        if pat.search(combined):
+            reasons.append(msg)
 
-    # Проверка русскоязычных ИИ-штампов и спам-фраз
     for phrase in AI_AND_SPAM_PHRASES:
-        norm_phrase = phrase.lower().replace("ё", "е")
-        if norm_phrase in low_combined:
+        if phrase.lower().replace("ё", "е") in low_combined:
             reasons.append(f"Обнаружен спам/ИИ-штамп: «{phrase}»")
 
-    # Не более одного вопросительного предложения
     q_count = clean_body.count("?")
     if q_count == 0:
         warnings.append("В сообщении нет завершающего вопроса (рекомендуется 1 спокойный вопрос)")
@@ -299,3 +304,42 @@ def check_draft(
         reasons.append(f"Слишком много вопросов в одном сообщении ({q_count})")
 
     return GateResult(ok=len(reasons) == 0, reasons=reasons, warnings=warnings)
+
+
+def is_suppressed(
+    *,
+    company_domain: str = "",
+    prospect_email: str = "",
+    prospect_telegram: str = "",
+    config=None,
+) -> tuple[bool, str]:
+    comp = getattr(config, "compliance", None)
+    dnc = getattr(comp, "do_not_contact", None) or []
+    hit = match_do_not_contact(
+        domain=company_domain,
+        email=prospect_email,
+        telegram=prospect_telegram,
+        entries=dnc,
+    )
+    return (bool(hit), hit)
+
+
+def validate_draft(
+    *,
+    channel: str,
+    subject: str,
+    body: str,
+    company_domain: str = "",
+    prospect_email: str = "",
+    prospect_telegram: str = "",
+    config=None,
+) -> GateResult:
+    return check_draft(
+        channel=channel,
+        subject=subject,
+        body=body,
+        config=config,
+        domain=company_domain,
+        email=prospect_email,
+        telegram=prospect_telegram,
+    )

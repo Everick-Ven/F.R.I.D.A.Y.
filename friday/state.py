@@ -1,12 +1,9 @@
-"""SQLite менеджер состояния F.R.I.D.A.Y.
+"""SQLite менеджер состояния F.R.I.D.A.Y. (универсальный под любую нишу российского рынка).
 
-Ключевые принципы (унаследованы из архитектуры Harvey):
+Ключевые принципы (унаследованы из Harvey):
 - Режим WAL: веб-интерфейс и экспорт читают БД параллельно со сбором данных без блокировок.
-- Линейные идемпотентные миграции через `PRAGMA user_version`.
-- Модель наблюдений (`signal_codes` + `observations` + триггер `trg_observations_signal_known`):
-  каждый факт о практике — это строка с `confidence`, `evidence_url` и временем наблюдения.
-- Таблица `drafts` хранит персональные черновики и мини-разборы ТОЛЬКО для ручной проверки
-  и личной отправки человеком (автоматической холодной рассылки нет).
+- Модель наблюдений (`signal_codes` + `observations` + триггер `trg_observations_signal_known`).
+- Очередь `agent_tasks` для работы ИИ-агента рабочей среды как Мозга (Вариант А).
 """
 
 from __future__ import annotations
@@ -14,7 +11,7 @@ from __future__ import annotations
 import json
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -38,15 +35,16 @@ def _utcnow_str() -> str:
 
 
 MIGRATIONS: list[str] = [
-    # ── v1: полная схема F.R.I.D.A.Y. для российского юридического рынка ──
     """
     CREATE TABLE IF NOT EXISTS companies (
         id TEXT PRIMARY KEY,
         name TEXT DEFAULT '',
         domain TEXT DEFAULT '',
         website TEXT DEFAULT '',
-        legal_form TEXT DEFAULT '',
-        practice_areas_json TEXT DEFAULT '[]',
+        industry TEXT DEFAULT '',
+        subcategories_json TEXT DEFAULT '[]',
+        company_size TEXT DEFAULT '',
+        inn TEXT DEFAULT '',
         description TEXT DEFAULT '',
         city TEXT DEFAULT '',
         address TEXT DEFAULT '',
@@ -57,7 +55,7 @@ MIGRATIONS: list[str] = [
         tenchat TEXT DEFAULT '',
         ymaps_url TEXT DEFAULT '',
         twogis_url TEXT DEFAULT '',
-        registry_region TEXT DEFAULT '',
+        hh_url TEXT DEFAULT '',
         external_id TEXT DEFAULT '',
         source TEXT DEFAULT '',
         source_url TEXT DEFAULT '',
@@ -75,6 +73,7 @@ MIGRATIONS: list[str] = [
     CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_external
         ON companies(external_id) WHERE external_id != '';
     CREATE INDEX IF NOT EXISTS idx_companies_city ON companies(city);
+    CREATE INDEX IF NOT EXISTS idx_companies_industry ON companies(industry);
 
     CREATE TABLE IF NOT EXISTS prospects (
         id TEXT PRIMARY KEY,
@@ -84,8 +83,7 @@ MIGRATIONS: list[str] = [
         middle_name TEXT DEFAULT '',
         title TEXT DEFAULT '',
         role_kind TEXT DEFAULT '',
-        registry_number TEXT DEFAULT '',
-        registry_status TEXT DEFAULT '',
+        registry_id TEXT DEFAULT '',
         email TEXT DEFAULT '',
         email_source TEXT DEFAULT '',
         phone TEXT DEFAULT '',
@@ -94,6 +92,7 @@ MIGRATIONS: list[str] = [
         tenchat TEXT DEFAULT '',
         vk TEXT DEFAULT '',
         company TEXT DEFAULT '',
+        industry TEXT DEFAULT '',
         city TEXT DEFAULT '',
         source TEXT DEFAULT '',
         source_url TEXT DEFAULT '',
@@ -107,8 +106,6 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_prospects_company_id ON prospects(company_id);
     CREATE INDEX IF NOT EXISTS idx_prospects_status ON prospects(status);
     CREATE INDEX IF NOT EXISTS idx_prospects_score ON prospects(score DESC);
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_prospects_registry
-        ON prospects(registry_number) WHERE registry_number != '';
 
     CREATE TABLE IF NOT EXISTS signal_codes (
         code TEXT PRIMARY KEY,
@@ -162,7 +159,7 @@ MIGRATIONS: list[str] = [
         signal_used TEXT DEFAULT '',
         status TEXT DEFAULT 'pending_review',
         gate_notes_json TEXT DEFAULT '[]',
-        brain_provider TEXT DEFAULT '',
+        brain_provider TEXT DEFAULT 'agent',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -184,22 +181,9 @@ MIGRATIONS: list[str] = [
         ended_at TIMESTAMP
     );
 
-    CREATE TABLE IF NOT EXISTS usage_events (
-        id TEXT PRIMARY KEY,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        provider TEXT DEFAULT 'claude',
-        agent TEXT DEFAULT '',
-        task TEXT DEFAULT '',
-        model TEXT DEFAULT '',
-        input_tokens INTEGER DEFAULT 0,
-        output_tokens INTEGER DEFAULT 0,
-        duration_ms INTEGER DEFAULT 0,
-        is_error INTEGER DEFAULT 0
-    );
-
     CREATE TABLE IF NOT EXISTS agent_tasks (
         id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,           -- scout_score | writer_draft
+        kind TEXT NOT NULL,           -- train_niche | scout_score | writer_draft
         status TEXT DEFAULT 'pending', -- pending | completed | cancelled
         payload_json TEXT NOT NULL,
         prompt_text TEXT NOT NULL,
@@ -257,7 +241,7 @@ class StateManager:
                     await db.execute(f"PRAGMA user_version = {target}")
                     await db.commit()
 
-    # ── Settings KV ──
+    # ── Settings ──
 
     async def get_setting(self, key: str, default: str = "") -> str:
         async with self._connect() as db:
@@ -309,10 +293,7 @@ class StateManager:
                     confidence_floor = excluded.confidence_floor,
                     updated_at = excluded.updated_at
                 """,
-                (
-                    code, label, description, category, value_type,
-                    collector, cost_note, confidence_floor, now, now,
-                ),
+                (code, label, description, category, value_type, collector, cost_note, confidence_floor, now, now),
             )
             await db.commit()
 
@@ -370,7 +351,6 @@ class StateManager:
         run_id: str = "",
         require_confirmed: bool = True,
     ) -> str | None:
-        """Записать наблюдение (если сигнал подтверждён пользователем и проходит порог confidence)."""
         async with self._connect() as db:
             async with db.execute(
                 "SELECT status, confidence_floor FROM signal_codes WHERE code = ?",
@@ -378,7 +358,6 @@ class StateManager:
             ) as cur:
                 sig = await cur.fetchone()
             if sig is None:
-                # Даём сработать триггеру БД для явной ошибки словаря
                 obs_id = _new_id()
                 await db.execute(
                     "INSERT INTO observations(id, signal_code) VALUES (?, ?)",
@@ -437,7 +416,6 @@ class StateManager:
         require: list[str] | None = None,
         exclude: list[str] | None = None,
     ) -> list[Company]:
-        """Построить когорту практик пересечением подтверждённых сигналов (SQL set intersection)."""
         require = [c for c in (require or []) if c]
         exclude = [c for c in (exclude or []) if c]
         where, params = ["1=1"], []
@@ -456,20 +434,21 @@ class StateManager:
             async with db.execute(sql, tuple(params)) as cur:
                 return [self._company_from_row(r) for r in await cur.fetchall()]
 
-    # ── Companies (Адвокатские образования и практики) ──
+    # ── Companies ──
 
     @staticmethod
     def _company_from_row(row: aiosqlite.Row) -> Company:
         d = dict(row)
-        d["practice_areas"] = _parse_json_list(d.pop("practice_areas_json", "[]"))
+        d["subcategories"] = _parse_json_list(d.pop("subcategories_json", "[]"))
         d["tech_stack"] = _parse_json_list(d.pop("tech_stack_json", "[]"))
         d["signals"] = _parse_json_list(d.pop("signals_json", "[]"))
         return Company(**d)
 
     async def upsert_company(self, company: Company) -> tuple[str, bool]:
-        """Добавить или обогатить компанию. Возвращает `(company_id, is_new)`."""
         domain = normalize_domain_idna(company.domain or company.website)
         ext_id = (company.external_id or "").strip()
+        if not ext_id and company.inn.strip():
+            ext_id = f"inn:{company.inn.strip()}"
         now = _utcnow_str()
 
         async with self._connect() as db:
@@ -486,19 +465,22 @@ class StateManager:
                 await db.execute(
                     """
                     INSERT INTO companies(
-                        id, name, domain, website, legal_form, practice_areas_json,
-                        description, city, address, phone, telegram, whatsapp, vk, tenchat,
-                        ymaps_url, twogis_url, registry_region, external_id, source, source_url,
-                        tech_stack_json, signals_json, notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        id, name, domain, website, industry, subcategories_json,
+                        company_size, inn, description, city, address, phone,
+                        telegram, whatsapp, vk, tenchat, ymaps_url, twogis_url, hh_url,
+                        external_id, source, source_url, tech_stack_json, signals_json,
+                        notes, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         cid,
                         company.name.strip(),
                         domain,
                         company.website.strip(),
-                        company.legal_form.strip(),
-                        json.dumps(company.practice_areas, ensure_ascii=False),
+                        company.industry.strip(),
+                        json.dumps(company.subcategories, ensure_ascii=False),
+                        company.company_size.strip(),
+                        company.inn.strip(),
                         company.description.strip(),
                         company.city.strip(),
                         company.address.strip(),
@@ -509,7 +491,7 @@ class StateManager:
                         company.tenchat.strip(),
                         company.ymaps_url.strip(),
                         company.twogis_url.strip(),
-                        company.registry_region.strip(),
+                        company.hh_url.strip(),
                         ext_id,
                         company.source.strip(),
                         company.source_url.strip(),
@@ -524,7 +506,7 @@ class StateManager:
                 return cid, True
 
             cur_obj = self._company_from_row(existing)
-            merged_areas = list(dict.fromkeys([*cur_obj.practice_areas, *company.practice_areas]))
+            merged_subs = list(dict.fromkeys([*cur_obj.subcategories, *company.subcategories]))
             merged_stack = list(dict.fromkeys([*cur_obj.tech_stack, *company.tech_stack]))
             merged_sigs = list(dict.fromkeys([*cur_obj.signals, *company.signals]))
 
@@ -534,8 +516,10 @@ class StateManager:
                     name = CASE WHEN name = '' THEN ? ELSE name END,
                     domain = CASE WHEN domain = '' THEN ? ELSE domain END,
                     website = CASE WHEN website = '' THEN ? ELSE website END,
-                    legal_form = CASE WHEN legal_form = '' THEN ? ELSE legal_form END,
-                    practice_areas_json = ?,
+                    industry = CASE WHEN industry = '' THEN ? ELSE industry END,
+                    subcategories_json = ?,
+                    company_size = CASE WHEN company_size = '' THEN ? ELSE company_size END,
+                    inn = CASE WHEN inn = '' THEN ? ELSE inn END,
                     description = CASE WHEN description = '' THEN ? ELSE description END,
                     city = CASE WHEN city = '' THEN ? ELSE city END,
                     address = CASE WHEN address = '' THEN ? ELSE address END,
@@ -546,7 +530,7 @@ class StateManager:
                     tenchat = CASE WHEN tenchat = '' THEN ? ELSE tenchat END,
                     ymaps_url = CASE WHEN ymaps_url = '' THEN ? ELSE ymaps_url END,
                     twogis_url = CASE WHEN twogis_url = '' THEN ? ELSE twogis_url END,
-                    registry_region = CASE WHEN registry_region = '' THEN ? ELSE registry_region END,
+                    hh_url = CASE WHEN hh_url = '' THEN ? ELSE hh_url END,
                     tech_stack_json = ?,
                     signals_json = ?,
                     notes = CASE WHEN notes = '' THEN ? ELSE notes END,
@@ -557,8 +541,10 @@ class StateManager:
                     company.name.strip(),
                     domain,
                     company.website.strip(),
-                    company.legal_form.strip(),
-                    json.dumps(merged_areas, ensure_ascii=False),
+                    company.industry.strip(),
+                    json.dumps(merged_subs, ensure_ascii=False),
+                    company.company_size.strip(),
+                    company.inn.strip(),
                     company.description.strip(),
                     company.city.strip(),
                     company.address.strip(),
@@ -569,7 +555,7 @@ class StateManager:
                     company.tenchat.strip(),
                     company.ymaps_url.strip(),
                     company.twogis_url.strip(),
-                    company.registry_region.strip(),
+                    company.hh_url.strip(),
                     json.dumps(merged_stack, ensure_ascii=False),
                     json.dumps(merged_sigs, ensure_ascii=False),
                     company.notes.strip(),
@@ -585,21 +571,22 @@ class StateManager:
         company_id: str,
         *,
         name: str = "",
-        legal_form: str = "",
+        industry: str = "",
+        inn: str = "",
         description: str = "",
         phone: str = "",
         telegram: str = "",
         whatsapp: str = "",
         vk: str = "",
         tenchat: str = "",
-        practice_areas: list[str] | None = None,
+        subcategories: list[str] | None = None,
         tech_stack: list[str] | None = None,
         signals: list[str] | None = None,
     ) -> None:
         existing = await self.get_company(company_id)
         if not existing:
             return
-        merged_areas = list(dict.fromkeys([*existing.practice_areas, *(practice_areas or [])]))
+        merged_subs = list(dict.fromkeys([*existing.subcategories, *(subcategories or [])]))
         merged_stack = list(dict.fromkeys([*existing.tech_stack, *(tech_stack or [])]))
         merged_sigs = list(dict.fromkeys([*existing.signals, *(signals or [])]))
         now = _utcnow_str()
@@ -608,14 +595,15 @@ class StateManager:
                 """
                 UPDATE companies SET
                     name = CASE WHEN ? != '' AND (name = '' OR name LIKE '%.%') THEN ? ELSE name END,
-                    legal_form = CASE WHEN legal_form = '' AND ? != '' THEN ? ELSE legal_form END,
+                    industry = CASE WHEN industry = '' AND ? != '' THEN ? ELSE industry END,
+                    inn = CASE WHEN inn = '' AND ? != '' THEN ? ELSE inn END,
                     description = CASE WHEN description = '' AND ? != '' THEN ? ELSE description END,
                     phone = CASE WHEN phone = '' AND ? != '' THEN ? ELSE phone END,
                     telegram = CASE WHEN telegram = '' AND ? != '' THEN ? ELSE telegram END,
                     whatsapp = CASE WHEN whatsapp = '' AND ? != '' THEN ? ELSE whatsapp END,
                     vk = CASE WHEN vk = '' AND ? != '' THEN ? ELSE vk END,
                     tenchat = CASE WHEN tenchat = '' AND ? != '' THEN ? ELSE tenchat END,
-                    practice_areas_json = ?,
+                    subcategories_json = ?,
                     tech_stack_json = ?,
                     signals_json = ?,
                     profile_checked_at = ?,
@@ -624,14 +612,15 @@ class StateManager:
                 """,
                 (
                     name, name,
-                    legal_form, legal_form,
+                    industry, industry,
+                    inn, inn,
                     description, description,
                     phone, phone,
                     telegram, telegram,
                     whatsapp, whatsapp,
                     vk, vk,
                     tenchat, tenchat,
-                    json.dumps(merged_areas, ensure_ascii=False),
+                    json.dumps(merged_subs, ensure_ascii=False),
                     json.dumps(merged_stack, ensure_ascii=False),
                     json.dumps(merged_sigs, ensure_ascii=False),
                     now,
@@ -688,38 +677,23 @@ class StateManager:
             ) as cur:
                 return [self._company_from_row(r) for r in await cur.fetchall()]
 
-    async def companies_needing_prospects(self, limit: int = 50) -> list[Company]:
-        async with self._connect() as db:
-            async with db.execute(
-                """
-                SELECT c.* FROM companies c
-                WHERE c.prospects_checked_at IS NULL
-                  AND NOT EXISTS (SELECT 1 FROM prospects p WHERE p.company_id = c.id)
-                ORDER BY c.created_at ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ) as cur:
-                return [self._company_from_row(r) for r in await cur.fetchall()]
-
-    # ── Prospects (Адвокаты / Управляющие партнёры / Председатели) ──
+    # ── Prospects ──
 
     @staticmethod
     def _prospect_from_row(row: aiosqlite.Row) -> Prospect:
         return Prospect(**dict(row))
 
     async def upsert_prospect(self, prospect: Prospect) -> tuple[str, bool]:
-        """Добавить или обновить контакт адвоката / ЛПР с дедупликацией."""
-        reg = (prospect.registry_number or "").strip()
+        reg_id = (prospect.registry_id or "").strip()
         email = (prospect.email or "").strip().lower()
         tg = (prospect.telegram or "").strip()
         now = _utcnow_str()
 
         async with self._connect() as db:
             existing = None
-            if reg:
+            if reg_id:
                 async with db.execute(
-                    "SELECT * FROM prospects WHERE registry_number = ?", (reg,)
+                    "SELECT * FROM prospects WHERE registry_id = ?", (reg_id,)
                 ) as cur:
                     existing = await cur.fetchone()
             if existing is None and email:
@@ -737,7 +711,6 @@ class StateManager:
                 ) as cur:
                     existing = await cur.fetchone()
             if existing is None and prospect.company_id and not prospect.first_name and not prospect.last_name:
-                # Общий контакт практики — не более одного на компанию
                 async with db.execute(
                     "SELECT * FROM prospects WHERE company_id = ? AND first_name = '' AND last_name = ''",
                     (prospect.company_id,),
@@ -750,9 +723,9 @@ class StateManager:
                     """
                     INSERT INTO prospects(
                         id, company_id, last_name, first_name, middle_name,
-                        title, role_kind, registry_number, registry_status,
+                        title, role_kind, registry_id,
                         email, email_source, phone, telegram, whatsapp, tenchat, vk,
-                        company, city, source, source_url, status, score,
+                        company, industry, city, source, source_url, status, score,
                         personalization_notes, created_at, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
@@ -764,8 +737,7 @@ class StateManager:
                         prospect.middle_name.strip(),
                         prospect.title.strip(),
                         prospect.role_kind.strip(),
-                        reg,
-                        prospect.registry_status.strip(),
+                        reg_id,
                         email,
                         prospect.email_source.strip(),
                         prospect.phone.strip(),
@@ -774,6 +746,7 @@ class StateManager:
                         prospect.tenchat.strip(),
                         prospect.vk.strip(),
                         prospect.company.strip(),
+                        prospect.industry.strip(),
                         prospect.city.strip(),
                         prospect.source.strip(),
                         prospect.source_url.strip(),
@@ -794,8 +767,7 @@ class StateManager:
                     middle_name = CASE WHEN middle_name = '' THEN ? ELSE middle_name END,
                     title = CASE WHEN title = '' THEN ? ELSE title END,
                     role_kind = CASE WHEN role_kind = '' THEN ? ELSE role_kind END,
-                    registry_number = CASE WHEN registry_number = '' THEN ? ELSE registry_number END,
-                    registry_status = CASE WHEN registry_status = '' THEN ? ELSE registry_status END,
+                    registry_id = CASE WHEN registry_id = '' THEN ? ELSE registry_id END,
                     email = CASE WHEN email = '' THEN ? ELSE email END,
                     email_source = CASE WHEN email_source = '' THEN ? ELSE email_source END,
                     phone = CASE WHEN phone = '' THEN ? ELSE phone END,
@@ -811,8 +783,7 @@ class StateManager:
                     prospect.middle_name.strip(),
                     prospect.title.strip(),
                     prospect.role_kind.strip(),
-                    reg,
-                    prospect.registry_status.strip(),
+                    reg_id,
                     email,
                     prospect.email_source.strip(),
                     prospect.phone.strip(),
@@ -891,13 +862,7 @@ class StateManager:
             )
             await db.commit()
 
-    # ── Drafts (Черновики для ручного контакта) ──
-
-    @staticmethod
-    def _draft_from_row(row: aiosqlite.Row) -> Draft:
-        d = dict(row)
-        d["gate_notes"] = _parse_json_list(d.pop("gate_notes_json", "[]"))
-        return Draft(**d)
+    # ── Drafts ──
 
     async def upsert_draft(self, draft: Draft) -> str:
         did = draft.id or _new_id()
@@ -931,7 +896,7 @@ class StateManager:
                     draft.signal_used.strip(),
                     draft.status,
                     json.dumps(draft.gate_notes, ensure_ascii=False),
-                    draft.brain_provider,
+                    draft.brain_provider or "agent",
                     now,
                     now,
                 ),
@@ -966,9 +931,9 @@ class StateManager:
         sql = """
             SELECT d.*,
                    p.first_name, p.middle_name, p.last_name, p.title,
-                   p.email, p.telegram AS prospect_telegram, p.phone AS prospect_phone,
-                   p.score, p.registry_number,
-                   c.name AS company_name, c.domain, c.website, c.city, c.legal_form,
+                   p.email, p.telegram AS prospect_telegram, p.whatsapp AS prospect_whatsapp,
+                   p.phone AS prospect_phone, p.score, p.registry_id,
+                   c.name AS company_name, c.domain, c.website, c.city, c.industry,
                    c.telegram AS company_telegram
             FROM drafts d
             JOIN prospects p ON p.id = d.prospect_id
@@ -1007,7 +972,7 @@ class StateManager:
             await db.commit()
             return cur.rowcount > 0
 
-    # ── Runs & Usage & Agent Tasks ──
+    # ── Runs & Agent Tasks ──
 
     async def start_run(self, stage: str, provider: str = "", params: dict | None = None) -> str:
         run_id = _new_id()
@@ -1038,33 +1003,6 @@ class StateManager:
                 WHERE id = ?
                 """,
                 (status, records, cost_rub, error[:500], _utcnow_str(), run_id),
-            )
-            await db.commit()
-
-    async def record_usage_event(
-        self,
-        *,
-        provider: str,
-        agent: str = "",
-        task: str = "",
-        model: str = "",
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        duration_ms: int = 0,
-        is_error: bool = False,
-    ) -> None:
-        async with self._connect() as db:
-            await db.execute(
-                """
-                INSERT INTO usage_events(
-                    id, created_at, provider, agent, task, model,
-                    input_tokens, output_tokens, duration_ms, is_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    _new_id(), _utcnow_str(), provider, agent, task, model,
-                    input_tokens, output_tokens, duration_ms, int(is_error),
-                ),
             )
             await db.commit()
 
@@ -1114,7 +1052,6 @@ class StateManager:
             return cur.rowcount > 0
 
     async def get_state_summary(self) -> dict:
-        today_prefix = date.today().isoformat()
         async with self._connect() as db:
             async with db.execute("SELECT COUNT(*) AS cnt FROM companies") as cur:
                 companies_total = (await cur.fetchone())["cnt"]
@@ -1130,13 +1067,8 @@ class StateManager:
                 signals_by_status = {r["status"]: r["cnt"] for r in await cur.fetchall()}
             async with db.execute("SELECT COUNT(*) AS cnt FROM observations") as cur:
                 observations_total = (await cur.fetchone())["cnt"]
-            async with db.execute(
-                "SELECT provider, COUNT(*) AS cnt FROM usage_events WHERE created_at LIKE ? AND is_error = 0 GROUP BY provider",
-                (f"{today_prefix}%",),
-            ) as cur:
-                calls_today = {r["provider"]: r["cnt"] for r in await cur.fetchall()}
-            async with db.execute("SELECT COUNT(*) AS cnt FROM agent_tasks WHERE status = 'pending'") as cur:
-                pending_agent_tasks = (await cur.fetchone())["cnt"]
+            async with db.execute("SELECT kind, COUNT(*) AS cnt FROM agent_tasks WHERE status = 'pending' GROUP BY kind") as cur:
+                tasks_by_kind = {r["kind"]: r["cnt"] for r in await cur.fetchall()}
 
         return {
             "companies_total": companies_total,
@@ -1147,6 +1079,6 @@ class StateManager:
             "drafts_total": sum(drafts_by_status.values()),
             "signals_by_status": signals_by_status,
             "observations_total": observations_total,
-            "calls_today": calls_today,
-            "pending_agent_tasks": pending_agent_tasks,
+            "pending_agent_tasks": sum(tasks_by_kind.values()),
+            "pending_tasks_by_kind": tasks_by_kind,
         }

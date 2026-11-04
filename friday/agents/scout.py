@@ -1,198 +1,123 @@
-"""Scout — скоринг адвокатских образований и формулировка персонального угла захода."""
+"""Агент-разведчик (Scout): скоринг соответствия нише РФ и формулировка угла захода.
+
+В Варианте А (`brain.mode = "agent"`):
+1. Мгновенно считает детерминированный базовый балл (`friday.fit`) по фактам из `observations` и ICP.
+2. По запросу (`use_ai=True`) формирует структурированные задачи `scout_score` для ИИ-агента
+   рабочей среды в `data/agent_tasks/` (с изоляцией внешних данных в `<untrusted>`).
+"""
 
 from __future__ import annotations
 
-import json
-import logging
-
-from friday.brain import AgentTaskQueued, Brain
-from friday.config import FridayConfig
-from friday.fit import company_fit, pick_primary_signal
-from friday.models import Prospect
+from friday.brain import enqueue_agent_task, load_prompt, load_skills
+from friday.config import FridayConfig, load_config
+from friday.fit import compute_fit_score
+from friday.models.company import Company
+from friday.models.prospect import Prospect
 from friday.state import StateManager
-from friday.untrusted import UNTRUSTED_RULE, fence
-
-logger = logging.getLogger("friday.scout")
-
-BATCH_SIZE = 12
+from friday.untrusted import UNTRUSTED_RULE, wrap_untrusted
 
 
-class Scout:
-    def __init__(self, brain: Brain, state: StateManager, config: FridayConfig):
-        self.brain = brain
-        self.state = state
-        self.config = config
+def _deterministic_angle(
+    company: Company | None,
+    observations: list[dict],
+    reasons: list[str],
+    cfg: FridayConfig,
+) -> str:
+    codes = {o["signal_code"]: o.get("value_text", "") for o in observations}
+    cname = company.name if company else "компании"
+    dom = (company.domain or company.website) if company else ""
 
-    async def score_pending_prospects(
-        self,
-        *,
-        limit: int = 30,
-        rescore_all: bool = False,
-    ) -> dict:
-        """Оценить контакты и сформировать заметку персонализации по собранным сигналам."""
-        prospects = await self.state.get_prospects(status="new", limit=limit * 2)
-        if not rescore_all:
-            prospects = [p for p in prospects if p.score == 0 or not p.personalization_notes]
-        prospects = prospects[:limit]
-
-        if not prospects:
-            return {"scored": 0, "queued_task_ids": []}
-
-        # Собираем контекст по компаниям и их наблюдениям
-        items_context: list[dict] = []
-        for p in prospects:
-            comp = await self.state.get_company(p.company_id) if p.company_id else None
-            obs = await self.state.get_observations(company_id=p.company_id) if p.company_id else []
-            comp_dict = comp.__dict__ if comp else {"name": p.company, "city": p.city}
-            det_score, det_reasons = company_fit(comp_dict, [p.__dict__], obs, self.config)
-            sig_code, sig_desc = pick_primary_signal(obs)
-            items_context.append(
-                {
-                    "prospect": p,
-                    "company": comp,
-                    "observations": obs,
-                    "det_score": det_score,
-                    "det_reasons": det_reasons,
-                    "primary_signal_code": sig_code,
-                    "primary_signal_desc": sig_desc,
-                }
-            )
-
-        # В детерминированном режиме `template` сразу считаем по формуле и сигналам без LLM
-        if self.brain.provider == "template":
-            scored = 0
-            for ctx in items_context:
-                p: Prospect = ctx["prospect"]
-                note = _build_template_angle(ctx)
-                await self.state.update_prospect_scoring(
-                    p.id, score=max(1, ctx["det_score"]), personalization_notes=note
-                )
-                scored += 1
-            return {"scored": scored, "queued_task_ids": [], "mode": "template"}
-
-        scored_total = 0
-        queued_tasks: list[str] = []
-
-        for start in range(0, len(items_context), BATCH_SIZE):
-            batch = items_context[start : start + BATCH_SIZE]
-            prompt, payload = self._build_scout_prompt(batch)
-            try:
-                parsed = await self.brain.think_json(
-                    prompt,
-                    agent="scout",
-                    task="scout_score",
-                    task_payload=payload,
-                )
-            except AgentTaskQueued as queued:
-                logger.info("Scout: пакет передан в очередь ИИ-агента (%s)", queued.file_path)
-                queued_tasks.append(queued.task_id)
-                continue
-
-            if isinstance(parsed, list):
-                scored_total += await apply_scout_response(self.state, parsed)
-            else:
-                # Надёжный откат к детерминированной оценке, если модель не ответила
-                logger.warning("Scout: LLM не вернула валидный JSON, применяем расчёт по сигналам.")
-                for ctx in batch:
-                    p = ctx["prospect"]
-                    await self.state.update_prospect_scoring(
-                        p.id,
-                        score=max(1, ctx["det_score"]),
-                        personalization_notes=_build_template_angle(ctx),
-                    )
-                    scored_total += 1
-
-        return {"scored": scored_total, "queued_task_ids": queued_tasks, "mode": self.brain.provider}
-
-    def _build_scout_prompt(self, batch: list[dict]) -> tuple[str, dict]:
-        sys_hdr = self.brain.build_system_header(self.config)
-        skills = self.brain.load_skills_for_agent("scout")
-        scout_instructions = self.brain.load_prompt(
-            "scout",
-            {
-                "legal_forms": ", ".join(self.config.icp.legal_forms),
-                "practice_areas": ", ".join(self.config.icp.practice_areas),
-                "cities": ", ".join(self.config.icp.cities),
-                "titles": ", ".join(self.config.icp.decision_maker_titles),
-            },
+    if "HH_HIRING_ROLE" in codes and ("NO_ONLINE_CAPTURE" in codes or "NO_MESSENGER_WIDGET" in codes):
+        return (
+            f"На hh.ru у {cname} открыт найм ({codes['HH_HIRING_ROLE']}), "
+            f"при этом на сайте {dom} нет быстрых виджетов захвата заявок и мессенджеров."
         )
+    if "HH_HIRING_ROLE" in codes:
+        return f"Активный сигнал роста {cname} на hh.ru: {codes['HH_HIRING_ROLE']}."
+    if "YANDEX_DIRECT_ACTIVE" in codes and ("NO_ONLINE_CAPTURE" in codes or "NO_YANDEX_METRIKA" in codes):
+        return (
+            f"На {dom} запущена реклама в Яндекс.Директе, но теряется часть обращений "
+            f"из-за отсутствия онлайн-захвата или сквозной аналитики."
+        )
+    if "YANDEX_PAGE2_RANK" in codes:
+        return f"Сайт {dom} находится в шаге от топ-10 Яндекса ({codes['YANDEX_PAGE2_RANK']})."
+    if "LOW_MAP_RATING" in codes:
+        return f"Точка роста в геосервисах у {cname}: {codes['LOW_MAP_RATING']}."
+    if "NO_WEBSITE_ON_MAP" in codes:
+        return f"В карточке геосервиса {cname} не указан сайт — часть клиентов уходит конкурентам."
+    if "THIN_SERVICE_STRUCTURE" in codes:
+        return f"На сайте {dom} узкая структура посадочных страниц под отдельные услуги/товары."
+    if reasons:
+        return f"Совпадение с нишей «{cfg.icp.niche}»: " + "; ".join(reasons[:2])
+    return f"Профильная компания в городе {company.city if company else 'РФ'} под продукт «{cfg.product.name}»."
 
-        serialized_leads = []
-        for ctx in batch:
-            p: Prospect = ctx["prospect"]
-            c = ctx["company"]
-            obs_short = [
-                {
-                    "code": o["signal_code"],
-                    "num": o["value_num"],
-                    "text": o["value_text"],
-                    "evidence_url": o["evidence_url"],
-                }
-                for o in ctx["observations"][:12]
+
+async def score_all_prospects(
+    state: StateManager,
+    *,
+    use_ai: bool = False,
+    limit: int = 100,
+    config: FridayConfig | None = None,
+) -> dict:
+    cfg = config or load_config()
+    prospects = await state.get_prospects(limit=limit)
+    scored = 0
+    queued_tasks = 0
+
+    sys_prompt = ""
+    if use_ai and cfg.brain.mode == "agent":
+        sys_prompt = "\n\n".join(
+            p
+            for p in [
+                load_prompt("system"),
+                load_prompt("scout"),
+                load_skills(["product_knowledge", "signal_playbook_ru", "lead_qualification_ru"]),
+                UNTRUSTED_RULE,
             ]
-            serialized_leads.append(
-                {
-                    "prospect_id": p.id,
-                    "fio": p.full_name() or "Общий контакт",
-                    "title": p.title,
-                    "registry_number": p.registry_number,
-                    "company_name": c.name if c else p.company,
-                    "legal_form": c.legal_form if c else "",
-                    "city": (c.city if c else p.city),
-                    "website": c.website if c else p.source_url,
-                    "practice_areas": c.practice_areas if c else [],
-                    "tech_stack": c.tech_stack if c else [],
-                    "channels": {
-                        "telegram": p.telegram or (c.telegram if c else ""),
-                        "email": p.email,
-                        "phone": p.phone or (c.phone if c else ""),
-                    },
-                    "confirmed_observations": obs_short,
-                    "baseline_fit_hint": ctx["det_score"],
-                }
+            if p
+        )
+
+    for p in prospects:
+        comp = await state.get_company(p.company_id) if p.company_id else None
+        obs = await state.get_observations(company_id=p.company_id) if p.company_id else []
+        det_score, reasons = compute_fit_score(comp, p, obs, cfg)
+        det_angle = _deterministic_angle(comp, obs, reasons, cfg)
+
+        await state.update_prospect_scoring(
+            p.id,
+            score=det_score,
+            personalization_notes=det_angle,
+        )
+        scored += 1
+
+        if use_ai and cfg.brain.mode == "agent":
+            untrusted_blob = wrap_untrusted(
+                f"Компания: {comp.name if comp else p.company}\n"
+                f"Отрасль: {comp.industry if comp else p.industry}\n"
+                f"Город: {p.city}\n"
+                f"Домен: {comp.domain if comp else ''}\n"
+                f"Описание: {comp.description if comp else ''}\n"
+                f"Технологии: {', '.join(comp.tech_stack) if comp else ''}\n"
+                f"ЛПР: {p.full_name} — {p.title}\n"
+                f"Сигналы: {'; '.join(o.get('signal_code', '') + '=' + o.get('value_text', '') for o in obs)}",
+                source="company_profile",
             )
+            user_prompt = (
+                f"Наша компания: {cfg.persona.company} — {cfg.product.name}\n"
+                f"Описание продукта: {cfg.product.description}\n"
+                f"Целевая ниша (ICP): {cfg.icp.niche}\n"
+                f"Базовый детерминированный балл: {det_score}/100\n\n"
+                f"{untrusted_blob}\n\n"
+                'Верни строго JSON-объект: {"score": 0..100, "angle": "1-2 предложения на русском"}.'
+            )
+            await enqueue_agent_task(
+                state,
+                cfg,
+                kind="scout_score",
+                payload={"prospect_id": p.id, "company_id": p.company_id, "deterministic_score": det_score},
+                system_prompt=sys_prompt,
+                user_prompt=user_prompt,
+            )
+            queued_tasks += 1
 
-        schema_hint = (
-            'Верните строго JSON-массив вида:\n'
-            '[{"prospect_id": "...", "score": 82, "angle": "Конкретное наблюдение в 1-2 предложениях"}]'
-        )
-        full_prompt = (
-            f"{sys_hdr}\n\n{UNTRUSTED_RULE}\n\n"
-            f"=== НАВЫКИ ===\n{skills}\n\n"
-            f"=== ЗАДАЧА SCOUT ===\n{scout_instructions}\n\n"
-            f"=== ДАННЫЕ ПРАКТИК ===\n"
-            f"{fence(json.dumps(serialized_leads, ensure_ascii=False, indent=2), 'prospect_batch')}\n\n"
-            f"{schema_hint}"
-        )
-        return full_prompt, {"prospect_ids": [x["prospect"].id for x in batch]}
-
-
-def _build_template_angle(ctx: dict) -> str:
-    c = ctx["company"]
-    p: Prospect = ctx["prospect"]
-    sig_desc = ctx.get("primary_signal_desc") or ""
-    comp_name = (c.name if c else p.company) or "практики"
-    city = (c.city if c else p.city) or ""
-    loc_part = f" ({city})" if city else ""
-    if sig_desc:
-        return f"У «{comp_name}»{loc_part} зафиксирован сигнал: {sig_desc}."
-    return f"Практика «{comp_name}»{loc_part}, роль контакта: {p.title or 'Адвокат'}."
-
-
-async def apply_scout_response(state: StateManager, items: list[dict]) -> int:
-    """Применить JSON-массив оценок Scout (из LLM или из `friday tasks apply`)."""
-    applied = 0
-    for row in items:
-        if not isinstance(row, dict):
-            continue
-        pid = str(row.get("prospect_id") or "").strip()
-        if not pid:
-            continue
-        try:
-            score = int(row.get("score") or 50)
-        except (ValueError, TypeError):
-            score = 50
-        angle = str(row.get("angle") or row.get("personalization_notes") or "").strip()
-        await state.update_prospect_scoring(pid, score=score, personalization_notes=angle)
-        applied += 1
-    return applied
+    return {"scored": scored, "queued_agent_tasks": queued_tasks}

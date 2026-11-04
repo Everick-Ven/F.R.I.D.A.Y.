@@ -1,8 +1,10 @@
-# Environment & local configuration
+# Environment & local trained configuration (like Harvey's harvey.local.yaml)
 .env
 .env.*
 !.env.example
 friday.local.yaml
+skills/product_knowledge.md
+skills/competitive_intel.md
 skills/outreach_rules.local.md
 
 # Local database, exports, logs & agent task queue

@@ -1,4 +1,4 @@
-"""Модель адвокатского образования / юридической практики."""
+"""Модель целевой компании на российском рынке (универсальная под любую нишу)."""
 
 from dataclasses import dataclass, field
 
@@ -9,8 +9,10 @@ class Company:
     name: str = ""
     domain: str = ""
     website: str = ""
-    legal_form: str = ""          # Коллегия адвокатов | Адвокатское бюро | Адвокатский кабинет | Юридическая фирма
-    practice_areas: list[str] = field(default_factory=list)
+    industry: str = ""            # Отрасль / ниша (стоматология, логистика, SaaS, производство и т.д.)
+    subcategories: list[str] = field(default_factory=list)
+    company_size: str = ""
+    inn: str = ""                 # ИНН компании (при импорте из баз контрагентов или футера сайта)
     description: str = ""
     city: str = ""
     address: str = ""
@@ -21,8 +23,8 @@ class Company:
     tenchat: str = ""
     ymaps_url: str = ""
     twogis_url: str = ""
-    registry_region: str = ""
-    external_id: str = ""         # Стабильный ключ провайдера: "2gis:...", "ymaps:...", "minjust:77/..."
+    hh_url: str = ""              # Ссылка на страницу работодателя на hh.ru
+    external_id: str = ""         # Стабильный ключ: "2gis:...", "ymaps:...", "hh:...", "inn:...", "osm:..."
     source: str = ""
     source_url: str = ""
     tech_stack: list[str] = field(default_factory=list)

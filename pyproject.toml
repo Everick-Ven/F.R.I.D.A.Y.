@@ -3,20 +3,20 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "friday-legal-scout"
-version = "0.1.0"
-description = "F.R.I.D.A.Y. — ИИ-разведка и подготовка персонального аутрича для юридического рынка РФ (38-ФЗ и КПЭА)"
+name = "friday-ru"
+version = "0.2.0"
+description = "F.R.I.D.A.Y. — универсальная ИИ-разведка и подготовка персонального аутрича для любого бизнеса в РФ (Agent-as-Brain)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 keywords = [
-    "legal-marketing",
+    "sales",
     "ai-agent",
     "prospecting",
     "yandex",
     "2gis",
-    "claude",
-    "advocates",
+    "hh-ru",
+    "b2b-russia",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -35,12 +35,15 @@ dependencies = [
     "pydantic>=2.5,<3",
     "fastapi>=0.115,<1",
     "uvicorn>=0.34,<1",
+    "python-multipart>=0.0.9,<1",
+    "rich>=13.7,<15",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0,<9",
     "pytest-asyncio>=0.23,<1",
+    "respx>=0.21,<1",
 ]
 
 [project.urls]
