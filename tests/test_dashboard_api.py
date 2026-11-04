@@ -59,6 +59,19 @@ def test_dashboard_starts_clean_and_supports_niche_presets_and_pipeline(
 
         tasks = client.get("/api/agent-tasks?status=pending").json()["items"]
         assert len(tasks) >= 1
+        assert tasks[0]["kind_label"] == "Подготовка персонального черновика"
+        assert "prompt_text" not in tasks[0]
+
+        # Отмена одной ожидающей задачи из UI
+        del_r = client.delete(f"/api/agent-tasks/{tasks[0]['id']}")
+        assert del_r.status_code == 200
+        assert del_r.json()["status"] == "cancelled"
+
+        # Проверяем, что в HTML/JS нет ручного копирования промптов и ручной вставки JSON
+        html_txt = client.get("/").text
+        js_txt = client.get("/static/app.js").text
+        assert "Скопировать полный промпт задачи" not in html_txt + js_txt
+        assert "Применить JSON-ответ" not in html_txt + js_txt
 
         # 5. И быстрый предпросмотр шаблонных черновиков + экспорт CSV
         tpl_res = client.post("/api/run/drafts", json={"channel": "telegram", "template_preview": True})

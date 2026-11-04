@@ -1,16 +1,72 @@
-/* F.R.I.D.A.Y. v0.2 UI — относительные URL (/api/*), совместимо с любым Live Preview прокси */
+/* F.R.I.D.A.Y. v0.2 UI — относительные URL (/api/*), надёжная работа внутри Live Preview iframe */
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-let hasAutoSwitchedTab = false;
+let cachedPresets = [];
+let hasInitializedForm = false;
+let pendingTasksCount = 0;
 
-function showToast(msg) {
-  const el = $("#toast");
-  el.textContent = msg;
-  el.classList.remove("hidden");
-  clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => el.classList.add("hidden"), 4200);
+function notify(msg, isError = false) {
+  const toast = $("#toast");
+  if (toast) {
+    toast.textContent = msg;
+    toast.style.borderColor = isError ? "var(--danger)" : "var(--primary)";
+    toast.classList.remove("hidden");
+    clearTimeout(notify._t);
+    notify._t = setTimeout(() => toast.classList.add("hidden"), 4800);
+  }
+  const bar = $("#statusBar");
+  if (bar) {
+    bar.textContent = msg;
+    bar.classList.toggle("error", Boolean(isError));
+    bar.classList.remove("hidden");
+  }
+}
+
+async function safeCopyText(text) {
+  if (!text) return false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) {
+    // Внутри кросс-доменного iframe браузер может запретить Clipboard API — используем fallback
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.top = "-1000px";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (_) {
+    ok = false;
+  }
+  document.body.removeChild(ta);
+  return ok;
+}
+
+async function downloadEndpoint(url, filename) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = blobUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
 }
 
 async function api(path, opts = {}) {
@@ -22,11 +78,29 @@ async function api(path, opts = {}) {
     let txt = await res.text();
     try {
       const parsed = JSON.parse(txt);
-      if (parsed.detail) txt = parsed.detail;
+      if (parsed.detail) {
+        txt = typeof parsed.detail === "string" ? parsed.detail : JSON.stringify(parsed.detail);
+      }
     } catch (_) {}
     throw new Error(txt || `HTTP ${res.status}`);
   }
   return res.json();
+}
+
+async function withButtonBusy(btn, busyLabel, fn) {
+  const prevText = btn ? btn.textContent : "";
+  if (btn) {
+    btn.disabled = true;
+    if (busyLabel) btn.textContent = busyLabel;
+  }
+  try {
+    return await fn();
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      if (busyLabel) btn.textContent = prevText;
+    }
+  }
 }
 
 function esc(str) {
@@ -46,8 +120,9 @@ function statusBadge(status) {
     rejected: ["Отклонено", "badge-danger"],
     confirmed: ["confirmed", "badge-ok"],
     proposed: ["proposed", "badge-warn"],
-    pending: ["Ожидает ИИ-агента", "badge-warn"],
-    completed: ["Выполнена", "badge-ok"],
+    pending: ["Ожидает выполнения агентом", "badge-warn"],
+    completed: ["Выполнено агентом", "badge-ok"],
+    cancelled: ["Отменена", "badge-danger"],
   };
   const [label, cls] = map[status] || [status, ""];
   return `<span class="badge ${cls}">${esc(label)}</span>`;
@@ -57,10 +132,6 @@ function switchTab(target) {
   $$("#mainTabs .tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === target));
   $$(".panel").forEach((p) => p.classList.toggle("active", p.id === `tab-${target}`));
 }
-
-$$("#mainTabs .tab").forEach((btn) => {
-  btn.addEventListener("click", () => switchTab(btn.dataset.tab));
-});
 
 function splitComma(val) {
   return String(val || "")
@@ -76,7 +147,11 @@ function splitLinesOrComma(val) {
     .filter(Boolean);
 }
 
-function fillNicheForm(cfg) {
+function fillNicheForm(cfg, forceOverwrite = false) {
+  // Не затираем то, что пользователь прямо сейчас печатает при фоновом автообновлении
+  if (hasInitializedForm && !forceOverwrite) return;
+  hasInitializedForm = true;
+
   const per = cfg.persona || {};
   const prod = cfg.product || {};
   const icp = cfg.icp || {};
@@ -103,43 +178,41 @@ function fillNicheForm(cfg) {
   if (per.role) $("#nsSenderTitle").value = per.role;
   if (per.telegram) $("#nsSenderTg").value = per.telegram;
 
-  if (!$("#inpQuery").value && (icp.search_queries || []).length > 0) {
+  if ((icp.search_queries || []).length > 0 && (forceOverwrite || !$("#inpQuery").value)) {
     $("#inpQuery").value = icp.search_queries[0];
   }
-  if (!$("#inpCity").value && (icp.cities || []).length > 0) {
+  if ((icp.cities || []).length > 0 && (forceOverwrite || !$("#inpCity").value)) {
     $("#inpCity").value = icp.cities[0];
   }
 }
 
 async function loadPresets() {
   const { items } = await api("/api/niche/presets");
+  cachedPresets = items || [];
   const wrap = $("#presetList");
-  wrap.innerHTML = items.map((tpl, idx) => `
-    <button type="button" class="preset-item" data-preset-idx="${idx}">
-      <strong>${esc(tpl.label)}</strong>
-      <span>Целевая ниша: ${esc(tpl.icp.niche)}</span>
-    </button>
-  `).join("");
-
-  $$("#presetList .preset-item").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const tpl = items[Number(btn.dataset.presetIdx)];
-      fillNicheForm({
-        persona: tpl.persona,
-        product: tpl.product,
-        icp: tpl.icp,
-        compliance: { regulated_niche: tpl.regulated_niche || "none" },
-      });
-      showToast(`Подставлен шаблон «${tpl.label}» — нажмите «Сохранить нишу и продукт» ниже`);
-    });
-  });
+  wrap.innerHTML = cachedPresets
+    .map(
+      (tpl, idx) => `
+    <div class="preset-card">
+      <div>
+        <strong>${esc(tpl.label)}</strong>
+        <span>Целевая ниша: ${esc(tpl.icp.niche)}</span>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-sm btn-primary" data-preset-apply="${idx}">Применить сразу</button>
+        <button type="button" class="btn btn-sm" data-preset-fill="${idx}">В форму</button>
+      </div>
+    </div>`
+    )
+    .join("");
 }
 
-async function loadSummary() {
+async function loadSummary(forceFormSync = false) {
   const { summary, niche_configured, config, skills } = await api("/api/summary");
   const d = summary.drafts_by_status || {};
+  pendingTasksCount = summary.pending_agent_tasks ?? 0;
 
-  $("#tabAgentCnt").textContent = summary.pending_agent_tasks ?? 0;
+  $("#tabAgentCnt").textContent = pendingTasksCount;
   $("#tabDraftsCnt").textContent = (d.pending_review ?? 0) + (d.approved ?? 0);
 
   const badgeWrap = $("#headerBadges");
@@ -152,19 +225,14 @@ async function loadSummary() {
     callout.classList.add("ready");
     $("#nicheCalloutTitle").textContent = `Активная ниша настроена: ${config.persona.company} (${config.product.name})`;
     $("#nicheCalloutDesc").textContent =
-      `Целевая аудитория (ICP): ${config.icp.niche}. Вы можете в любой момент переобучить систему под другой продукт или перейти на вкладку «2. Конвейер и сбор».`;
-    if (!hasAutoSwitchedTab && summary.companies_total > 0) {
-      hasAutoSwitchedTab = true;
-      switchTab("overview");
-    }
+      `Целевая аудитория (ICP): ${config.icp.niche}. Можно сразу переходить на вкладку «2. Конвейер и сбор» или обновить параметры ниши ниже.`;
   } else {
     badgeWrap.classList.add("unconfigured");
     badgeTxt.textContent = "Шаг 1: настройте нишу и продукт";
     callout.classList.remove("ready");
-    hasAutoSwitchedTab = true;
   }
 
-  fillNicheForm(config);
+  fillNicheForm(config, forceFormSync);
 
   if (skills && skills.product_knowledge_md) {
     $("#productSkillPreview").textContent = skills.product_knowledge_md;
@@ -176,7 +244,7 @@ async function loadSummary() {
     ["Сигналов зафиксировано", summary.observations_total],
     ["Черновиков на проверке", d.pending_review || 0],
     ["Одобрено к отправке", d.approved || 0],
-    ["Задач ИИ-агенту (Мозг)", summary.pending_agent_tasks || 0],
+    ["Задач в очереди агента", pendingTasksCount],
   ]
     .map(
       ([label, val]) => `
@@ -197,7 +265,7 @@ async function loadDrafts() {
   const { items } = await api(`/api/drafts?${qs.toString()}`);
 
   if (!items.length) {
-    $("#draftsList").innerHTML = `<div class="card muted">Черновики пока отсутствуют. Соберите компании на вкладке «2. Конвейер и сбор» и поставьте подготовку черновиков ИИ-агенту рабочей среды.</div>`;
+    $("#draftsList").innerHTML = `<div class="card muted">Черновики пока отсутствуют. Соберите или загрузите компании на вкладке «2. Конвейер и сбор» и запустите подготовку черновиков.</div>`;
     return;
   }
 
@@ -220,7 +288,7 @@ async function loadDrafts() {
               Город: ${esc(r.city || "—")} · Канал: <strong>${esc(r.channel)}</strong> ·
               Балл ICP: <strong>${esc(r.score)}/100</strong> ·
               Сигнал: <span class="badge">${esc(r.signal_used || "—")}</span> ·
-              Мозг: <span class="badge">${esc(r.brain_provider || "agent")}</span>
+              Источник: <span class="badge">${esc(r.brain_provider || "agent")}</span>
             </div>
           </div>
           <div>${statusBadge(r.status)}</div>
@@ -235,32 +303,14 @@ async function loadDrafts() {
           Email: ${esc(r.email || "—")} · Тел.: ${esc(r.prospect_phone || "—")}
         </div>
         <div class="btn-row">
-          <button class="btn btn-sm btn-primary" data-copy="${esc(r.id)}">Скопировать текст</button>
-          <button class="btn btn-sm btn-ok" data-draft-status="${esc(r.id)}:approved">Одобрить</button>
-          <button class="btn btn-sm" data-draft-status="${esc(r.id)}:sent_manually">Отметить отправленным вручную</button>
-          <button class="btn btn-sm btn-danger" data-draft-status="${esc(r.id)}:rejected">Отклонить</button>
+          <button type="button" class="btn btn-sm btn-primary" data-copy-draft="${esc(r.id)}">Скопировать текст</button>
+          <button type="button" class="btn btn-sm btn-ok" data-draft-status="${esc(r.id)}:approved">Одобрить</button>
+          <button type="button" class="btn btn-sm" data-draft-status="${esc(r.id)}:sent_manually">Отметить отправленным</button>
+          <button type="button" class="btn btn-sm btn-danger" data-draft-status="${esc(r.id)}:rejected">Отклонить</button>
         </div>
       </div>`;
     })
     .join("");
-
-  $$("[data-copy]").forEach((b) => {
-    b.addEventListener("click", async () => {
-      const id = b.dataset.copy;
-      const text = $(`#draft-body-${id}`)?.textContent || "";
-      await navigator.clipboard.writeText(text);
-      showToast("Текст скопирован в буфер обмена для ручной отправки 1-на-1");
-    });
-  });
-
-  $$("[data-draft-status]").forEach((b) => {
-    b.addEventListener("click", async () => {
-      const [id, st] = b.dataset.draftStatus.split(":");
-      await api(`/api/drafts/${id}`, { method: "PATCH", body: JSON.stringify({ status: st }) });
-      showToast(`Статус черновика обновлён: ${st}`);
-      await refreshAll();
-    });
-  });
 }
 
 async function loadCompaniesAndProspects() {
@@ -276,95 +326,72 @@ async function loadCompaniesAndProspects() {
   ]);
 
   $("#cntCompanies").textContent = companies.length;
-  $("#tblCompanies tbody").innerHTML = companies
-    .map((c) => {
-      const links = [
-        c.website ? `<a href="${esc(c.website)}" target="_blank" rel="noopener">${esc(c.domain || c.website)}</a>` : "",
-        c.hh_url ? `<a href="${esc(c.hh_url)}" target="_blank" rel="noopener">hh.ru</a>` : "",
-        c.telegram ? `<a href="${esc(c.telegram)}" target="_blank" rel="noopener">TG</a>` : "",
-        c.twogis_url ? `<a href="${esc(c.twogis_url)}" target="_blank" rel="noopener">2ГИС</a>` : "",
-        c.ymaps_url ? `<a href="${esc(c.ymaps_url)}" target="_blank" rel="noopener">Я.Карты</a>` : "",
-      ]
-        .filter(Boolean)
-        .join(" · ");
-      const stack = (c.tech_stack || []).map((t) => `<span class="badge">${esc(t)}</span>`).join("") || "—";
-      const sigs = (c.observations || [])
-        .map((o) => `<span class="badge" title="${esc(o.value_text)}">${esc(o.signal_code)}</span>`)
-        .join("") || "—";
-      return `
-      <tr>
-        <td>
-          <strong>${esc(c.name)}</strong>
-          ${c.inn ? `<div class="muted">ИНН ${esc(c.inn)}</div>` : ""}
-        </td>
-        <td>${esc(c.industry || "—")}</td>
-        <td>${esc(c.city || "—")}</td>
-        <td>${links || "—"}</td>
-        <td>${stack}</td>
-        <td>${sigs}</td>
-      </tr>`;
-    })
-    .join("");
+  $("#tblCompanies tbody").innerHTML = companies.length
+    ? companies
+        .map((c) => {
+          const links = [
+            c.website ? `<a href="${esc(c.website)}" target="_blank" rel="noopener">${esc(c.domain || c.website)}</a>` : "",
+            c.hh_url ? `<a href="${esc(c.hh_url)}" target="_blank" rel="noopener">hh.ru</a>` : "",
+            c.telegram ? `<a href="${esc(c.telegram)}" target="_blank" rel="noopener">TG</a>` : "",
+            c.twogis_url ? `<a href="${esc(c.twogis_url)}" target="_blank" rel="noopener">2ГИС</a>` : "",
+            c.ymaps_url ? `<a href="${esc(c.ymaps_url)}" target="_blank" rel="noopener">Я.Карты</a>` : "",
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          const stack = (c.tech_stack || []).map((t) => `<span class="badge">${esc(t)}</span>`).join("") || "—";
+          const sigs = (c.observations || [])
+            .map((o) => `<span class="badge" title="${esc(o.value_text)}">${esc(o.signal_code)}</span>`)
+            .join("") || "—";
+          return `
+          <tr>
+            <td>
+              <strong>${esc(c.name)}</strong>
+              ${c.inn ? `<div class="muted">ИНН ${esc(c.inn)}</div>` : ""}
+            </td>
+            <td>${esc(c.industry || "—")}</td>
+            <td>${esc(c.city || "—")}</td>
+            <td>${links || "—"}</td>
+            <td>${stack}</td>
+            <td>${sigs}</td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="6" class="muted">Компании пока не добавлены. На вкладке «2. Конвейер и сбор» запустите поиск, импортируйте CSV/JSON или загрузите 2 тестовые карточки.</td></tr>`;
 
   $("#cntProspects").textContent = prospects.length;
-  $("#tblProspects tbody").innerHTML = prospects
-    .map((p) => {
-      const contacts = [
-        p.telegram ? `<a href="${esc(p.telegram)}" target="_blank" rel="noopener">Telegram</a>` : "",
-        p.email ? esc(p.email) : "",
-        p.phone ? esc(p.phone) : "",
-      ]
-        .filter(Boolean)
-        .join(" · ");
-      return `
-      <tr>
-        <td><strong>${esc(p.score)}</strong></td>
-        <td>
-          <strong>${esc(p.full_name)}</strong>
-          <div class="muted">${esc(p.title)}</div>
-        </td>
-        <td>
-          ${esc(p.company)}
-          <div class="muted">${esc(p.industry || "")} · ${esc(p.city || "")}</div>
-        </td>
-        <td>${contacts || "—"}</td>
-        <td>${esc(p.personalization_notes || "—")}</td>
-        <td>
-          <div class="btn-row">
-            <button class="btn btn-sm btn-primary" data-gen-draft="${esc(p.id)}:agent">ИИ-агенту</button>
-            <button class="btn btn-sm" data-gen-draft="${esc(p.id)}:template">Шаблон</button>
-          </div>
-        </td>
-      </tr>`;
-    })
-    .join("");
-
-  $$("[data-gen-draft]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const [pid, mode] = btn.dataset.genDraft.split(":");
-      btn.disabled = true;
-      try {
-        const res = await api("/api/run/draft-single", {
-          method: "POST",
-          body: JSON.stringify({
-            prospect_id: pid,
-            channel: "telegram",
-            template_preview: mode === "template",
-          }),
-        });
-        showToast(
-          res.queued
-            ? `Создана задача ИИ-агенту #${res.task_id} (вкладка «3. ИИ-агент»)`
-            : "Шаблонный черновик создан (вкладка «4. Черновики»)"
-        );
-        await refreshAll();
-      } catch (e) {
-        showToast(`Ошибка: ${e.message}`);
-      } finally {
-        btn.disabled = false;
-      }
-    });
-  });
+  $("#tblProspects tbody").innerHTML = prospects.length
+    ? prospects
+        .map((p) => {
+          const contacts = [
+            p.telegram ? `<a href="${esc(p.telegram)}" target="_blank" rel="noopener">Telegram</a>` : "",
+            p.email ? esc(p.email) : "",
+            p.phone ? esc(p.phone) : "",
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          return `
+          <tr>
+            <td><strong>${esc(p.score)}</strong></td>
+            <td>
+              <strong>${esc(p.full_name)}</strong>
+              <div class="muted">${esc(p.title)}</div>
+            </td>
+            <td>
+              ${esc(p.company)}
+              <div class="muted">${esc(p.industry || "")} · ${esc(p.city || "")}</div>
+            </td>
+            <td>${contacts || "—"}</td>
+            <td>${esc(p.personalization_notes || "—")}</td>
+            <td>
+              <div class="btn-row">
+                <button type="button" class="btn btn-sm btn-primary" data-gen-draft="${esc(p.id)}:agent">В очередь агенту</button>
+                <button type="button" class="btn btn-sm" data-gen-draft="${esc(p.id)}:template">Шаблон сразу</button>
+              </div>
+            </td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="6" class="muted">ЛПР пока не найдены.</td></tr>`;
 }
 
 async function loadSignals() {
@@ -383,28 +410,20 @@ async function loadSignals() {
       <td>${statusBadge(s.status)}</td>
       <td>
         <div class="btn-row">
-          <button class="btn btn-sm btn-ok" data-sig="${esc(s.code)}:confirmed">Подтвердить</button>
-          <button class="btn btn-sm btn-danger" data-sig="${esc(s.code)}:rejected">Отклонить</button>
+          <button type="button" class="btn btn-sm btn-ok" data-sig="${esc(s.code)}:confirmed">Подтвердить</button>
+          <button type="button" class="btn btn-sm btn-danger" data-sig="${esc(s.code)}:rejected">Отклонить</button>
         </div>
       </td>
     </tr>`
     )
     .join("");
-
-  $$("[data-sig]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const [code, status] = btn.dataset.sig.split(":");
-      await api(`/api/signals/${code}`, { method: "PATCH", body: JSON.stringify({ status }) });
-      showToast(`Сигнал ${code} -> ${status}`);
-      await loadSignals();
-    });
-  });
 }
 
 async function loadAgentTasks() {
-  const { items } = await api("/api/agent-tasks?status=pending");
+  const st = $("#fltTaskStatus")?.value || "pending";
+  const { items } = await api(`/api/agent-tasks?status=${encodeURIComponent(st)}`);
   if (!items.length) {
-    $("#agentTasksList").innerHTML = `<div class="card muted">Очередь ожидающих задач ИИ-агента пуста. Создайте задачу обучения на вкладке «1. Ниша и продукт» или поставьте черновики на вкладке «2. Конвейер и сбор».</div>`;
+    $("#agentTasksList").innerHTML = `<div class="card muted">Задач с выбранным статусом нет. Когда вы ставите настройку ниши, глубокий скоринг или подготовку черновиков ИИ-агенту, они появляются здесь и автоматически обрабатываются агентом рабочей среды.</div>`;
     return;
   }
 
@@ -414,56 +433,29 @@ async function loadAgentTasks() {
     <div class="draft-card">
       <div class="draft-head">
         <div>
-          <strong>Задача #${esc(t.id)}</strong> · <code>${esc(t.kind)}</code>
-          <div class="draft-meta">CLI: <code>friday tasks show ${esc(t.id)}</code> → <code>friday tasks apply ${esc(t.id)} '&lt;json&gt;'</code></div>
+          <strong>${esc(t.kind_label || t.kind)}</strong>
+          <span class="badge">#${esc(t.id)}</span>
+          <div class="draft-meta" style="margin-top:4px">
+            Объект: <strong>${esc(t.target || "—")}</strong>
+          </div>
+          <div class="draft-meta">
+            Создана: ${esc(t.created_at || "—")}
+            ${t.completed_at ? ` · Завершена: ${esc(t.completed_at)}` : ""}
+          </div>
         </div>
-        <div>${statusBadge(t.status)}</div>
-      </div>
-      <div class="btn-row" style="margin-bottom:8px">
-        <button class="btn btn-sm" data-copy-prompt="${esc(t.id)}">Скопировать полный промпт задачи</button>
-      </div>
-      <div class="draft-body" id="task-prompt-${esc(t.id)}" style="max-height:200px;overflow:auto">${esc(t.prompt_text)}</div>
-      <div class="form-stack">
-        <textarea rows="3" id="task-resp-${esc(t.id)}" placeholder='Вставьте JSON-ответ ИИ-агента (или попросите агента рабочей среды выполнить friday tasks apply ${esc(t.id)})'></textarea>
-        <div>
-          <button class="btn btn-sm btn-primary" data-complete-task="${esc(t.id)}">Применить JSON-ответ (с проверкой шлюза ФЗ-38)</button>
+        <div class="btn-row" style="align-items:center">
+          ${statusBadge(t.status)}
+          ${t.status === "pending" ? `<button type="button" class="btn btn-sm btn-ghost" data-cancel-task="${esc(t.id)}">Отменить</button>` : ""}
         </div>
       </div>
     </div>`
     )
     .join("");
-
-  $$("[data-copy-prompt]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const tid = btn.dataset.copyPrompt;
-      const txt = $(`#task-prompt-${tid}`)?.textContent || "";
-      await navigator.clipboard.writeText(txt);
-      showToast(`Промпт задачи #${tid} скопирован в буфер обмена`);
-    });
-  });
-
-  $$("[data-complete-task]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const tid = btn.dataset.completeTask;
-      const raw = $(`#task-resp-${tid}`).value.trim();
-      if (!raw) return showToast("Вставьте JSON-ответ");
-      try {
-        await api(`/api/agent-tasks/${tid}/complete`, {
-          method: "POST",
-          body: JSON.stringify({ response_json: raw }),
-        });
-        showToast(`Задача #${tid} успешно применена!`);
-        await refreshAll();
-      } catch (e) {
-        showToast(`Ошибка: ${e.message}`);
-      }
-    });
-  });
 }
 
-async function refreshAll() {
+async function refreshAll(forceFormSync = false) {
   await Promise.all([
-    loadSummary(),
+    loadSummary(forceFormSync),
     loadDrafts(),
     loadCompaniesAndProspects(),
     loadSignals(),
@@ -471,32 +463,215 @@ async function refreshAll() {
   ]);
 }
 
-// ── Привязка событий Шага 1 (Ниша и продукт) ──
+// ── Единое делегирование кликов для всех динамических и навигационных кнопок ──
+
+document.addEventListener("click", async (e) => {
+  const tabBtn = e.target.closest("#mainTabs .tab");
+  if (tabBtn) {
+    switchTab(tabBtn.dataset.tab);
+    return;
+  }
+
+  const presetFillBtn = e.target.closest("[data-preset-fill]");
+  if (presetFillBtn) {
+    const tpl = cachedPresets[Number(presetFillBtn.dataset.presetFill)];
+    if (!tpl) return;
+    fillNicheForm(
+      {
+        persona: tpl.persona,
+        product: tpl.product,
+        icp: tpl.icp,
+        compliance: { regulated_niche: tpl.regulated_niche || "none" },
+      },
+      true
+    );
+    $("#cardNicheForm")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    notify(`Шаблон «${tpl.label}» подставлен в анкету ниже — проверьте поля и нажмите «Сохранить нишу и продукт».`);
+    return;
+  }
+
+  const presetApplyBtn = e.target.closest("[data-preset-apply]");
+  if (presetApplyBtn) {
+    const tpl = cachedPresets[Number(presetApplyBtn.dataset.presetApply)];
+    if (!tpl) return;
+    await withButtonBusy(presetApplyBtn, "Сохранение...", async () => {
+      try {
+        await api("/api/niche/save", {
+          method: "POST",
+          body: JSON.stringify({
+            persona: tpl.persona,
+            product: tpl.product,
+            icp: tpl.icp,
+            compliance: { regulated_niche: tpl.regulated_niche || "none" },
+          }),
+        });
+        await refreshAll(true);
+        notify(`Ниша «${tpl.label}» активирована и сохранена в friday.local.yaml.`);
+      } catch (err) {
+        notify(`Ошибка применения шаблона: ${err.message}`, true);
+      }
+    });
+    return;
+  }
+
+  const copyBtn = e.target.closest("[data-copy-draft]");
+  if (copyBtn) {
+    const id = copyBtn.dataset.copyDraft;
+    const text = $(`#draft-body-${id}`)?.textContent || "";
+    const ok = await safeCopyText(text);
+    if (ok) {
+      const prev = copyBtn.textContent;
+      copyBtn.textContent = "Скопировано ✓";
+      setTimeout(() => { copyBtn.textContent = prev; }, 1800);
+      notify("Текст черновика скопирован в буфер обмена для ручной отправки 1-на-1.");
+    } else {
+      notify("Выделите текст черновика выше и нажмите Ctrl+C / Cmd+C.", true);
+    }
+    return;
+  }
+
+  const draftStBtn = e.target.closest("[data-draft-status]");
+  if (draftStBtn) {
+    const [id, st] = draftStBtn.dataset.draftStatus.split(":");
+    await withButtonBusy(draftStBtn, "...", async () => {
+      try {
+        await api(`/api/drafts/${id}`, { method: "PATCH", body: JSON.stringify({ status: st }) });
+        await refreshAll();
+        notify(`Статус черновика изменён на «${st}».`);
+      } catch (err) {
+        notify(`Ошибка обновления статуса: ${err.message}`, true);
+      }
+    });
+    return;
+  }
+
+  const genDraftBtn = e.target.closest("[data-gen-draft]");
+  if (genDraftBtn) {
+    const [pid, mode] = genDraftBtn.dataset.genDraft.split(":");
+    await withButtonBusy(genDraftBtn, "В работе...", async () => {
+      try {
+        const res = await api("/api/run/draft-single", {
+          method: "POST",
+          body: JSON.stringify({
+            prospect_id: pid,
+            channel: "telegram",
+            template_preview: mode === "template",
+          }),
+        });
+        await refreshAll();
+        if (res.queued) {
+          notify(`Задача подготовки черновика #${res.task_id} передана в очередь ИИ-агента.`);
+          switchTab("agent");
+        } else {
+          notify("Шаблонный черновик создан — открыта вкладка «4. Черновики».");
+          switchTab("drafts");
+        }
+      } catch (err) {
+        notify(`Ошибка создания черновика: ${err.message}`, true);
+      }
+    });
+    return;
+  }
+
+  const sigBtn = e.target.closest("[data-sig]");
+  if (sigBtn) {
+    const [code, status] = sigBtn.dataset.sig.split(":");
+    await withButtonBusy(sigBtn, "...", async () => {
+      try {
+        await api(`/api/signals/${code}`, { method: "PATCH", body: JSON.stringify({ status }) });
+        await loadSignals();
+        notify(`Статус сигнала ${code} изменён на ${status}.`);
+      } catch (err) {
+        notify(`Ошибка обновления сигнала: ${err.message}`, true);
+      }
+    });
+    return;
+  }
+
+  const cancelTaskBtn = e.target.closest("[data-cancel-task]");
+  if (cancelTaskBtn) {
+    const tid = cancelTaskBtn.dataset.cancelTask;
+    await withButtonBusy(cancelTaskBtn, "Отмена...", async () => {
+      try {
+        await api(`/api/agent-tasks/${tid}`, { method: "DELETE" });
+        await refreshAll();
+        notify(`Задача #${tid} отменена.`);
+      } catch (err) {
+        notify(`Ошибка отмены задачи: ${err.message}`, true);
+      }
+    });
+  }
+});
+
+// ── Верхняя панель (Скачать CSV / Markdown / Обновить) ──
+
+$("#btnRefresh").addEventListener("click", (e) =>
+  withButtonBusy(e.currentTarget, "Обновление...", async () => {
+    await refreshAll();
+    notify("Данные панели обновлены.");
+  })
+);
+
+$("#btnExportCsv").addEventListener("click", (e) =>
+  withButtonBusy(e.currentTarget, "Скачивание...", async () => {
+    try {
+      await downloadEndpoint("/api/export/csv", "friday_drafts_ru.csv");
+      notify("Файл friday_drafts_ru.csv скачан.");
+    } catch (err) {
+      notify(`Ошибка скачивания CSV: ${err.message}`, true);
+    }
+  })
+);
+
+$("#btnExportMd").addEventListener("click", (e) =>
+  withButtonBusy(e.currentTarget, "Скачивание...", async () => {
+    try {
+      await downloadEndpoint("/api/export/markdown", "friday_drafts_ru.md");
+      notify("Пакет friday_drafts_ru.md скачан.");
+    } catch (err) {
+      notify(`Ошибка скачивания Markdown: ${err.message}`, true);
+    }
+  })
+);
+
+// ── Шаг 1: Сохранение ниши и отправка на обучение ИИ-агенту ──
 
 $("#formSaveNiche").addEventListener("submit", async (e) => {
   e.preventDefault();
+  const bizName = $("#nsBizName").value.trim();
+  const prodName = $("#nsProdName").value.trim();
+  const prodDesc = $("#nsProdDesc").value.trim();
+  const prodEntry = $("#nsProdEntry").value.trim();
+  const icpNiche = $("#nsIcpNiche").value.trim();
+  const queries = splitLinesOrComma($("#nsIcpQueries").value);
+
+  if (!bizName || !prodName || !icpNiche || queries.length === 0) {
+    notify("Заполните название компании, продукт, целевую нишу (ICP) и хотя бы 1 поисковый запрос.", true);
+    return;
+  }
+
   const payload = {
     persona: {
-      company: $("#nsBizName").value.trim(),
+      company: bizName,
       website: $("#nsBizWebsite").value.trim(),
-      name: $("#nsSenderName").value.trim(),
-      role: $("#nsSenderTitle").value.trim(),
+      name: $("#nsSenderName").value.trim() || "Руководитель направления",
+      role: $("#nsSenderTitle").value.trim() || "Руководитель проектов",
       telegram: $("#nsSenderTg").value.trim(),
     },
     product: {
-      name: $("#nsProdName").value.trim(),
-      description: $("#nsProdDesc").value.trim(),
+      name: prodName,
+      description: prodDesc || prodName,
       key_benefits: splitLinesOrComma($("#nsProdBenefits").value),
       pricing: $("#nsProdPricing").value.trim(),
       offer: {
-        entry: $("#nsProdEntry").value.trim(),
+        entry: prodEntry || "прислать короткий разбор из 3 пунктов",
         goal: "send_audit",
       },
     },
     icp: {
-      niche: $("#nsIcpNiche").value.trim(),
+      niche: icpNiche,
       industries: splitComma($("#nsIcpIndustries").value),
-      search_queries: splitLinesOrComma($("#nsIcpQueries").value),
+      search_queries: queries,
       cities: splitComma($("#nsIcpCities").value),
       decision_maker_titles: splitComma($("#nsIcpTitles").value),
       hiring_signals: splitComma($("#nsIcpHiring").value),
@@ -505,139 +680,231 @@ $("#formSaveNiche").addEventListener("submit", async (e) => {
       regulated_niche: $("#nsRegulated").value,
     },
   };
-  try {
-    await api("/api/niche/save", { method: "POST", body: JSON.stringify(payload) });
-    showToast("Ниша и продукт сохранены в friday.local.yaml и skills/product_knowledge.md!");
-    await refreshAll();
-  } catch (err) {
-    showToast(`Ошибка сохранения: ${err.message}`);
-  }
+
+  await withButtonBusy($("#btnSubmitSaveNiche"), "Сохранение...", async () => {
+    try {
+      await api("/api/niche/save", { method: "POST", body: JSON.stringify(payload) });
+      await refreshAll(true);
+      notify(`Ниша «${icpNiche}» и продукт сохранены в friday.local.yaml и skills/product_knowledge.md.`);
+    } catch (err) {
+      notify(`Ошибка сохранения: ${err.message}`, true);
+    }
+  });
 });
 
 $("#formTrainAgent").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const payload = {
-    website: $("#trWebsite").value.trim(),
-    niche_hint: $("#trNiche").value.trim(),
-    brief: $("#trBrief").value.trim(),
-    cities: splitComma($("#trCities").value),
-  };
-  try {
-    const res = await api("/api/niche/train", { method: "POST", body: JSON.stringify(payload) });
-    showToast(`Создана задача обучения #${res.task_id} (скачано страниц: ${res.pages_crawled})`);
-    await refreshAll();
-    switchTab("agent");
-  } catch (err) {
-    showToast(`Ошибка: ${err.message}`);
+  const website = $("#trWebsite").value.trim();
+  const nicheHint = $("#trNiche").value.trim();
+  const brief = $("#trBrief").value.trim();
+  if (!website && !nicheHint && !brief) {
+    notify("Укажите сайт продукта или краткое описание ниши и вашего продукта.", true);
+    return;
   }
+
+  await withButtonBusy($("#btnSubmitTrain"), "Постановка задачи...", async () => {
+    try {
+      const res = await api("/api/niche/train", {
+        method: "POST",
+        body: JSON.stringify({
+          website,
+          niche_hint: nicheHint,
+          brief,
+          cities: splitComma($("#trCities").value),
+        }),
+      });
+      await refreshAll();
+      switchTab("agent");
+      notify(`Задача настройки ниши #${res.task_id} поставлена в очередь ИИ-агента — напишите в чат «Выполни задачу F.R.I.D.A.Y.», и агент сразу применит настройки.`);
+    } catch (err) {
+      notify(`Ошибка постановки задачи: ${err.message}`, true);
+    }
+  });
 });
 
-// ── Привязка кнопок Конвейера и Сбора ──
+// ── Фильтры и кнопки Конвейера (вкладка 2) ──
 
-$("#btnRefresh").addEventListener("click", refreshAll);
 $("#fltDraftStatus").addEventListener("change", loadDrafts);
 $("#fltDraftChannel").addEventListener("change", loadDrafts);
+$("#fltTaskStatus").addEventListener("change", loadAgentTasks);
 
-$("#btnApplyCohort").addEventListener("click", loadCompaniesAndProspects);
+$("#btnApplyCohort").addEventListener("click", (e) =>
+  withButtonBusy(e.currentTarget, "Фильтрация...", async () => {
+    await loadCompaniesAndProspects();
+    notify("Фильтр когорты применён.");
+  })
+);
 $("#btnResetCohort").addEventListener("click", () => {
   $("#inpCohortRequire").value = "";
   $("#inpCohortExclude").value = "";
   loadCompaniesAndProspects();
+  notify("Фильтр когорты сброшен.");
 });
 
-$("#btnCopyAgentInstruction").addEventListener("click", async () => {
-  const cmd = "Посмотри ожидающие задачи F.R.I.D.A.Y. через `.venv/bin/friday tasks next`, выполни каждую строго по JSON-контракту и примени ответы через `.venv/bin/friday tasks apply <task_id> '<json>'`.";
-  await navigator.clipboard.writeText(cmd);
-  showToast("Инструкция для ИИ-агента рабочей среды скопирована в буфер обмена!");
-});
-
-async function runStage(btn, fn, label) {
-  btn.disabled = true;
-  try {
-    const res = await fn();
-    showToast(`${label}: ${JSON.stringify(res)}`);
-    await refreshAll();
-  } catch (e) {
-    showToast(`Ошибка: ${e.message}`);
-  } finally {
-    btn.disabled = false;
-  }
-}
+$("#btnSeedSample").addEventListener("click", (e) =>
+  withButtonBusy(e.currentTarget, "Загрузка...", async () => {
+    try {
+      const res = await api("/api/run/sample", { method: "POST" });
+      await refreshAll();
+      notify(`Добавлено компаний: ${res.inserted_companies}, ЛПР: ${res.inserted_prospects}, сигналов: ${res.recorded_observations}.`);
+    } catch (err) {
+      notify(`Ошибка загрузки тестовых карточек: ${err.message}`, true);
+    }
+  })
+);
 
 $("#btnRunProfile").addEventListener("click", (e) =>
-  runStage(e.currentTarget, () => api("/api/run/profile", { method: "POST" }), "Профилирование сайтов")
+  withButtonBusy(e.currentTarget, "Проверка сайтов...", async () => {
+    try {
+      const res = await api("/api/run/profile", { method: "POST" });
+      await refreshAll();
+      if (!res.checked) {
+        notify("Нет непроверенных сайтов в базе — сначала найдите компании, загрузите CSV или добавьте 2 тестовые карточки.");
+      } else {
+        notify(`Проверено сайтов: ${res.checked} (успешно: ${res.ok}, новых сигналов: ${res.observations}).`);
+      }
+    } catch (err) {
+      notify(`Ошибка профилирования: ${err.message}`, true);
+    }
+  })
 );
+
 $("#btnRunProspects").addEventListener("click", (e) =>
-  runStage(e.currentTarget, () => api("/api/run/prospects", { method: "POST" }), "Поиск ЛПР")
+  withButtonBusy(e.currentTarget, "Поиск ЛПР...", async () => {
+    try {
+      const res = await api("/api/run/prospects", { method: "POST" });
+      await refreshAll();
+      if (!res.companies_scanned) {
+        notify("Нет новых компаний для обхода страниц руководства.");
+      } else {
+        notify(`Проверено компаний: ${res.companies_scanned}, найдено новых ЛПР: ${res.prospects_created}.`);
+      }
+    } catch (err) {
+      notify(`Ошибка поиска ЛПР: ${err.message}`, true);
+    }
+  })
 );
+
 $("#btnRunScore").addEventListener("click", (e) =>
-  runStage(e.currentTarget, () => api("/api/run/score", { method: "POST" }), "Скоринг ICP")
+  withButtonBusy(e.currentTarget, "Расчёт баллов...", async () => {
+    try {
+      const res = await api("/api/run/score", { method: "POST" });
+      await refreshAll();
+      if (!res.scored) {
+        notify("В базе пока нет ЛПР для скоринга — сначала добавьте компании или 2 тестовые карточки.");
+      } else {
+        notify(`Рассчитан балл соответствия ICP для ${res.scored} ЛПР.`);
+      }
+    } catch (err) {
+      notify(`Ошибка скоринга: ${err.message}`, true);
+    }
+  })
 );
+
 $("#btnRunScoreAi").addEventListener("click", (e) =>
-  runStage(e.currentTarget, () => api("/api/run/score?use_ai=true", { method: "POST" }), "Очередь скоринга ИИ-агенту")
+  withButtonBusy(e.currentTarget, "Постановка...", async () => {
+    try {
+      const res = await api("/api/run/score?use_ai=true", { method: "POST" });
+      await refreshAll();
+      if (!res.queued_agent_tasks) {
+        notify("В базе пока нет ЛПР для постановки задач скоринга.");
+      } else {
+        switchTab("agent");
+        notify(`В очередь ИИ-агента поставлено задач скоринга: ${res.queued_agent_tasks}.`);
+      }
+    } catch (err) {
+      notify(`Ошибка: ${err.message}`, true);
+    }
+  })
 );
-$("#btnQueueDraftsTg").addEventListener("click", (e) =>
-  runStage(
-    e.currentTarget,
-    () => api("/api/run/drafts", { method: "POST", body: JSON.stringify({ channel: "telegram", template_preview: false }) }),
-    "Постановка черновиков Telegram ИИ-агенту"
-  )
-);
-$("#btnQueueDraftsEmail").addEventListener("click", (e) =>
-  runStage(
-    e.currentTarget,
-    () => api("/api/run/drafts", { method: "POST", body: JSON.stringify({ channel: "email", template_preview: false }) }),
-    "Постановка черновиков Email ИИ-агенту"
-  )
-);
-$("#btnPreviewTemplateTg").addEventListener("click", (e) =>
-  runStage(
-    e.currentTarget,
-    () => api("/api/run/drafts", { method: "POST", body: JSON.stringify({ channel: "telegram", template_preview: true }) }),
-    "Шаблонный предпросмотр Telegram"
-  )
-);
-$("#btnSeedSample").addEventListener("click", (e) =>
-  runStage(
-    e.currentTarget,
-    () => api("/api/run/sample", { method: "POST" }),
-    "Тестовые карточки под текущую нишу"
-  )
-);
+
+async function triggerBatchDrafts(btn, channel, templatePreview) {
+  await withButtonBusy(btn, "Подготовка...", async () => {
+    try {
+      const res = await api("/api/run/drafts", {
+        method: "POST",
+        body: JSON.stringify({ channel, template_preview: templatePreview }),
+      });
+      await refreshAll();
+      if (!res.processed) {
+        notify("Нет подходящих ЛПР с баллом выше порога ICP — сначала добавьте компании и запустите скоринг.");
+      } else if (templatePreview) {
+        switchTab("drafts");
+        notify(`Создано шаблонных черновиков (${channel}): ${res.drafts_ready} (заблокировано ФЗ-38: ${res.gate_blocked}).`);
+      } else {
+        switchTab("agent");
+        notify(`В очередь ИИ-агента передано задач на черновики (${channel}): ${res.queued_agent_tasks}.`);
+      }
+    } catch (err) {
+      notify(`Ошибка подготовки черновиков: ${err.message}`, true);
+    }
+  });
+}
+
+$("#btnQueueDraftsTg").addEventListener("click", (e) => triggerBatchDrafts(e.currentTarget, "telegram", false));
+$("#btnQueueDraftsEmail").addEventListener("click", (e) => triggerBatchDrafts(e.currentTarget, "email", false));
+$("#btnPreviewTemplateTg").addEventListener("click", (e) => triggerBatchDrafts(e.currentTarget, "telegram", true));
 
 $("#formDiscover").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const payload = {
-    query: $("#inpQuery").value.trim(),
-    city: $("#inpCity").value.trim(),
-    provider: $("#selProvider").value,
-    limit: Number($("#inpLimit").value || 15),
-  };
-  showToast("Запущен поиск компаний в РФ...");
-  try {
-    const res = await api("/api/run/discover", { method: "POST", body: JSON.stringify(payload) });
-    showToast(`Найдено новых компаний: ${res.inserted_companies} (источники: ${(res.providers_used || []).join(", ") || "—"})`);
-    await refreshAll();
-  } catch (err) {
-    showToast(`Ошибка поиска: ${err.message}`);
+  const q = $("#inpQuery").value.trim();
+  const c = $("#inpCity").value.trim();
+  if (!q) {
+    notify("Введите поисковый запрос или сначала сохраните нишу на вкладке «1. Ниша и продукт».", true);
+    return;
   }
+  await withButtonBusy($("#btnSubmitDiscover"), "Поиск...", async () => {
+    try {
+      const res = await api("/api/run/discover", {
+        method: "POST",
+        body: JSON.stringify({
+          query: q,
+          city: c || "Москва",
+          provider: $("#selProvider").value,
+          limit: Number($("#inpLimit").value || 15),
+        }),
+      });
+      await refreshAll();
+      if (!res.inserted_companies && !res.updated_companies) {
+        notify(
+          "Внешний поиск вернул 0 карточек (в облачном контейнере доступ к внешним сайтам ограничен — используйте импорт CSV/JSON/TXT или кнопку «Загрузить 2 тестовые карточки»)."
+        );
+      } else {
+        notify(`Поиск завершён: новых компаний +${res.inserted_companies}, обновлено ${res.updated_companies}.`);
+      }
+    } catch (err) {
+      notify(`Ошибка поиска: ${err.message}`, true);
+    }
+  });
 });
 
 $("#formUpload").addEventListener("submit", async (e) => {
   e.preventDefault();
   const fileEl = $("#inpFile");
-  if (!fileEl.files || !fileEl.files[0]) return showToast("Выберите файл");
+  if (!fileEl.files || !fileEl.files[0]) {
+    notify("Сначала выберите файл .csv, .json или .txt для импорта.", true);
+    return;
+  }
   const fd = new FormData();
   fd.append("file", fileEl.files[0]);
   fd.append("city", $("#inpCity").value.trim());
-  try {
-    const res = await api("/api/import/upload", { method: "POST", body: fd });
-    showToast(`Импортировано из ${res.filename}: +${res.inserted_companies} компаний, +${res.inserted_prospects} ЛПР`);
-    fileEl.value = "";
-    await refreshAll();
-  } catch (err) {
-    showToast(`Ошибка импорта: ${err.message}`);
-  }
+  await withButtonBusy($("#btnSubmitUpload"), "Импорт...", async () => {
+    try {
+      const res = await api("/api/import/upload", { method: "POST", body: fd });
+      fileEl.value = "";
+      await refreshAll();
+      notify(`Импортировано из ${res.filename}: +${res.inserted_companies} компаний, +${res.inserted_prospects} ЛПР.`);
+    } catch (err) {
+      notify(`Ошибка импорта: ${err.message}`, true);
+    }
+  });
 });
 
-Promise.all([loadPresets(), refreshAll()]).catch((e) => showToast(`Ошибка загрузки: ${e.message}`));
+// Фоновое автообновление очереди (раз в 4 сек, когда есть ожидающие задачи ИИ-агента)
+setInterval(() => {
+  if (pendingTasksCount > 0 && !document.hidden) {
+    Promise.all([loadSummary(false), loadAgentTasks(), loadDrafts()]).catch(() => {});
+  }
+}, 4000);
+
+Promise.all([loadPresets(), refreshAll(true)]).catch((e) => notify(`Ошибка загрузки: ${e.message}`, true));

@@ -12,31 +12,32 @@
       <div class="logo">F.R.I.D.A.Y.</div>
       <div>
         <div class="subtitle">Универсальная B2B-разведка и персонализированные черновики для рынка РФ</div>
-        <div class="compliance-pill" id="headerBadges">
+        <div class="compliance-pill unconfigured" id="headerBadges">
           <span class="dot"></span>
           <span id="nicheBadgeText">Шаг 1: настройте нишу и продукт</span>
-          · Вариант А: ИИ-агент рабочей среды как Мозг · ФЗ-38 ст. 18 (без автоотправки)
+          · ИИ-агент рабочей среды как Мозг · ФЗ-38 ст. 18 (без автоотправки)
         </div>
       </div>
     </div>
     <div class="top-actions">
-      <a class="btn btn-ghost" href="/api/export/csv" target="_blank" rel="noopener">Экспорт CSV</a>
-      <a class="btn btn-ghost" href="/api/export/markdown" target="_blank" rel="noopener">Пакет Markdown</a>
-      <button class="btn btn-primary" id="btnRefresh">Обновить</button>
+      <button type="button" class="btn btn-ghost" id="btnExportCsv">Скачать CSV</button>
+      <button type="button" class="btn btn-ghost" id="btnExportMd">Скачать Markdown</button>
+      <button type="button" class="btn btn-primary" id="btnRefresh">Обновить</button>
     </div>
   </header>
 
   <nav class="tabs" id="mainTabs">
-    <button class="tab active" data-tab="niche">1. Ниша и продукт</button>
-    <button class="tab" data-tab="overview">2. Конвейер и сбор</button>
-    <button class="tab" data-tab="agent">3. ИИ-агент (Мозг) <span class="badge-cnt" id="tabAgentCnt">0</span></button>
-    <button class="tab" data-tab="drafts">4. Черновики <span class="badge-cnt" id="tabDraftsCnt">0</span></button>
-    <button class="tab" data-tab="companies">5. Компании и ЛПР</button>
-    <button class="tab" data-tab="signals">6. Сигналы РФ (28)</button>
+    <button type="button" class="tab active" data-tab="niche">1. Ниша и продукт</button>
+    <button type="button" class="tab" data-tab="overview">2. Конвейер и сбор</button>
+    <button type="button" class="tab" data-tab="agent">3. Очередь ИИ-агента <span class="badge-cnt" id="tabAgentCnt">0</span></button>
+    <button type="button" class="tab" data-tab="drafts">4. Черновики <span class="badge-cnt" id="tabDraftsCnt">0</span></button>
+    <button type="button" class="tab" data-tab="companies">5. Компании и ЛПР</button>
+    <button type="button" class="tab" data-tab="signals">6. Сигналы РФ (28)</button>
   </nav>
 
   <main class="container">
     <div id="toast" class="toast hidden"></div>
+    <div id="statusBar" class="status-bar hidden"></div>
 
     <!-- 1. НИША И ПРОДУКТ (ШАГ 1) -->
     <section class="panel active" id="tab-niche">
@@ -44,7 +45,7 @@
         <div>
           <strong id="nicheCalloutTitle">Шаг 1. Обучите F.R.I.D.A.Y. вашему продукту и целевой нише</strong>
           <p id="nicheCalloutDesc">
-            Система универсальна для любой сферы бизнеса в РФ. Задайте ваш продукт и портрет клиента (ICP) через ИИ-агента по ссылке на сайт, выберите готовый шаблон для примера или заполните анкету ниже — настройки сохранятся в <code>friday.local.yaml</code> и <code>skills/product_knowledge.md</code>.
+            Система универсальна для любой сферы бизнеса в РФ. Отправьте сайт/бриф на разбор ИИ-агенту рабочей среды, примените готовый шаблон для примера или заполните анкету ниже — настройки сохранятся в <code>friday.local.yaml</code> и <code>skills/product_knowledge.md</code>.
           </p>
         </div>
       </div>
@@ -53,10 +54,10 @@
         <div class="card">
           <h2>Вариант 1А. Обучить через ИИ-агента по сайту или брифу</h2>
           <p class="muted">
-            Python безопасно скачает страницы вашего сайта ($0, SSRF-safe) и сформирует задачу <code>train_niche</code> для ИИ-агента вашей рабочей среды (Arena.ai, Cursor, Windsurf, Claude Code).
+            Система скачает доступные страницы вашего сайта ($0, SSRF-safe) и передаст задачу настройки ниши ИИ-агенту вашей рабочей среды — он сам заполнит профиль продукта, ICP и поисковые запросы.
           </p>
-          <form id="formTrainAgent" class="form-stack">
-            <label>Сайт вашего продукта / компании (необязательно, если есть бриф)
+          <form id="formTrainAgent" class="form-stack" novalidate>
+            <label>Сайт вашего продукта / компании (необязательно, если есть описание)
               <input type="text" id="trWebsite" placeholder="https://ваш-продукт.рф" />
             </label>
             <label>Кому вы продаёте в РФ (целевая ниша)
@@ -68,46 +69,48 @@
             <label>Целевые города РФ (через запятую)
               <input type="text" id="trCities" value="Москва, Санкт-Петербург, Екатеринбург, Казань" />
             </label>
-            <button type="submit" class="btn btn-primary">Создать задачу обучения для ИИ-агента</button>
+            <div>
+              <button type="submit" class="btn btn-primary" id="btnSubmitTrain">Отправить на настройку ИИ-агенту</button>
+            </div>
           </form>
         </div>
 
         <div class="card">
-          <h2>Быстрая подстановка шаблона ниши (для примера)</h2>
+          <h2>Готовые примеры ниш РФ (1 клик)</h2>
           <p class="muted">
-            Нажмите на любой пример ниже, чтобы заполнить анкету справа готовыми настройками под одну из популярных B2B-ниш РФ (вы сможете отредактировать любое поле перед сохранением):
+            Можно сразу применить любой шаблон ниже для проверки конвейера или подставить его в анкету для редактирования под себя:
           </p>
           <div id="presetList" class="preset-list"></div>
         </div>
       </div>
 
-      <div class="card">
-        <h2>Прямая настройка продукта, целевой ниши (ICP) и правил ФЗ-38</h2>
-        <form id="formSaveNiche" class="form-stack">
+      <div class="card" id="cardNicheForm">
+        <h2>Прямая анкета продукта, целевой ниши (ICP) и правил ФЗ-38</h2>
+        <form id="formSaveNiche" class="form-stack" novalidate>
           <div class="grid-3">
-            <label>Название вашей компании
-              <input type="text" id="nsBizName" required placeholder="ООО «Вектор»" />
+            <label>Название вашей компании *
+              <input type="text" id="nsBizName" placeholder="ООО «Вектор»" />
             </label>
             <label>Сайт вашего продукта
               <input type="text" id="nsBizWebsite" placeholder="https://example.ru" />
             </label>
-            <label>Название продукта / услуги
-              <input type="text" id="nsProdName" required placeholder="Внедрение CRM / Логистика / Поставки..." />
+            <label>Название продукта / услуги *
+              <input type="text" id="nsProdName" placeholder="Внедрение CRM / Логистика / Поставки..." />
             </label>
           </div>
 
           <div class="grid-2">
-            <label>Описание продукта и какую задачу он решает (1–2 конкретных предложения)
-              <textarea id="nsProdDesc" rows="2" required></textarea>
+            <label>Описание продукта и какую задачу он решает *
+              <textarea id="nsProdDesc" rows="2" placeholder="Настраиваем связку сайта, телефонии и CRM за 14 дней..."></textarea>
             </label>
             <label>Ключевые выгоды (по одной на строке)
-              <textarea id="nsProdBenefits" rows="2" placeholder="Фиксация 100% звонков и мессенджеров в CRM&#10;Запуск за 14 дней"></textarea>
+              <textarea id="nsProdBenefits" rows="2" placeholder="Фиксация всех звонков и мессенджеров в CRM&#10;Запуск за 14 дней"></textarea>
             </label>
           </div>
 
           <div class="grid-3">
-            <label>Мягкий первый шаг (Entry Offer в конце письма)
-              <input type="text" id="nsProdEntry" required placeholder="прислать короткий разбор из 3 пунктов в чат" />
+            <label>Мягкий первый шаг (Entry Offer в конце письма) *
+              <input type="text" id="nsProdEntry" placeholder="прислать короткий разбор из 3 пунктов в чат" />
             </label>
             <label>Ценовая модель / условия (необязательно)
               <input type="text" id="nsProdPricing" placeholder="от 50 000 ₽ или расчёт под проект" />
@@ -125,8 +128,8 @@
           <hr class="sep" />
 
           <div class="grid-2">
-            <label>Описание целевой ниши (ICP)
-              <input type="text" id="nsIcpNiche" required placeholder="Оптовые и производственные компании РФ..." />
+            <label>Описание целевой ниши (ICP) *
+              <input type="text" id="nsIcpNiche" placeholder="Оптовые и производственные компании РФ..." />
             </label>
             <label>Отрасли клиентов (через запятую)
               <input type="text" id="nsIcpIndustries" placeholder="Производство, Оптовая торговля, Логистика" />
@@ -134,11 +137,11 @@
           </div>
 
           <div class="grid-2">
-            <label>Поисковые запросы для Яндекса / 2ГИС / hh.ru (по одному на строке)
-              <textarea id="nsIcpQueries" rows="3" required placeholder="производство металлоконструкций&#10;оптовый поставщик стройматериалов"></textarea>
+            <label>Поисковые запросы для Яндекса / 2ГИС / hh.ru (по одному на строке) *
+              <textarea id="nsIcpQueries" rows="3" placeholder="производство металлоконструкций&#10;оптовый поставщик стройматериалов"></textarea>
             </label>
             <label>Города РФ (через запятую)
-              <textarea id="nsIcpCities" rows="3" required placeholder="Москва, Санкт-Петербург, Екатеринбург, Казань"></textarea>
+              <textarea id="nsIcpCities" rows="3" placeholder="Москва, Санкт-Петербург, Екатеринбург, Казань"></textarea>
             </label>
           </div>
 
@@ -146,7 +149,7 @@
             <label>Целевые должности ЛПР на сайтах (через запятую)
               <input type="text" id="nsIcpTitles" placeholder="коммерческий директор, руководитель отдела продаж, генеральный директор, основатель" />
             </label>
-            <label>Сигнальные вакансии на hh.ru (через запятую — бесплатный поиск по найму!)
+            <label>Сигнальные вакансии на hh.ru (через запятую — бесплатный поиск по найму)
               <input type="text" id="nsIcpHiring" placeholder="менеджер по продажам, руководитель отдела продаж, закупщик" />
             </label>
           </div>
@@ -166,14 +169,14 @@
           </div>
 
           <div class="btn-row">
-            <button type="submit" class="btn btn-primary">Сохранить нишу и продукт (friday.local.yaml)</button>
+            <button type="submit" class="btn btn-primary" id="btnSubmitSaveNiche">Сохранить нишу и продукт (friday.local.yaml)</button>
           </div>
         </form>
       </div>
 
       <div class="card">
         <h2>Активная база знаний продукта (<code>skills/product_knowledge.md</code>)</h2>
-        <pre id="productSkillPreview" class="code-preview">Пока не создана — сохраните настройки ниши выше или запустите обучение через ИИ-агента.</pre>
+        <pre id="productSkillPreview" class="code-preview">Пока не создана — сохраните настройки ниши выше или отправьте сайт/бриф ИИ-агенту.</pre>
       </div>
     </section>
 
@@ -183,30 +186,30 @@
 
       <div class="grid-2">
         <div class="card">
-          <h2>Этапы конвейера ($0 сбор + Мозг Вариант А)</h2>
+          <h2>Этапы конвейера ($0 сбор + Мозг ИИ-агента)</h2>
           <p class="muted">
-            Каждый этап работает независимо через общую SQLite (WAL). Автоматической рассылки нет — система только исследует рынок и готовит проверенные черновики.
+            Каждый этап работает независимо через общую SQLite (WAL). Автоматической рассылки нет — система исследует рынок и готовит проверенные черновики.
           </p>
           <div class="btn-row">
-            <button class="btn" id="btnRunProfile">1. Профилировать сайты ($0)</button>
-            <button class="btn" id="btnRunProspects">2. Найти ЛПР и ФИО ($0)</button>
-            <button class="btn" id="btnRunScore">3. Скоринг ICP</button>
-            <button class="btn btn-accent" id="btnRunScoreAi">3+. Глубокий скоринг (ИИ-агенту)</button>
+            <button type="button" class="btn" id="btnRunProfile">1. Профилировать сайты ($0)</button>
+            <button type="button" class="btn" id="btnRunProspects">2. Найти ЛПР и ФИО ($0)</button>
+            <button type="button" class="btn" id="btnRunScore">3. Скоринг ICP</button>
+            <button type="button" class="btn btn-accent" id="btnRunScoreAi">3+. Углублённый скоринг (ИИ-агенту)</button>
           </div>
           <div class="btn-row" style="margin-top:10px">
-            <button class="btn btn-primary" id="btnQueueDraftsTg">4. Поставить черновики Telegram ИИ-агенту</button>
-            <button class="btn btn-primary" id="btnQueueDraftsEmail">4. Поставить черновики Email ИИ-агенту</button>
-            <button class="btn btn-ghost" id="btnPreviewTemplateTg">Быстрый шаблон-предпросмотр (без ожидания)</button>
+            <button type="button" class="btn btn-primary" id="btnQueueDraftsTg">4. Черновики Telegram (ИИ-агенту)</button>
+            <button type="button" class="btn btn-primary" id="btnQueueDraftsEmail">4. Черновики Email (ИИ-агенту)</button>
+            <button type="button" class="btn btn-ghost" id="btnPreviewTemplateTg">Быстрый шаблон-предпросмотр</button>
           </div>
           <hr class="sep" />
           <div class="btn-row">
-            <button class="btn btn-ghost" id="btnSeedSample">Загрузить 2 тестовые карточки под выбранную нишу</button>
+            <button type="button" class="btn btn-ok" id="btnSeedSample">Загрузить 2 тестовые карточки под выбранную нишу</button>
           </div>
         </div>
 
         <div class="card">
           <h2>Поиск компаний в РФ или импорт файла</h2>
-          <form id="formDiscover" class="form-stack">
+          <form id="formDiscover" class="form-stack" novalidate>
             <div class="grid-2">
               <label>Поисковый запрос (из ниши или свой)
                 <input type="text" id="inpQuery" placeholder="Например: производство упаковки" />
@@ -219,7 +222,7 @@
               <label>Источник обнаружения
                 <select id="selProvider">
                   <option value="auto">Авто (Яндекс/2ГИС + hh.ru + веб Рунета)</option>
-                  <option value="hh_ru">HeadHunter (api.hh.ru — бесплатно по вакансиям!)</option>
+                  <option value="hh_ru">HeadHunter (api.hh.ru — бесплатно по вакансиям)</option>
                   <option value="ddg_ru">Веб-поиск Рунета (бесплатно, без агрегаторов)</option>
                   <option value="osm_ru">OpenStreetMap Организации РФ (бесплатно)</option>
                   <option value="yandex_search">Яндекс Поиск v2 (позиции 11–30, нужен ключ)</option>
@@ -231,14 +234,16 @@
                 <input type="number" id="inpLimit" value="15" min="1" max="50" />
               </label>
             </div>
-            <button type="submit" class="btn btn-primary">Найти компании ($0)</button>
+            <div>
+              <button type="submit" class="btn btn-primary" id="btnSubmitDiscover">Найти компании ($0)</button>
+            </div>
           </form>
 
           <hr class="sep" />
 
-          <form id="formUpload" class="form-inline">
-            <input type="file" id="inpFile" accept=".csv,.json,.jsonl,.txt" required />
-            <button type="submit" class="btn">Импортировать CSV / JSON / TXT</button>
+          <form id="formUpload" class="form-inline" novalidate>
+            <input type="file" id="inpFile" accept=".csv,.json,.jsonl,.txt" />
+            <button type="submit" class="btn" id="btnSubmitUpload">Импортировать CSV / JSON / TXT</button>
           </form>
           <p class="muted" style="margin-top:6px;margin-bottom:0">
             Поддерживаются выгрузки Контур.Компас, СБИС, 2ГИС, Rusprofile или текстовый список доменов <code>.ru</code> / <code>.рф</code>.
@@ -247,19 +252,23 @@
       </div>
     </section>
 
-    <!-- 3. ИИ-АГЕНТ (МОЗГ — ВАРИАНТ А) -->
+    <!-- 3. ОЧЕРЕДЬ ЗАДАЧ ИИ-АГЕНТА -->
     <section class="panel" id="tab-agent">
       <div class="card">
-        <h2>Мозг F.R.I.D.A.Y. — Вариант А: ИИ-агент рабочей среды</h2>
-        <p class="muted">
-          F.R.I.D.A.Y. не требует платных ключей OpenAI/Anthropic или внешнего CLI. Все интеллектуальные задачи
-          (<code>train_niche</code>, <code>scout_score</code>, <code>writer_draft</code>) сохраняются в <code>data/agent_tasks/</code> и SQLite.
-          Просто попросите ИИ-агента вашей рабочей среды (Arena.ai Agent Mode, Cursor, Windsurf, Claude Code):
-          <strong>«Выполни ожидающие задачи F.R.I.D.A.Y. через <code>friday tasks next</code> и <code>friday tasks apply</code>»</strong> —
-          либо вставьте JSON-ответ вручную ниже. Каждый черновик при применении автоматически проверяется шлюзом ФЗ-38 (<code>gate.py</code>).
-        </p>
-        <div class="btn-row">
-          <button class="btn btn-ghost" id="btnCopyAgentInstruction">Скопировать команду для ИИ-агента в чате</button>
+        <div class="toolbar" style="margin-bottom:0">
+          <div>
+            <h2>Очередь задач ИИ-агента рабочей среды</h2>
+            <p class="muted" style="margin-bottom:0">
+              Ручное копирование промптов и вставка JSON не требуются: ИИ-агент вашей рабочей среды сам забирает задачи из очереди, выполняет настройку ниши, скоринг или подготовку черновиков (с автоматической проверкой шлюза ФЗ-38), а панель обновляет статус автоматически.
+            </p>
+          </div>
+          <div class="filters">
+            <select id="fltTaskStatus">
+              <option value="pending">Ожидают агента</option>
+              <option value="completed">Выполненные</option>
+              <option value="all">Все задачи</option>
+            </select>
+          </div>
         </div>
       </div>
 
@@ -297,8 +306,8 @@
         <div class="form-inline">
           <input type="text" id="inpCohortRequire" placeholder="Обязательные коды (напр. HH_HIRING_ROLE,NO_ONLINE_CAPTURE)" />
           <input type="text" id="inpCohortExclude" placeholder="Исключить коды (напр. SITE_UNREACHABLE)" />
-          <button class="btn btn-primary" id="btnApplyCohort">Применить фильтр</button>
-          <button class="btn btn-ghost" id="btnResetCohort">Сбросить</button>
+          <button type="button" class="btn btn-primary" id="btnApplyCohort">Применить фильтр</button>
+          <button type="button" class="btn btn-ghost" id="btnResetCohort">Сбросить</button>
         </div>
       </div>
 

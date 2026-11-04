@@ -1051,6 +1051,19 @@ class StateManager:
             await db.commit()
             return cur.rowcount > 0
 
+    async def cancel_agent_task(self, task_id: str) -> bool:
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                UPDATE agent_tasks
+                SET status = 'cancelled', completed_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (_utcnow_str(), task_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
     async def get_state_summary(self) -> dict:
         async with self._connect() as db:
             async with db.execute("SELECT COUNT(*) AS cnt FROM companies") as cur:

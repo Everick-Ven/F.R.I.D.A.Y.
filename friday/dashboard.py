@@ -348,7 +348,46 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/api/agent-tasks")
     async def api_agent_tasks(status: str = "pending"):
-        return {"items": await state.list_agent_tasks(status=status)}
+        raw_items = await state.list_agent_tasks(status=status)
+        kind_labels = {
+            "train_niche": "Обучение нише и продукту (Шаг 1)",
+            "scout_score": "Квалификация и скоринг ЛПР",
+            "writer_draft": "Подготовка персонального черновика",
+        }
+        enriched = []
+        for item in raw_items:
+            pl = item.get("payload") or {}
+            kind = item.get("kind", "")
+            target_desc = ""
+            if kind == "train_niche":
+                parts = [
+                    f"Сайт: {pl['website']}" if pl.get("website") else "",
+                    f"Ниша: {pl['niche_hint']}" if pl.get("niche_hint") else "",
+                    f"Бриф: {pl['brief'][:80]}" if pl.get("brief") else "",
+                ]
+                target_desc = " · ".join(x for x in parts if x) or "Настройка профиля продукта и ICP"
+            else:
+                pid = str(pl.get("prospect_id") or "")
+                p_obj = await state.get_prospect(pid) if pid else None
+                c_obj = await state.get_company(str(pl.get("company_id") or "")) if pl.get("company_id") else None
+                comp_name = c_obj.name if c_obj else (p_obj.company if p_obj else "")
+                fio = p_obj.full_name if p_obj else pid
+                ch = f" · Канал: {pl['channel']}" if pl.get("channel") else ""
+                target_desc = f"{comp_name} — {fio}{ch}".strip(" —")
+
+            enriched.append(
+                {
+                    "id": item["id"],
+                    "kind": kind,
+                    "kind_label": kind_labels.get(kind, kind),
+                    "status": item["status"],
+                    "target": target_desc,
+                    "payload": pl,
+                    "created_at": item.get("created_at", ""),
+                    "completed_at": item.get("completed_at") or "",
+                }
+            )
+        return {"items": enriched}
 
     @app.post("/api/agent-tasks/{task_id}/complete")
     async def api_complete_agent_task(task_id: str, body: AgentTaskCompletion):
@@ -358,6 +397,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
             return {"ok": True, "outcome": outcome}
         except BrainError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/agent-tasks/{task_id}")
+    async def api_cancel_agent_task(task_id: str):
+        ok = await state.cancel_agent_task(task_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Активная задача не найдена")
+        return {"ok": True, "id": task_id, "status": "cancelled"}
 
     # ── Экспорт ──
 
