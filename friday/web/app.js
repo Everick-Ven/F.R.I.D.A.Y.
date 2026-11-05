@@ -1,11 +1,11 @@
-/* F.R.I.D.A.Y. Web Client — относительные пути /api/* (совместимо с iframe Live Preview) */
+/* F.R.I.D.A.Y. Web Client — относительные /api/* + прямое получение живых данных РФ */
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 let NICHE_PRESETS = [];
 let CURRENT_DRAFT_STATUS = "";
-let ACTIVE_SUBVIEW = "companies";
+let ACTIVE_CONFIG = null;
 let JOB_HIDE_TIMER = null;
 const DRAFT_CACHE = new Map();
 
@@ -22,14 +22,17 @@ const SOURCE_LABELS = {
   yandex_search: "Яндекс",
   twogis: "2ГИС",
   yandex_maps: "Яндекс Карты",
+  ddg_ru: "Веб-поиск",
   web_search: "Веб-поиск",
-  osm: "Карты",
-  import_file: "Импорт",
+  osm_ru: "OpenStreetMap",
+  osm: "OpenStreetMap",
+  import: "Импорт",
   website_team: "Сайт компании",
 };
 
 const SIGNAL_SHORT_LABELS = {
   HH_HIRING_ROLE: "Вакансия hh.ru",
+  HH_OPEN_ROLES: "Активный найм",
   YANDEX_DIRECT_ACTIVE: "Яндекс Директ",
   NO_ONLINE_CAPTURE: "Нет захвата заявок",
   NO_YANDEX_METRIKA: "Без Метрики",
@@ -40,6 +43,8 @@ const SIGNAL_SHORT_LABELS = {
   TECH_STACK_RU: "CMS / Стек",
   LOW_MAP_RATING: "Рейтинг на картах",
   NO_WEBSITE_ON_MAP: "Нет сайта в карточке",
+  OUTDATED_COPYRIGHT: "Устаревший сайт",
+  SITE_UNREACHABLE: "Сбой сайта",
 };
 
 const CATEGORY_LABELS = {
@@ -53,6 +58,59 @@ const CATEGORY_LABELS = {
   company: "Профиль",
 };
 
+const HH_AREA_IDS = {
+  "москва": "1",
+  "санкт-петербург": "2",
+  "екатеринбург": "3",
+  "новосибирск": "4",
+  "нижний новгород": "66",
+  "казань": "88",
+  "краснодар": "53",
+  "самара": "78",
+  "ростов-на-дону": "76",
+  "челябинск": "104",
+  "уфа": "99",
+  "воронеж": "26",
+  "пермь": "72",
+  "волгоград": "24",
+  "красноярск": "54",
+  "владивосток": "22",
+  "тюмень": "95",
+  "сочи": "237",
+};
+
+const CITY_BBOX_RU = {
+  "москва": [55.57, 37.37, 55.91, 37.85],
+  "санкт-петербург": [59.82, 30.14, 60.06, 30.52],
+  "екатеринбург": [56.75, 60.48, 56.92, 60.73],
+  "новосибирск": [54.92, 82.80, 55.10, 83.08],
+  "казань": [55.71, 48.97, 55.86, 49.26],
+  "нижний новгород": [56.23, 43.82, 56.37, 44.10],
+  "краснодар": [44.98, 38.89, 45.12, 39.11],
+  "самара": [53.16, 50.06, 53.30, 50.30],
+  "ростов-на-дону": [47.19, 39.60, 47.31, 39.84],
+  "челябинск": [55.09, 61.30, 55.25, 61.50],
+  "уфа": [54.68, 55.88, 54.84, 56.12],
+  "воронеж": [51.60, 39.10, 51.75, 39.32],
+  "пермь": [57.95, 56.10, 58.08, 56.38],
+  "тюмень": [57.09, 65.45, 57.21, 65.66],
+  "владивосток": [43.07, 131.85, 43.21, 132.01],
+  "сочи": [43.54, 39.69, 43.64, 39.81],
+};
+
+const OSM_TAG_RULES = [
+  { kw: ["адвокат", "юрист", "юридич", "право", "коллеги"], tags: [["office", "lawyer"]] },
+  { kw: ["стоматолог", "клиник", "медицин", "косметолог", "врач"], tags: [["amenity", "dentist"], ["amenity", "clinic"]] },
+  { kw: ["ресторан", "кафе", "кофейн", "пекарн", "horeca"], tags: [["amenity", "restaurant"], ["amenity", "cafe"]] },
+  { kw: ["отель", "гостиниц"], tags: [["tourism", "hotel"]] },
+  { kw: ["автосервис", "кузовн", "шиномонтаж"], tags: [["shop", "car_repair"]] },
+  { kw: ["строй", "архитект", "ремонт", "проект"], tags: [["office", "construction_company"], ["office", "architect"]] },
+  { kw: ["бухгалтер", "аудит", "налог"], tags: [["office", "accountant"], ["office", "tax_advisor"]] },
+  { kw: ["логист", "перевоз", "склад", "вэд"], tags: [["office", "logistics"], ["office", "transport"]] },
+  { kw: ["ит", "it", "crm", "разработк", "интегратор"], tags: [["office", "it"]] },
+  { kw: ["маркетинг", "реклам", "seo", "digital"], tags: [["office", "advertising_agency"]] },
+];
+
 function showToast(msg, isError = false) {
   const el = $("#toast");
   if (!el) return;
@@ -60,7 +118,7 @@ function showToast(msg, isError = false) {
   el.style.borderColor = isError ? "rgba(239, 68, 68, 0.5)" : "rgba(255, 255, 255, 0.16)";
   el.classList.remove("hidden");
   clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => el.classList.add("hidden"), 3400);
+  showToast._t = setTimeout(() => el.classList.add("hidden"), 3600);
 }
 
 function esc(s) {
@@ -71,6 +129,15 @@ function esc(s) {
     .replaceAll('"', "&quot;");
 }
 
+function stripHtml(html) {
+  return String(html || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&quot;/gi, '"')
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 async function safeCopyText(text) {
   const value = String(text ?? "");
   if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
@@ -78,7 +145,7 @@ async function safeCopyText(text) {
       await navigator.clipboard.writeText(value);
       return true;
     } catch (_err) {
-      // Fallback для песочницы iframe
+      // Fallback для iframe
     }
   }
   const ta = document.createElement("textarea");
@@ -136,6 +203,268 @@ async function api(path, opts = {}) {
   return data;
 }
 
+async function fetchJsonSimple(url, timeoutMs = 7500) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    // Без кастомных заголовков — CORS simple request без preflight
+    const res = await fetch(url, { method: "GET", signal: ctrl.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ── Живой поиск реальных организаций из браузера пользователя (HeadHunter CORS API + Overpass OSM) ── */
+async function resolveHhArea(city) {
+  const key = String(city || "").trim().toLowerCase();
+  if (!key) return "113";
+  if (HH_AREA_IDS[key]) return HH_AREA_IDS[key];
+  const sug = await fetchJsonSimple(
+    `https://api.hh.ru/suggests/areas?text=${encodeURIComponent(city.trim())}`,
+    4500
+  );
+  if (sug && Array.isArray(sug.items) && sug.items.length > 0) {
+    return String(sug.items[0].id || "113");
+  }
+  return "113";
+}
+
+function isHrAgency(name) {
+  const nl = String(name || "").toLowerCase();
+  return (
+    nl.includes("кадровое агентство") ||
+    nl.includes("подбор персонала") ||
+    nl.includes("рекрутинг") ||
+    nl === "ancor" ||
+    nl === "анкор"
+  );
+}
+
+async function fetchLiveFromHeadHunter(query, city, limit = 15, onStep = null) {
+  const area = await resolveHhArea(city);
+  const qClean = query.trim();
+  const candidates = new Map();
+
+  // Параллельный поиск по базе работодателей и по активным вакансиям hh.ru
+  const [empSearch, vacSearch] = await Promise.all([
+    fetchJsonSimple(
+      `https://api.hh.ru/employers?text=${encodeURIComponent(qClean)}&area=${area}&per_page=25`,
+      7500
+    ),
+    fetchJsonSimple(
+      `https://api.hh.ru/vacancies?text=${encodeURIComponent(qClean)}&area=${area}&per_page=30`,
+      7500
+    ),
+  ]);
+
+  if (empSearch && Array.isArray(empSearch.items)) {
+    for (const emp of empSearch.items) {
+      const id = String(emp.id || "");
+      const name = String(emp.name || "").trim();
+      if (!id || !name || isHrAgency(name)) continue;
+      candidates.set(id, {
+        id,
+        name,
+        hh_url: emp.alternate_url || `https://hh.ru/employer/${id}`,
+        open_vacancies: Number(emp.open_vacancies || 0),
+        vac_name: "",
+        vac_url: "",
+        city: city || "Россия",
+        address: "",
+        phone: "",
+        email: "",
+        contact_fio: "",
+      });
+    }
+  }
+
+  if (vacSearch && Array.isArray(vacSearch.items)) {
+    for (const vac of vacSearch.items) {
+      const emp = vac.employer || {};
+      const id = String(emp.id || "");
+      const name = String(emp.name || "").trim();
+      if (!id || !name || isHrAgency(name)) continue;
+
+      let phone = "";
+      if (vac.contacts && Array.isArray(vac.contacts.phones) && vac.contacts.phones.length > 0) {
+        const ph = vac.contacts.phones[0];
+        phone = ph.formatted || `+${ph.country || "7"} (${ph.city || ""}) ${ph.number || ""}`.trim();
+      }
+      const existing = candidates.get(id) || {
+        id,
+        name,
+        hh_url: emp.alternate_url || `https://hh.ru/employer/${id}`,
+        open_vacancies: 1,
+        city: vac.area?.name || city || "Россия",
+        address: "",
+        phone: "",
+        email: "",
+        contact_fio: "",
+      };
+      existing.vac_name = existing.vac_name || String(vac.name || "").trim();
+      existing.vac_url = existing.vac_url || String(vac.alternate_url || "");
+      existing.address = existing.address || String(vac.address?.raw || "");
+      existing.phone = existing.phone || phone;
+      existing.email = existing.email || String(vac.contacts?.email || "");
+      existing.contact_fio = existing.contact_fio || String(vac.contacts?.name || "");
+      candidates.set(id, existing);
+    }
+  }
+
+  const list = Array.from(candidates.values()).slice(0, Math.min(limit + 6, 20));
+  if (!list.length) return [];
+
+  if (onStep) onStep(`Проверка официальных сайтов ${list.length} организаций в HeadHunter…`);
+
+  // Подтягиваем карточки работодателей (там хранится проверенный официальный site_url)
+  const enriched = await Promise.all(
+    list.map(async (cand) => {
+      const detail = await fetchJsonSimple(`https://api.hh.ru/employers/${cand.id}`, 6500);
+      const siteUrl = detail?.site_url ? String(detail.site_url).trim() : "";
+      const openVac = Number(detail?.open_vacancies ?? cand.open_vacancies ?? 0);
+      const inds = Array.isArray(detail?.industries)
+        ? detail.industries.map((i) => i.name).filter(Boolean).slice(0, 2).join(", ")
+        : "";
+      const desc = detail?.description ? stripHtml(detail.description).slice(0, 320) : "";
+
+      const observations = [];
+      if (cand.vac_name) {
+        observations.push({
+          signal_code: "HH_HIRING_ROLE",
+          collector: "hh_ru",
+          value_text: `Вакансия: «${cand.vac_name}»`,
+          evidence_url: cand.vac_url || cand.hh_url,
+        });
+      }
+      if (openVac > 0) {
+        observations.push({
+          signal_code: "HH_OPEN_ROLES",
+          collector: "hh_ru",
+          value_num: openVac,
+          value_text: `${openVac} открытых вакансий на hh.ru`,
+          evidence_url: cand.hh_url,
+        });
+      }
+
+      return {
+        name: cand.name,
+        website: siteUrl,
+        city: detail?.area?.name || cand.city,
+        industry: inds || query,
+        address: cand.address,
+        phone: cand.phone,
+        email: cand.email,
+        contact_fio: cand.contact_fio,
+        hh_url: cand.hh_url,
+        external_id: `hh:${cand.id}`,
+        source: "hh_ru",
+        source_url: cand.vac_url || cand.hh_url,
+        description: desc,
+        observations,
+      };
+    })
+  );
+
+  // Сначала компании с проверенным собственным сайтом
+  enriched.sort((a, b) => (b.website ? 1 : 0) - (a.website ? 1 : 0));
+  return enriched.slice(0, limit);
+}
+
+async function fetchLiveFromOverpass(query, city, limit = 12) {
+  const bbox = CITY_BBOX_RU[String(city || "").trim().toLowerCase()];
+  if (!bbox) return [];
+  const bboxStr = bbox.join(",");
+  const qlLower = query.toLowerCase();
+
+  let tagClauses = [];
+  for (const rule of OSM_TAG_RULES) {
+    if (rule.kw.some((k) => qlLower.includes(k))) {
+      for (const [k, v] of rule.tags) {
+        tagClauses.push(`nwr["${k}"="${v}"](${bboxStr});`);
+      }
+    }
+  }
+  if (!tagClauses.length) {
+    const firstWord = (query.trim().split(/\s+/)[0] || "").replace(/[^\p{L}\p{N}-]/gu, "").slice(0, 22);
+    if (firstWord.length >= 3) {
+      tagClauses.push(`nwr["name"~"${firstWord}",i](${bboxStr});`);
+    } else {
+      return [];
+    }
+  }
+
+  const overpassQuery = `[out:json][timeout:10];(${tagClauses.join("")});out center 35;`;
+  const endpoints = [
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+  ];
+
+  let data = null;
+  for (const ep of endpoints) {
+    data = await fetchJsonSimple(`${ep}?data=${encodeURIComponent(overpassQuery)}`, 6500);
+    if (data && Array.isArray(data.elements)) break;
+  }
+  if (!data || !Array.isArray(data.elements)) return [];
+
+  const items = [];
+  for (const el of data.elements) {
+    const tags = el.tags || {};
+    const name = String(tags.name || "").trim();
+    const website = String(tags.website || tags["contact:website"] || "").trim();
+    const phone = String(tags.phone || tags["contact:phone"] || "").trim();
+    const email = String(tags.email || tags["contact:email"] || "").trim();
+    const telegram = String(tags["contact:telegram"] || tags.telegram || "").trim();
+    const vk = String(tags["contact:vk"] || tags.vk || "").trim();
+    if (!name || (!website && !phone)) continue;
+
+    const street = tags["addr:street"] || "";
+    const house = tags["addr:housenumber"] || "";
+    const address = `${street} ${house}`.trim();
+    const osmUrl = `https://www.openstreetmap.org/${el.type || "node"}/${el.id}`;
+    const observations = [];
+    if (telegram) {
+      observations.push({
+        signal_code: "TELEGRAM_PUBLIC",
+        collector: "osm_ru",
+        value_text: telegram,
+        evidence_url: website || osmUrl,
+      });
+    }
+    if (!website) {
+      observations.push({
+        signal_code: "NO_WEBSITE_ON_MAP",
+        collector: "osm_ru",
+        value_text: "В карточке геосервиса не указан сайт",
+        evidence_url: osmUrl,
+      });
+    }
+
+    items.push({
+      name,
+      website,
+      city,
+      industry: query,
+      address,
+      phone,
+      email,
+      telegram: telegram.startsWith("@") ? `https://t.me/${telegram.slice(1)}` : telegram,
+      vk,
+      external_id: `osm:${el.type}:${el.id}`,
+      source: "osm_ru",
+      source_url: website || osmUrl,
+      observations,
+    });
+  }
+
+  items.sort((a, b) => (b.website ? 1 : 0) - (a.website ? 1 : 0));
+  return items.slice(0, limit);
+}
+
 /* ── Живой индикатор прогресса ── */
 function renderJobCard(job) {
   const card = $("#live-job-card");
@@ -182,13 +511,100 @@ async function runTrackedJob(path, payload, { button = null, onComplete = null }
       return null;
     }
 
+    // Если сервер работает в изолированном облачном контейнере — загружаем живые компании напрямую через браузер
+    if (job.kind === "discover" && job.result?.network_isolated) {
+      const q = job.result.query;
+      const c = job.result.city;
+      const prov = job.result.provider || "auto";
+      const lim = job.result.limit || 15;
+
+      renderJobCard({
+        title: "Поиск реальных организаций",
+        status: "running",
+        percent: 32,
+        stage: `Запрос к открытому API HeadHunter и картам: «${q}» (${c})`,
+        steps: [
+          { label: `Поиск по запросу «${q}»`, state: "active" },
+          { label: "Получение официальных сайтов и контактов", state: "pending" },
+          { label: "Сохранение и оценка релевантности", state: "pending" },
+        ],
+      });
+
+      const tasks = [];
+      if (prov === "auto" || prov === "hh") {
+        tasks.push(
+          fetchLiveFromHeadHunter(q, c, lim, (detail) => {
+            renderJobCard({
+              title: "Поиск реальных организаций",
+              status: "running",
+              percent: 62,
+              stage: detail,
+              steps: [
+                { label: `Поиск по запросу «${q}»`, state: "done" },
+                { label: "Получение официальных сайтов и контактов", state: "active" },
+                { label: "Сохранение и оценка релевантности", state: "pending" },
+              ],
+            });
+          })
+        );
+      }
+      if (prov !== "hh") {
+        tasks.push(fetchLiveFromOverpass(q, c, Math.max(8, Math.floor(lim / 2))));
+      }
+
+      const batches = await Promise.all(tasks);
+      const combined = batches.flat();
+
+      if (!combined.length) {
+        renderJobCard({
+          title: "Поиск завершён",
+          status: "failed",
+          percent: 100,
+          stage: `По запросу «${q}» (${c}) в открытых источниках не найдено карточек. Попробуйте более широкий запрос.`,
+          steps: [],
+        });
+        showToast("Попробуйте уточнить или расширить поисковый запрос", true);
+        return null;
+      }
+
+      renderJobCard({
+        title: "Поиск реальных организаций",
+        status: "running",
+        percent: 88,
+        stage: `Сохранение ${combined.length} найденных организаций…`,
+        steps: [
+          { label: `Поиск по запросу «${q}»`, state: "done" },
+          { label: "Получение официальных сайтов и контактов", state: "done" },
+          { label: "Сохранение и оценка релевантности", state: "active" },
+        ],
+      });
+
+      const saved = await api("/api/import/live-batch", {
+        method: "POST",
+        body: JSON.stringify({ items: combined }),
+      });
+
+      const totalFound = (saved.inserted_companies || 0) + (saved.updated_companies || 0);
+      renderJobCard({
+        title: "Поиск завершён",
+        status: "completed",
+        percent: 100,
+        stage: `Найдено реальных организаций: ${totalFound}`,
+        steps: [
+          { label: `Поиск по запросу «${q}»`, state: "done" },
+          { label: "Получение официальных сайтов и контактов", state: "done" },
+          { label: "Сохранение и оценка релевантности", state: "done" },
+        ],
+      });
+    }
+
     await loadSummary(true);
     if (onComplete) await onComplete(job);
 
     JOB_HIDE_TIMER = setTimeout(() => {
       const card = $("#live-job-card");
       if (card) card.classList.add("hidden");
-    }, 2600);
+    }, 2800);
     return job;
   } catch (e) {
     showToast(e.message, true);
@@ -213,7 +629,6 @@ function switchTab(tabId) {
 }
 
 function switchSubview(sub) {
-  ACTIVE_SUBVIEW = sub;
   $$("#db-subtabs .seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.subview === sub));
   $("#subview-companies").classList.toggle("hidden", sub !== "companies");
   $("#subview-prospects").classList.toggle("hidden", sub !== "prospects");
@@ -223,6 +638,7 @@ function switchSubview(sub) {
 /* ── Загрузка профиля и сводки ── */
 function fillNicheFormFromConfig(cfg, skills = {}) {
   if (!cfg) return;
+  ACTIVE_CONFIG = cfg;
   const p = cfg.persona || {};
   const prod = cfg.product || {};
   const icp = cfg.icp || {};
@@ -254,7 +670,6 @@ function fillNicheFormFromConfig(cfg, skills = {}) {
     $("#cfg-skill-md").value = skills.product_knowledge_md;
   }
 
-  // Синхронизируем поля быстрого старта, если они ещё пустые
   if (!$("#train-website").value && p.website) $("#train-website").value = p.website;
   if (!$("#train-niche-hint").value && cleanVal(icp.niche, "Не настроена")) {
     $("#train-niche-hint").value = icp.niche;
@@ -380,7 +795,7 @@ async function loadCompanies() {
   const tbody = $("#companies-tbody");
 
   if (!data.items.length) {
-    tbody.innerHTML = `<tr><td colspan="5" class="empty-box">Список компаний пока пуст. Запустите поиск по запросу, импортируйте файл или добавьте демо-данные.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="5" class="empty-box">Список компаний пока пуст. Введите запрос и нажмите «Найти компании» или загрузите список из файла.</td></tr>`;
     return;
   }
 
@@ -389,26 +804,40 @@ async function loadCompanies() {
       const obsHtml = (c.observations || [])
         .map((o) => {
           const label = SIGNAL_SHORT_LABELS[o.signal_code] || o.signal_code;
-          const tip = o.value_text ? `${o.signal_code}: ${o.value_text}` : o.signal_code;
+          const tip = o.value_text ? `${o.value_text}` : o.signal_code;
           return `<span class="tag" title="${esc(tip)}">${esc(label)}</span>`;
         })
         .join("");
+
       const contacts = [
         c.phone ? esc(c.phone) : "",
         c.telegram ? `<a class="contact-link" href="${esc(c.telegram)}" target="_blank" rel="noopener">Telegram</a>` : "",
         c.whatsapp ? `<a class="contact-link" href="${esc(c.whatsapp)}" target="_blank" rel="noopener">WhatsApp</a>` : "",
+        c.vk ? `<a class="contact-link" href="${esc(c.vk)}" target="_blank" rel="noopener">VK</a>` : "",
       ]
         .filter(Boolean)
         .join(" · ");
 
       const siteUrl = c.website || (c.domain ? `https://${c.domain}` : "");
+      const links = [];
+      if (siteUrl) {
+        links.push(`<a href="${esc(siteUrl)}" target="_blank" rel="noopener">${esc(c.domain || siteUrl)}</a>`);
+      }
+      if (c.hh_url) {
+        links.push(`<a href="${esc(c.hh_url)}" target="_blank" rel="noopener">hh.ru</a>`);
+      }
+      if (!links.length && c.source_url && c.source_url.startsWith("http")) {
+        links.push(`<a href="${esc(c.source_url)}" target="_blank" rel="noopener">Карточка источника</a>`);
+      }
+
       return `
         <tr>
           <td>
             <div class="entity-name">${esc(c.name)}</div>
             <div class="entity-sub">
-              ${siteUrl ? `<a href="${esc(siteUrl)}" target="_blank" rel="noopener">${esc(c.domain || c.website)}</a>` : "—"}
+              ${links.join(" · ") || "—"}
               ${c.inn ? ` · ИНН ${esc(c.inn)}` : ""}
+              ${c.address ? ` · ${esc(c.address)}` : ""}
             </div>
           </td>
           <td>${esc(c.city || "—")}</td>
@@ -425,7 +854,7 @@ async function loadProspects() {
   const tbody = $("#prospects-tbody");
 
   if (!data.items.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="empty-box">Контакты руководителей появятся после поиска или обогащения компаний.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-box">Контакты руководителей появятся после поиска или импорта компаний.</td></tr>`;
     return;
   }
 
@@ -433,12 +862,16 @@ async function loadProspects() {
     .map((p) => {
       const channels = [
         p.telegram ? `<a class="contact-link" href="${esc(p.telegram)}" target="_blank" rel="noopener">Telegram</a>` : "",
-        p.email ? esc(p.email) : "",
+        p.email ? `<a class="contact-link" href="mailto:${esc(p.email)}">${esc(p.email)}</a>` : "",
         p.phone ? esc(p.phone) : "",
+        p.source_url && p.source_url.startsWith("http")
+          ? `<a class="contact-link" href="${esc(p.source_url)}" target="_blank" rel="noopener">Сайт</a>`
+          : "",
       ]
         .filter(Boolean)
         .join(" · ");
-      const scoreCls = p.fit_score >= 65 ? "score-pill high" : "score-pill";
+      const numScore = p.score ?? p.fit_score ?? 0;
+      const scoreCls = numScore >= 65 ? "score-pill high" : "score-pill";
       return `
         <tr>
           <td>
@@ -448,7 +881,7 @@ async function loadProspects() {
           <td>${esc(p.title || "Руководитель")}</td>
           <td>${esc(p.company || "—")}</td>
           <td>${channels || "—"}</td>
-          <td><span class="${scoreCls}" title="${esc(p.score_reason || "")}">${p.fit_score}</span></td>
+          <td><span class="${scoreCls}" title="${esc(p.personalization_notes || "")}">${numScore}</span></td>
           <td style="text-align:right">
             <button type="button" class="ghost-btn sm" data-single-draft="${esc(p.id)}">Написать</button>
           </td>
@@ -475,14 +908,15 @@ async function loadDrafts() {
   box.innerHTML = data.items
     .map((d) => {
       DRAFT_CACHE.set(String(d.id), (d.subject ? `Тема: ${d.subject}\n\n` : "") + (d.body || ""));
-      const fio = [d.last_name, d.first_name, d.middle_name].filter(Boolean).join(" ") || "Руководитель";
+      const fio = [d.last_name, d.first_name, d.middle_name].filter(Boolean).join(" ") || d.title || "Руководитель";
       const st = STATUS_LABELS[d.status] || { text: d.status, cls: "" };
       const channelName =
         d.channel === "telegram" ? "Telegram" : d.channel === "whatsapp" ? "WhatsApp" : "Email";
+      const dScore = d.score ?? d.fit_score ?? 0;
 
       const contacts = [
         d.telegram ? `<a class="contact-link" href="${esc(d.telegram)}" target="_blank" rel="noopener">Telegram</a>` : "",
-        d.email ? esc(d.email) : "",
+        d.email ? `<a class="contact-link" href="mailto:${esc(d.email)}">${esc(d.email)}</a>` : "",
         d.phone ? esc(d.phone) : "",
         d.website ? `<a class="contact-link" href="${esc(d.website)}" target="_blank" rel="noopener">Сайт</a>` : "",
       ]
@@ -494,11 +928,11 @@ async function loadDrafts() {
           <div class="draft-top">
             <div>
               <div class="draft-company">${esc(d.company_name || "Компания")}</div>
-              <div class="draft-person">${esc(fio)}${d.title ? ` · ${esc(d.title)}` : ""}${d.city ? ` · ${esc(d.city)}` : ""}</div>
+              <div class="draft-person">${esc(fio)}${d.title && fio !== d.title ? ` · ${esc(d.title)}` : ""}${d.city ? ` · ${esc(d.city)}` : ""}</div>
             </div>
             <div class="draft-badges">
               <span class="tag">${esc(channelName)}</span>
-              ${d.fit_score ? `<span class="score-pill ${d.fit_score >= 65 ? "high" : ""}">${d.fit_score}</span>` : ""}
+              ${dScore ? `<span class="score-pill ${dScore >= 65 ? "high" : ""}">${dScore}</span>` : ""}
               <span class="tag ${st.cls}">${esc(st.text)}</span>
             </div>
           </div>
@@ -638,7 +1072,7 @@ document.addEventListener("click", async (ev) => {
         }),
       });
       await loadSummary();
-      if (res.ok) {
+      if (res.gate_passed) {
         showToast("Черновик подготовлен");
         switchTab("drafts");
       } else {
@@ -703,16 +1137,6 @@ $("#btn-discover").addEventListener("click", async (ev) => {
 
 $("#btn-enrich").addEventListener("click", async (ev) => {
   await runTrackedJob("/api/jobs/enrich", {}, {
-    button: ev.currentTarget,
-    onComplete: async () => {
-      await loadCompanies();
-      await loadProspects();
-    },
-  });
-});
-
-$("#btn-sample").addEventListener("click", async (ev) => {
-  await runTrackedJob("/api/jobs/sample", {}, {
     button: ev.currentTarget,
     onComplete: async () => {
       await loadCompanies();

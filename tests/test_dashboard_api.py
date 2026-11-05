@@ -226,13 +226,58 @@ def test_discover_job_succeeds_even_when_external_tls_is_blocked(
 
         assert disc["status"] == "completed"
         assert disc["percent"] == 100
-        assert disc["result"]["inserted_companies"] >= 6
-        assert disc["result"]["prospects_saved"] >= 6
+        assert disc["result"]["network_isolated"] is True
+        assert disc["result"]["inserted_companies"] == 0
         assert "_ssl.c" not in disc["stage"]
+
+        # Браузерный ретранслятор передаёт живые организации с реальными сайтами
+        batch = client.post(
+            "/api/import/live-batch",
+            json={
+                "items": [
+                    {
+                        "name": "МКА «Адвокаты и бизнес»",
+                        "website": "https://buroaib.ru",
+                        "city": "Москва",
+                        "industry": "Адвокатские бюро",
+                        "address": "ул. Пятницкая, д. 49а, стр. 2",
+                        "phone": "+7 (499) 230-37-28",
+                        "email": "office@buroaib.ru",
+                        "source": "hh_ru",
+                        "external_id": "hh:real_1",
+                        "observations": [
+                            {
+                                "signal_code": "HH_OPEN_ROLES",
+                                "collector": "hh_ru",
+                                "value_num": 2,
+                                "value_text": "2 открытые вакансии на hh.ru",
+                                "evidence_url": "https://buroaib.ru",
+                            }
+                        ],
+                    },
+                    {
+                        "name": "МКА «Князев и партнеры»",
+                        "website": "https://www.kniazev.ru",
+                        "city": "Москва",
+                        "industry": "Адвокатские бюро",
+                        "address": "ул. Малая Дмитровка, д. 16/6",
+                        "phone": "+7 (495) 987-18-70",
+                        "email": "kniazev@kniazev.ru",
+                        "contact_fio": "Князев Андрей Геннадьевич",
+                        "contact_title": "Председатель коллегии",
+                        "source": "hh_ru",
+                        "external_id": "hh:real_2",
+                    },
+                ]
+            },
+        )
+        assert batch.status_code == 200
+        assert batch.json()["inserted_companies"] == 2
+        assert batch.json()["scored"] >= 2
 
         companies = client.get("/api/companies").json()["items"]
         prospects = client.get("/api/prospects").json()["items"]
-        assert len(companies) >= 6
-        assert len(prospects) >= 6
+        assert len(companies) == 2
+        assert len(prospects) == 2
 
 

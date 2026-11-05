@@ -220,83 +220,103 @@ async def discover_hh_ru(
     hiring_role: str = "",
     limit: int = 20,
 ) -> list[DiscoveredItem]:
-    """Ищет компании РФ через открытый API hh.ru по вакансиям или нишевому запросу."""
+    """Ищет реальные компании РФ через открытый API hh.ru (по работодателям и вакансиям)."""
     area = HH_AREA_IDS.get(city.strip().lower(), "113")  # 113 = вся Россия
     search_text = f"{hiring_role} {query}".strip() if hiring_role else query.strip()
     if not search_text:
         return []
 
     headers = {
-        "User-Agent": "FRIDAY-B2B-Scout/0.2 (contact@localhost)",
+        "HH-User-Agent": "FRIDAY-B2B-Scout/0.3",
         "Accept": "application/json",
     }
     items: list[DiscoveredItem] = []
     seen_emp_ids: set[str] = set()
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.5), headers=headers) as client:
+        emp_candidates: list[tuple[str, str, str, str, str]] = []
+
+        # 1. Поиск по активным вакансиям (сигналы найма)
         resp = await client.get(
             "https://api.hh.ru/vacancies",
             params={
                 "text": search_text,
                 "area": area,
-                "per_page": min(max(limit * 2, 20), 50),
+                "per_page": min(max(limit * 2, 20), 40),
                 "page": 0,
             },
         )
-        if resp.status_code != 200:
-            return []
-        vacancies = resp.json().get("items") or []
+        if resp.status_code == 200:
+            for vac in resp.json().get("items") or []:
+                emp = vac.get("employer") or {}
+                emp_id = str(emp.get("id") or "")
+                emp_name = (emp.get("name") or "").strip()
+                if not emp_id or not emp_name or emp_id in seen_emp_ids:
+                    continue
+                seen_emp_ids.add(emp_id)
+                vac_name = (vac.get("name") or "").strip()
+                vac_city = ((vac.get("area") or {}).get("name") or city).strip()
+                emp_hh_url = (emp.get("alternate_url") or f"https://hh.ru/employer/{emp_id}").strip()
+                emp_candidates.append((emp_id, emp_name, emp_hh_url, vac_name, vac_city))
 
-        for vac in vacancies:
-            emp = vac.get("employer") or {}
-            emp_id = str(emp.get("id") or "")
-            emp_name = (emp.get("name") or "").strip()
-            if not emp_id or not emp_name or emp_id in seen_emp_ids:
-                continue
-            # Пропускаем кадровые агентства, если ищем прямых работодателей
-            seen_emp_ids.add(emp_id)
+        # 2. Дополняем прямым поиском работодателей по нише, если не задана узкая вакансия
+        if not hiring_role and len(emp_candidates) < limit:
+            emp_resp = await client.get(
+                "https://api.hh.ru/employers",
+                params={"text": query.strip(), "area": area, "per_page": min(max(limit, 15), 30)},
+            )
+            if emp_resp.status_code == 200:
+                for emp in emp_resp.json().get("items") or []:
+                    eid = str(emp.get("id") or "")
+                    ename = (emp.get("name") or "").strip()
+                    ehh = (emp.get("alternate_url") or f"https://hh.ru/employer/{eid}").strip()
+                    if eid and ename and eid not in seen_emp_ids:
+                        seen_emp_ids.add(eid)
+                        emp_candidates.append((eid, ename, ehh, "", city))
 
-            vac_name = (vac.get("name") or "").strip()
-            vac_url = (vac.get("alternate_url") or "").strip()
-            vac_city = ((vac.get("area") or {}).get("name") or city).strip()
-            emp_hh_url = (emp.get("alternate_url") or f"https://hh.ru/employer/{emp_id}").strip()
-
+        for emp_id, emp_name, emp_hh_url, vac_name, vac_city in emp_candidates:
             site_url = ""
-            open_vacancies = 1
+            open_vacancies = 0
             industries_str = ""
             description = ""
-            # Подтягиваем карточку работодателя (там лежит официальный `site_url` и отрасли!)
             try:
                 er = await client.get(f"https://api.hh.ru/employers/{emp_id}")
                 if er.status_code == 200:
                     edata = er.json()
                     site_url = (edata.get("site_url") or "").strip()
-                    open_vacancies = int(edata.get("open_vacancies") or 1)
+                    open_vacancies = int(edata.get("open_vacancies") or 0)
                     ind_list = [i.get("name", "") for i in (edata.get("industries") or []) if i.get("name")]
                     industries_str = ", ".join(ind_list[:2])
                     raw_desc = re.sub(r"<[^>]+>", " ", edata.get("description") or "")
                     description = re.sub(r"\s+", " ", unescape(raw_desc)).strip()[:300]
-            except httpx.HTTPError:
+            except (httpx.HTTPError, OSError):
                 pass
 
+            if site_url and not site_url.startswith(("http://", "https://")):
+                site_url = f"https://{site_url}"
             if site_url and is_junk_ru_domain(site_url):
                 site_url = ""
 
-            obs: list[dict] = [
-                {
-                    "signal_code": "HH_HIRING_ROLE",
-                    "collector": "hh_ru",
-                    "value_text": f"Вакансия: «{vac_name}»",
-                    "evidence_url": vac_url or emp_hh_url,
-                },
-                {
-                    "signal_code": "HH_OPEN_ROLES",
-                    "collector": "hh_ru",
-                    "value_num": float(open_vacancies),
-                    "value_text": f"{open_vacancies} открытых вакансий на hh.ru",
-                    "evidence_url": emp_hh_url,
-                },
-            ]
+            obs: list[dict] = []
+            if vac_name:
+                obs.append(
+                    {
+                        "signal_code": "HH_HIRING_ROLE",
+                        "collector": "hh_ru",
+                        "value_text": f"Вакансия: «{vac_name}»",
+                        "evidence_url": emp_hh_url,
+                    }
+                )
+            if open_vacancies > 0:
+                obs.append(
+                    {
+                        "signal_code": "HH_OPEN_ROLES",
+                        "collector": "hh_ru",
+                        "value_num": float(open_vacancies),
+                        "value_text": f"{open_vacancies} открытых вакансий на hh.ru",
+                        "evidence_url": emp_hh_url,
+                    }
+                )
 
             items.append(
                 DiscoveredItem(
@@ -307,7 +327,7 @@ async def discover_hh_ru(
                     hh_url=emp_hh_url,
                     external_id=f"hh:{emp_id}",
                     source="hh_ru",
-                    source_url=vac_url or emp_hh_url,
+                    source_url=emp_hh_url,
                     description=description,
                     observations=obs,
                 )
@@ -315,6 +335,7 @@ async def discover_hh_ru(
             if len(items) >= limit:
                 break
 
+    items.sort(key=lambda x: 0 if x.website else 1)
     return items
 
 
@@ -927,10 +948,6 @@ async def persist_discovered_items(
             if p_created:
                 inserted_prospects += 1
 
-        if (item.external_id or "").startswith("catalog:"):
-            await state.mark_profile_checked(cid)
-            await state.mark_prospects_checked(cid)
-
     return {
         "inserted_companies": inserted_companies,
         "updated_companies": updated_companies,
@@ -1033,19 +1050,7 @@ async def run_discover(
             except (httpx.HTTPError, OSError):
                 network_errors += 1
 
-        # Если внешние поисковые сети недоступны на уровне контейнера/сети, используем резервный каталог РФ
-        if not collected_pairs and network_errors > 0:
-            from friday.collectors.ru_catalog_fallback import build_offline_catalog_items
-
-            fallback_pairs = build_offline_catalog_items(
-                query,
-                city,
-                config=cfg,
-                limit=min(limit, 8),
-            )
-            collected_pairs.extend(fallback_pairs)
-            used_providers.append("ru_catalog")
-
+        network_isolated = bool(not collected_pairs and network_errors > 0)
         stats = await persist_discovered_items(
             state,
             collected_pairs,
@@ -1053,6 +1058,7 @@ async def run_discover(
             run_id=run_id,
         )
         stats["providers_used"] = used_providers
+        stats["network_isolated"] = network_isolated
         await state.finish_run(
             run_id,
             status="completed",

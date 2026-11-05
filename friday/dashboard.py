@@ -22,12 +22,19 @@ from friday.brain import (
     load_prompt,
     load_skills,
 )
-from friday.collectors.discover import parse_import_file, persist_discovered_items, run_discover
+from friday.collectors.discover import (
+    DiscoveredItem,
+    is_junk_ru_domain,
+    parse_import_file,
+    persist_discovered_items,
+    run_discover,
+)
 from friday.collectors.people import run_people
 from friday.collectors.profile import run_profile
 from friday.config import is_niche_configured, load_config
 from friday.export import export_drafts_csv, export_drafts_markdown
 from friday.jobs import JobManager, JobRecord
+from friday.models.prospect import COMPANY_CONTACT_SOURCE, Prospect
 from friday.paths import SKILLS_DIR
 from friday.pipeline import bootstrap_state, seed_sample_for_active_niche
 from friday.state import StateManager
@@ -84,6 +91,33 @@ class StatusPatch(BaseModel):
 
 class AgentTaskCompletion(BaseModel):
     response_json: str
+
+
+class LiveBatchItem(BaseModel):
+    name: str
+    website: str = ""
+    city: str = ""
+    industry: str = ""
+    company_size: str = ""
+    inn: str = ""
+    address: str = ""
+    phone: str = ""
+    email: str = ""
+    contact_fio: str = ""
+    contact_title: str = ""
+    telegram: str = ""
+    whatsapp: str = ""
+    vk: str = ""
+    hh_url: str = ""
+    source_url: str = ""
+    external_id: str = ""
+    source: str = "hh_ru"
+    description: str = ""
+    observations: list[dict] = Field(default_factory=list)
+
+
+class LiveBatchRequest(BaseModel):
+    items: list[LiveBatchItem] = Field(default_factory=list)
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -224,6 +258,20 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 limit=req.limit,
                 config=cfg,
             )
+            if disc.get("network_isolated"):
+                res = {
+                    "network_isolated": True,
+                    "query": q,
+                    "city": c,
+                    "provider": req.provider,
+                    "limit": req.limit,
+                    "inserted_companies": 0,
+                    "prospects_saved": 0,
+                    "scored": 0,
+                }
+                job.complete(res, summary_stage="Переключение на прямое получение данных")
+                return res
+
             job.set_step(1, percent=65, detail="Проверка сайтов и извлечение контактов ЛПР")
             prof = await run_profile(state, limit=max(10, req.limit))
             peop = await run_people(state, limit=max(10, req.limit), config=cfg)
@@ -233,6 +281,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             found_companies = disc.get("inserted_companies", 0) + disc.get("updated_companies", 0)
             found_prospects = disc.get("inserted_prospects", 0) + peop.get("prospects_saved", 0)
             res = {
+                "network_isolated": False,
                 "inserted_companies": disc.get("inserted_companies", 0),
                 "updated_companies": disc.get("updated_companies", 0),
                 "profiled": prof.get("checked", 0),
@@ -534,6 +583,94 @@ def create_app(db_path: str | None = None) -> FastAPI:
             return {"ok": True, "filename": file.filename, **stats}
         finally:
             tmp_path.unlink(missing_ok=True)
+
+    @app.post("/api/import/live-batch")
+    async def api_import_live_batch(req: LiveBatchRequest):
+        cfg = load_config()
+        default_role = (
+            cfg.icp.decision_maker_titles[0].capitalize()
+            if cfg.icp.decision_maker_titles
+            else "Руководитель"
+        )
+        pairs: list[tuple[DiscoveredItem, Prospect | None]] = []
+
+        for raw in req.items[:60]:
+            name = raw.name.strip()
+            if not name:
+                continue
+            website = raw.website.strip()
+            if website and not website.startswith(("http://", "https://")):
+                website = f"https://{website}"
+            if website and is_junk_ru_domain(website):
+                website = ""
+
+            hh_url = raw.hh_url.strip()
+            if not website and not hh_url and not raw.phone.strip() and not raw.email.strip():
+                continue
+
+            obs_clean: list[dict] = []
+            for o in raw.observations:
+                code = str(o.get("signal_code") or "").strip().upper()
+                if not code:
+                    continue
+                obs_clean.append(
+                    {
+                        "signal_code": code,
+                        "collector": str(o.get("collector") or raw.source or "live"),
+                        "value_num": o.get("value_num"),
+                        "value_text": str(o.get("value_text") or "")[:240],
+                        "evidence_url": str(o.get("evidence_url") or website or hh_url or raw.source_url)[:300],
+                    }
+                )
+
+            item = DiscoveredItem(
+                name=name,
+                website=website,
+                city=raw.city.strip(),
+                industry=raw.industry.strip() or cfg.icp.niche,
+                company_size=raw.company_size.strip(),
+                inn=raw.inn.strip(),
+                address=raw.address.strip(),
+                phone=raw.phone.strip(),
+                telegram=raw.telegram.strip(),
+                whatsapp=raw.whatsapp.strip(),
+                vk=raw.vk.strip(),
+                hh_url=hh_url,
+                external_id=raw.external_id.strip(),
+                source=raw.source.strip() or "hh_ru",
+                source_url=raw.source_url.strip() or website or hh_url,
+                description=raw.description.strip()[:400],
+                observations=obs_clean,
+            )
+
+            parts = [p for p in raw.contact_fio.strip().split() if p]
+            last_n = parts[0] if len(parts) >= 2 else ""
+            first_n = parts[1] if len(parts) >= 2 else (parts[0] if len(parts) == 1 else "")
+            mid_n = parts[2] if len(parts) >= 3 else ""
+
+            prospect = Prospect(
+                last_name=last_n,
+                first_name=first_n,
+                middle_name=mid_n,
+                title=raw.contact_title.strip() or default_role,
+                role_kind="icp_decision_maker" if first_n else "company_contact",
+                email=raw.email.strip(),
+                email_source="public_contact" if raw.email.strip() else "",
+                phone=raw.phone.strip(),
+                telegram=raw.telegram.strip(),
+                whatsapp=raw.whatsapp.strip(),
+                vk=raw.vk.strip(),
+                company=name,
+                industry=item.industry,
+                city=item.city,
+                source=COMPANY_CONTACT_SOURCE if not first_n else "public_contact",
+                source_url=website or hh_url or raw.source_url.strip(),
+            )
+            pairs.append((item, prospect))
+
+        stats = await persist_discovered_items(state, pairs, config=cfg, run_id="live_browser_batch")
+        scor = await score_all_prospects(state, use_ai=False, limit=300, config=cfg)
+        return {"ok": True, **stats, "scored": scor.get("scored", 0)}
 
     @app.post("/api/run/profile")
     async def api_run_profile():
