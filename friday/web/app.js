@@ -1183,26 +1183,26 @@ async function loadCompanies() {
 
       const resourceLinks = [];
       if (siteHref) {
-        resourceLinks.push(`<a class="cell-link" href="${esc(siteHref)}" target="_blank" rel="noopener">🌐 ${esc(siteLabel)}</a>`);
+        resourceLinks.push(`<a class="cell-link" href="${esc(siteHref)}" target="_blank" rel="noopener">${esc(siteLabel)} ↗</a>`);
       }
       if (c.ymaps_url) {
-        resourceLinks.push(`<a class="cell-link" href="${esc(c.ymaps_url)}" target="_blank" rel="noopener">📍 Яндекс.Карты</a>`);
+        resourceLinks.push(`<a class="cell-link" href="${esc(c.ymaps_url)}" target="_blank" rel="noopener">Яндекс.Карты ↗</a>`);
       }
       if (c.hh_url) {
-        resourceLinks.push(`<a class="cell-link" href="${esc(c.hh_url)}" target="_blank" rel="noopener">💼 hh.ru</a>`);
+        resourceLinks.push(`<a class="cell-link" href="${esc(c.hh_url)}" target="_blank" rel="noopener">hh.ru ↗</a>`);
       }
       if (!siteHref && !c.ymaps_url && !c.hh_url && c.source_url) {
-        resourceLinks.push(`<a class="cell-link" href="${esc(c.source_url)}" target="_blank" rel="noopener">${esc(srcLabels[c.source] || "Источник")}</a>`);
+        resourceLinks.push(`<a class="cell-link" href="${esc(c.source_url)}" target="_blank" rel="noopener">${esc(srcLabels[c.source] || "Источник")} ↗</a>`);
       }
 
       const contactItems = [];
-      if (c.phone) contactItems.push(`<a class="cell-link" href="tel:${esc(c.phone)}">${esc(c.phone)}</a>`);
+      if (c.phone) contactItems.push(`<a class="cell-link phone-link" href="tel:${esc(c.phone)}">${esc(c.phone)}</a>`);
       if (c.telegram) {
         const tgHref = c.telegram.startsWith("http") ? c.telegram : `https://t.me/${c.telegram.replace(/^@/, "")}`;
-        contactItems.push(`<a class="cell-link" href="${esc(tgHref)}" target="_blank" rel="noopener">Telegram</a>`);
+        contactItems.push(`<a class="cell-link" href="${esc(tgHref)}" target="_blank" rel="noopener">Telegram ↗</a>`);
       }
       if (c.whatsapp) {
-        contactItems.push(`<a class="cell-link" href="${esc(c.whatsapp)}" target="_blank" rel="noopener">WhatsApp</a>`);
+        contactItems.push(`<a class="cell-link" href="${esc(c.whatsapp)}" target="_blank" rel="noopener">WhatsApp ↗</a>`);
       }
 
       const stackBadges = (c.tech_stack || [])
@@ -1216,7 +1216,7 @@ async function loadCompanies() {
           return `<span class="tag blue" title="${esc(o.value_text || lbl)}">${esc(lbl)}</span>`;
         });
 
-      const allBadges = [...stackBadges, ...obsBadges].join(" ") || `<span class="cell-sub">${esc(srcLabels[c.source] || c.source)}</span>`;
+      const allBadges = [...stackBadges, ...obsBadges].join("") || `<span class="cell-sub">${esc(srcLabels[c.source] || c.source)}</span>`;
 
       return `
         <tr>
@@ -1225,10 +1225,10 @@ async function loadCompanies() {
             ${c.address ? `<div class="cell-sub">${esc(c.address)}</div>` : ""}
             ${c.inn ? `<div class="cell-sub">ИНН ${esc(c.inn)}</div>` : ""}
           </td>
-          <td>${esc(c.city || "—")}</td>
+          <td class="cell-city">${esc(c.city || "—")}</td>
           <td>
-            <div>${resourceLinks.join(" · ") || "—"}</div>
-            ${contactItems.length ? `<div class="cell-sub">${contactItems.join(" · ")}</div>` : ""}
+            <div class="links-row">${resourceLinks.join("") || `<span class="cell-sub">—</span>`}</div>
+            ${contactItems.length ? `<div class="links-row">${contactItems.join("")}</div>` : ""}
           </td>
           <td>${allBadges}</td>
           <td class="col-actions">
@@ -1306,10 +1306,10 @@ async function loadProspects() {
       if (p.email) channels.push(`<a class="cell-link" href="mailto:${esc(p.email)}">${esc(p.email)}</a>`);
       if (p.telegram) {
         const tgHref = p.telegram.startsWith("http") ? p.telegram : `https://t.me/${p.telegram.replace(/^@/, "")}`;
-        channels.push(`<a class="cell-link" href="${esc(tgHref)}" target="_blank" rel="noopener">Telegram</a>`);
+        channels.push(`<a class="cell-link" href="${esc(tgHref)}" target="_blank" rel="noopener">Telegram ↗</a>`);
       }
-      if (p.whatsapp) channels.push(`<a class="cell-link" href="${esc(p.whatsapp)}" target="_blank" rel="noopener">WhatsApp</a>`);
-      if (p.phone) channels.push(`<a class="cell-link" href="tel:${esc(p.phone)}">${esc(p.phone)}</a>`);
+      if (p.whatsapp) channels.push(`<a class="cell-link" href="${esc(p.whatsapp)}" target="_blank" rel="noopener">WhatsApp ↗</a>`);
+      if (p.phone) channels.push(`<a class="cell-link phone-link" href="tel:${esc(p.phone)}">${esc(p.phone)}</a>`);
 
       const sc = Number(p.score || 0);
       return `
@@ -1323,7 +1323,7 @@ async function loadProspects() {
             <div class="cell-primary">${esc(p.company || "—")}</div>
             <div class="cell-sub">${esc(p.city || "")}</div>
           </td>
-          <td>${channels.join(" · ") || `<span class="cell-sub">—</span>`}</td>
+          <td><div class="links-row">${channels.join("") || `<span class="cell-sub">—</span>`}</div></td>
           <td><span class="score-pill ${sc >= 65 ? "high" : ""}">${sc}</span></td>
           <td class="col-actions">
             <button type="button" class="secondary-btn sm" data-prepare-prospect="${esc(p.id)}">
@@ -1424,22 +1424,22 @@ async function loadDrafts() {
 
       const contactLinks = [];
       if (siteUrl) {
-        contactLinks.push(`<a class="cell-link" href="${esc(siteUrl)}" target="_blank" rel="noopener">🌐 Открыть карточку / сайт</a>`);
+        contactLinks.push(`<a class="cell-link" href="${esc(siteUrl)}" target="_blank" rel="noopener">Открыть сайт / карточку ↗</a>`);
       }
       if (tgRaw) {
         const tgHref = tgRaw.startsWith("http") ? tgRaw : `https://t.me/${tgRaw.replace(/^@/, "")}`;
-        contactLinks.push(`<a class="cell-link" href="${esc(tgHref)}" target="_blank" rel="noopener">✈️ Telegram</a>`);
+        contactLinks.push(`<a class="cell-link" href="${esc(tgHref)}" target="_blank" rel="noopener">Telegram ↗</a>`);
       }
       if (d.prospect_whatsapp) {
-        contactLinks.push(`<a class="cell-link" href="${esc(d.prospect_whatsapp)}" target="_blank" rel="noopener">💬 WhatsApp</a>`);
+        contactLinks.push(`<a class="cell-link" href="${esc(d.prospect_whatsapp)}" target="_blank" rel="noopener">WhatsApp ↗</a>`);
       }
       if (d.email) {
         const mailSubj = encodeURIComponent(d.subject || `Предложение для ${d.company_name || ""}`);
         const mailBody = encodeURIComponent(d.body || "");
-        contactLinks.push(`<a class="cell-link" href="mailto:${esc(d.email)}?subject=${mailSubj}&body=${mailBody}">✉️ ${esc(d.email)}</a>`);
+        contactLinks.push(`<a class="cell-link" href="mailto:${esc(d.email)}?subject=${mailSubj}&body=${mailBody}">${esc(d.email)}</a>`);
       }
       if (phoneRaw) {
-        contactLinks.push(`<a class="cell-link" href="tel:${esc(phoneRaw)}">📞 ${esc(phoneRaw)}</a>`);
+        contactLinks.push(`<a class="cell-link phone-link" href="tel:${esc(phoneRaw)}">${esc(phoneRaw)}</a>`);
       }
 
       const isEditing = state.editingDraftId === d.id;
@@ -1485,7 +1485,7 @@ async function loadDrafts() {
           }
 
           <div class="draft-bottom">
-            <div class="draft-contacts">${contactLinks.join(" · ") || "Контакты в карточке компании"}</div>
+            <div class="links-row">${contactLinks.join("") || `<span class="cell-sub">Контакты в карточке компании</span>`}</div>
             <div class="draft-actions">
               <button type="button" class="secondary-btn sm" data-copy-draft="${esc(fullCopy)}">Скопировать текст</button>
               <button type="button" class="ghost-btn sm" data-edit-draft="${esc(d.id)}">Редактировать</button>
