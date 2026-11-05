@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from html import escape
 from pathlib import Path
+import re
 import tempfile
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -18,9 +21,6 @@ from friday.agents.writer import generate_draft_for_prospect, run_drafts
 from friday.brain import (
     BrainError,
     apply_agent_task_result,
-    enqueue_agent_task,
-    load_prompt,
-    load_skills,
 )
 from friday.collectors.discover import (
     DiscoveredItem,
@@ -29,10 +29,11 @@ from friday.collectors.discover import (
     persist_discovered_items,
     run_discover,
 )
-from friday.collectors.people import run_people
-from friday.collectors.profile import run_profile
+from friday.collectors.people import extract_people_from_html, run_people
+from friday.collectors.profile import inspect_company_html, run_profile
 from friday.config import is_niche_configured, load_config
 from friday.export import export_drafts_csv, export_drafts_markdown
+from friday.gate import validate_draft
 from friday.jobs import JobManager, JobRecord
 from friday.models.prospect import COMPANY_CONTACT_SOURCE, Prospect
 from friday.paths import SKILLS_DIR
@@ -41,12 +42,66 @@ from friday.state import StateManager
 from friday.trainer import (
     NICHE_TEMPLATES_RU,
     apply_niche_setup,
-    build_train_prompt_context,
     crawl_product_site,
     synthesize_niche_profile,
 )
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((https?://[^)\s]+)\)")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(((?:https?://|mailto:|tel:|/)[^)\s]+)\)")
+
+
+def _markdown_page_to_html(content: str, title: str, page_url: str) -> str:
+    """Преобразует живой слепок страницы (HTML или Jina Reader Markdown) в HTML для детерминированного профайлера."""
+    if "<html" in content.lower() or "<body" in content.lower():
+        return content
+
+    parsed_base = urlparse(page_url or "")
+    base_host = (parsed_base.hostname or "").lower().removeprefix("www.")
+
+    def _repl_img(m: re.Match) -> str:
+        alt = escape(m.group(1) or "")
+        src = m.group(2)
+        return f'<img src="{escape(src)}" alt="{alt}">'
+
+    def _repl_link(m: re.Match) -> str:
+        label = escape(m.group(1) or "")
+        href = m.group(2)
+        p = urlparse(href)
+        h_host = (p.hostname or "").lower().removeprefix("www.")
+        if base_host and h_host == base_host and p.path and p.path != "/":
+            rel = p.path
+            return f'<a href="{escape(rel)}">{label}</a> <a href="{escape(href)}">{label}</a>'
+        return f'<a href="{escape(href)}">{label}</a>'
+
+    body_html = _MD_IMAGE_RE.sub(_repl_img, content)
+    body_html = _MD_LINK_RE.sub(_repl_link, body_html)
+
+    form_tag = ""
+    low = content.lower()
+    if any(
+        kw in low
+        for kw in (
+            "оставить заявку",
+            "заказать звонок",
+            "записаться на консультацию",
+            "обратный звонок",
+            "отправить заявку",
+            "получить консультацию",
+            "онлайн-запись",
+        )
+    ):
+        form_tag = '<form action="/lead"><input type="tel"></form>'
+
+    safe_title = escape(title.strip()) if title else ""
+    return (
+        f"<!doctype html><html><head>"
+        f'<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{safe_title}</title></head><body>"
+        f"{form_tag}\n{body_html}"
+        f"</body></html>"
+    )
 
 
 class NicheSaveRequest(BaseModel):
@@ -63,19 +118,22 @@ class NicheTrainRequest(BaseModel):
     brief: str = ""
     niche_hint: str = ""
     cities: list[str] = Field(default_factory=list)
+    crawled_title: str = ""
+    crawled_text: str = ""
 
 
 class DiscoverRequest(BaseModel):
     query: str = ""
     city: str = ""
     provider: str = "auto"
-    limit: int = Field(default=15, ge=1, le=50)
+    limit: int = Field(default=25, ge=1, le=200)
 
 
 class DraftsRequest(BaseModel):
     channel: str = "telegram"
     min_score: int | None = None
-    limit: int = Field(default=20, ge=1, le=100)
+    city: str = ""
+    limit: int = Field(default=50, ge=1, le=200)
     template_preview: bool = False
 
 
@@ -85,12 +143,27 @@ class SingleDraftRequest(BaseModel):
     template_preview: bool = False
 
 
+class PrepareProposalRequest(BaseModel):
+    company_id: str = ""
+    prospect_id: str = ""
+    channel: str = "telegram"
+
+
+class DraftContentPatch(BaseModel):
+    subject: str = ""
+    body: str
+
+
 class StatusPatch(BaseModel):
     status: str
 
 
 class AgentTaskCompletion(BaseModel):
     response_json: str
+
+
+class WorkspaceClearRequest(BaseModel):
+    city: str = ""
 
 
 class LiveBatchItem(BaseModel):
@@ -108,16 +181,29 @@ class LiveBatchItem(BaseModel):
     telegram: str = ""
     whatsapp: str = ""
     vk: str = ""
+    ymaps_url: str = ""
+    twogis_url: str = ""
     hh_url: str = ""
     source_url: str = ""
     external_id: str = ""
-    source: str = "hh_ru"
+    source: str = "web_ru"
     description: str = ""
     observations: list[dict] = Field(default_factory=list)
 
 
 class LiveBatchRequest(BaseModel):
     items: list[LiveBatchItem] = Field(default_factory=list)
+
+
+class LivePageItem(BaseModel):
+    company_id: str
+    url: str
+    title: str = ""
+    content: str = ""
+
+
+class LivePagesEnrichRequest(BaseModel):
+    pages: list[LivePageItem] = Field(default_factory=list)
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -131,7 +217,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="F.R.I.D.A.Y.",
-        version="0.3.0",
+        version="0.4.0",
         lifespan=_lifespan,
     )
 
@@ -140,21 +226,28 @@ def create_app(db_path: str | None = None) -> FastAPI:
         resp = await call_next(request)
         if "X-Frame-Options" in resp.headers:
             del resp.headers["X-Frame-Options"]
+        path = request.url.path
+        if path == "/" or path.startswith("/static/"):
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
         return resp
 
     @app.get("/api/health")
     async def api_health():
         cfg = load_config()
-        return {"ok": True, "version": "0.3.0", "niche_configured": is_niche_configured(cfg)}
+        return {"ok": True, "version": "0.4.0", "niche_configured": is_niche_configured(cfg)}
 
     @app.get("/api/summary")
     async def api_summary():
         cfg = load_config()
         summary = await state.get_state_summary()
+        cities = await state.list_distinct_cities()
         prod_skill = SKILLS_DIR / "product_knowledge.md"
         comp_skill = SKILLS_DIR / "competitive_intel.md"
         return {
             "summary": summary,
+            "cities": cities,
             "niche_configured": is_niche_configured(cfg),
             "config": cfg.model_dump(),
             "active_jobs": jobs.active_jobs(),
@@ -187,15 +280,29 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         async def _run_train(job: JobRecord) -> dict:
             job.set_step(0, percent=15, detail="Анализ сайта и исходных материалов")
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.1)
             crawl = (
                 await crawl_product_site(req.website, timeout=4.5)
                 if req.website.strip()
                 else {"url": "", "pages": [], "error": ""}
             )
+            if not (crawl.get("pages") or []) and req.crawled_text.strip():
+                crawl = {
+                    "url": req.website.strip(),
+                    "pages": [
+                        {
+                            "url": req.website.strip(),
+                            "title": req.crawled_title.strip(),
+                            "h1": req.crawled_title.strip(),
+                            "description": "",
+                            "snippet": req.crawled_text.strip()[:3500],
+                        }
+                    ],
+                    "error": "",
+                }
 
             job.set_step(1, percent=52, detail="Формирование портрета клиентов и поисковых запросов")
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.15)
             profile_data = synthesize_niche_profile(
                 website=req.website,
                 crawl=crawl,
@@ -205,12 +312,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
 
             job.set_step(2, percent=82, detail="Настройка критериев отбора и параметров тона")
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.15)
             cfg = load_config()
             saved = apply_niche_setup(profile_data, base_config=cfg)
 
             job.set_step(3, percent=96, detail="Сохранение профиля проекта")
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.08)
             new_cfg = load_config()
             job.complete(
                 {
@@ -265,6 +372,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "city": c,
                     "provider": req.provider,
                     "limit": req.limit,
+                    "search_queries": cfg.icp.search_queries[:5],
                     "inserted_companies": 0,
                     "prospects_saved": 0,
                     "scored": 0,
@@ -277,11 +385,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
             peop = await run_people(state, limit=max(10, req.limit), config=cfg)
 
             job.set_step(2, percent=90, detail="Оценка релевантности найденных карточек")
-            scor = await score_all_prospects(state, use_ai=False, limit=200, config=cfg)
+            scor = await score_all_prospects(state, use_ai=False, limit=300, config=cfg)
             found_companies = disc.get("inserted_companies", 0) + disc.get("updated_companies", 0)
             found_prospects = disc.get("inserted_prospects", 0) + peop.get("prospects_saved", 0)
             res = {
                 "network_isolated": False,
+                "city": c,
                 "inserted_companies": disc.get("inserted_companies", 0),
                 "updated_companies": disc.get("updated_companies", 0),
                 "profiled": prof.get("checked", 0),
@@ -291,15 +400,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
             }
             job.complete(
                 res,
-                summary_stage=f"Найдено компаний: {found_companies} · Руководителей: {found_prospects}",
+                summary_stage=f"Найдено компаний ({c}): {found_companies} · Контактов ЛПР: {found_prospects}",
             )
             return res
 
         rec = jobs.start(
             kind="discover",
-            title="Поиск и обогащение компаний",
+            title=f"Поиск компаний ({c})",
             step_labels=[
-                f"Поиск по запросу «{q}»",
+                f"Поиск по запросу «{q}» в г. {c}",
                 "Анализ сайтов и контактов ЛПР",
                 "Оценка релевантности",
             ],
@@ -308,30 +417,45 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return rec.as_dict()
 
     @app.post("/api/jobs/enrich")
-    async def api_job_enrich():
+    async def api_job_enrich(city: str = ""):
         cfg = load_config()
 
         async def _run_enrich(job: JobRecord) -> dict:
             job.set_step(0, percent=25, detail="Анализ сайтов и маркетинговых сигналов")
-            prof = await run_profile(state, limit=40)
+            prof = await run_profile(state, limit=50)
             job.set_step(1, percent=65, detail="Поиск руководителей и прямых контактов")
-            peop = await run_people(state, limit=40, config=cfg)
+            peop = await run_people(state, limit=50, config=cfg)
             job.set_step(2, percent=90, detail="Расчёт оценки соответствия профилю")
-            scor = await score_all_prospects(state, use_ai=False, limit=200, config=cfg)
+            scor = await score_all_prospects(state, use_ai=False, limit=300, config=cfg)
+
+            candidates = await state.get_companies(limit=80, city=city or None)
+            web_targets = [
+                {"company_id": c.id, "name": c.name, "website": c.website or (f"https://{c.domain}" if c.domain else "")}
+                for c in candidates
+                if (c.website or c.domain)
+            ]
+            isolated = prof.get("checked", 0) == 0 and len(web_targets) > 0 and prof.get("unreachable", 0) >= 0
+
             res = {
+                "network_isolated": isolated and prof.get("checked", 0) == 0,
+                "targets": web_targets[:40] if prof.get("checked", 0) == 0 else [],
                 "profiled": prof.get("checked", 0),
                 "prospects_saved": peop.get("prospects_saved", 0),
                 "scored": scor.get("scored", 0),
             }
             job.complete(
                 res,
-                summary_stage=f"Проверено сайтов: {res['profiled']} · Контактов ЛПР: {res['scored']}",
+                summary_stage=(
+                    "Подготовка прямого аудита сайтов"
+                    if res["network_isolated"]
+                    else f"Проверено сайтов: {res['profiled']} · Контактов ЛПР: {res['scored']}"
+                ),
             )
             return res
 
         rec = jobs.start(
             kind="enrich",
-            title="Анализ сайтов и поиск ЛПР",
+            title="Аудит сайтов и поиск ЛПР",
             step_labels=[
                 "Анализ сайтов и сигналов",
                 "Извлечение руководителей и контактов",
@@ -341,20 +465,128 @@ def create_app(db_path: str | None = None) -> FastAPI:
         )
         return rec.as_dict()
 
+    @app.post("/api/enrich/live-pages")
+    async def api_enrich_live_pages(req: LivePagesEnrichRequest):
+        """Детерминированный разбор живых страниц компаний (аудит стека + сигналы + извлечение ФИО ЛПР)."""
+        cfg = load_config()
+        profiled = 0
+        people_added = 0
+        obs_added = 0
+
+        for page in req.pages[:50]:
+            comp = await state.get_company(page.company_id)
+            if not comp or not page.content.strip():
+                continue
+
+            html_doc = _markdown_page_to_html(page.content, page.title, page.url or comp.website)
+            parsed = inspect_company_html(
+                html_doc,
+                final_url=page.url or comp.website or f"https://{comp.domain}",
+                elapsed_ms=650.0,
+                had_https_redirect=(page.url or comp.website).startswith("https://"),
+            )
+
+            await state.update_company_profile_fields(
+                comp.id,
+                name=parsed.get("title", "")[:120] if not comp.name else "",
+                inn=parsed.get("inn", ""),
+                description=parsed.get("description", ""),
+                phone=parsed.get("phone", ""),
+                telegram=parsed.get("telegram", ""),
+                whatsapp=parsed.get("whatsapp", ""),
+                vk=parsed.get("vk", ""),
+                tenchat=parsed.get("tenchat", ""),
+                tech_stack=parsed.get("tech_stack") or [],
+                signals=[o["signal_code"] for o in parsed.get("observations") or []],
+            )
+            for obs in parsed.get("observations") or []:
+                oid = await state.record_observation(
+                    signal_code=obs["signal_code"],
+                    company_id=comp.id,
+                    collector="profile",
+                    value_num=obs.get("value_num"),
+                    value_text=obs.get("value_text", ""),
+                    evidence_url=obs.get("evidence_url") or page.url,
+                    require_confirmed=True,
+                )
+                if oid:
+                    obs_added += 1
+
+            refreshed_comp = await state.get_company(comp.id) or comp
+            found_people = extract_people_from_html(
+                html_doc,
+                page_url=page.url or comp.website,
+                company=refreshed_comp,
+                custom_titles=cfg.icp.decision_maker_titles,
+            )
+            for person in found_people:
+                pid, created = await state.upsert_prospect(person)
+                if created:
+                    people_added += 1
+                    await state.record_observation(
+                        signal_code="DECISION_MAKER_FOUND",
+                        company_id=comp.id,
+                        prospect_id=pid,
+                        collector="people",
+                        value_text=f"{person.full_name} — {person.title}",
+                        evidence_url=page.url or comp.website,
+                        require_confirmed=True,
+                    )
+                if person.email and person.email_source == "personal_page":
+                    await state.record_observation(
+                        signal_code="PERSONAL_EMAIL_FOUND",
+                        company_id=comp.id,
+                        prospect_id=pid,
+                        collector="people",
+                        value_text=person.email,
+                        evidence_url=page.url or comp.website,
+                        require_confirmed=True,
+                    )
+
+            if not found_people:
+                await state.ensure_company_prospect(comp.id)
+
+            await state.mark_prospects_checked(comp.id)
+            profiled += 1
+
+        scor = await score_all_prospects(state, use_ai=False, limit=300, config=cfg)
+        return {
+            "ok": True,
+            "profiled": profiled,
+            "observations_recorded": obs_added,
+            "prospects_added": people_added,
+            "scored": scor.get("scored", 0),
+        }
+
     @app.post("/api/jobs/drafts")
     async def api_job_drafts(req: DraftsRequest):
         cfg = load_config()
         if not is_niche_configured(cfg):
             raise HTTPException(
                 status_code=400,
-                detail="Сначала заполните информацию о вашем проекте во вкладке «Проект»",
+                detail="Сначала настройте параметры вашего проекта во вкладке «Проект»",
             )
 
         async def _run_dr(job: JobRecord) -> dict:
-            job.set_step(0, percent=20, detail="Отбор релевантных получателей и сигналов")
-            await score_all_prospects(state, use_ai=False, limit=200, config=cfg)
+            city_scope = req.city.strip()
+            job.set_step(0, percent=18, detail="Отбор организаций, контактов и подтверждённых сигналов")
+            companies = await state.get_companies(limit=max(req.limit * 2, 100), city=city_scope or None)
+            for comp in companies[: req.limit]:
+                await state.ensure_company_prospect(comp.id)
+
+            await score_all_prospects(state, use_ai=False, limit=300, config=cfg)
             min_s = cfg.icp.min_fit_score if req.min_score is None else req.min_score
-            prospects = await state.get_prospects(min_score=min_s, limit=req.limit * 2)
+            prospects = await state.get_prospects(
+                min_score=min_s,
+                city=city_scope or None,
+                limit=req.limit * 2,
+            )
+            if not prospects and min_s > 0:
+                prospects = await state.get_prospects(
+                    min_score=0,
+                    city=city_scope or None,
+                    limit=req.limit * 2,
+                )
 
             ready = 0
             blocked = 0
@@ -362,13 +594,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
             target_list = prospects[: req.limit]
             total = max(1, len(target_list))
 
-            job.set_step(1, percent=45, detail="Подготовка персональных писем")
+            job.set_step(1, percent=42, detail="Подготовка персональных предложений")
             for idx, p in enumerate(target_list, start=1):
                 pct = 40 + int((idx / total) * 52)
                 job.set_step(
                     1,
                     percent=min(94, pct),
-                    detail=f"Подготовка текста ({idx} из {len(target_list)}): {p.company or p.full_name}",
+                    detail=f"Подготовка предложения ({idx} из {len(target_list)}): {p.company or p.full_name}",
                 )
                 r = await generate_draft_for_prospect(
                     state,
@@ -383,57 +615,67 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     blocked += 1
                 else:
                     skipped += 1
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.03)
 
-            job.set_step(2, percent=97, detail="Проверка качества и сохранение черновиков")
-            await asyncio.sleep(0.1)
-            res = {"drafts_ready": ready, "gate_blocked": blocked, "skipped": skipped}
+            job.set_step(2, percent=97, detail="Проверка качества и сохранение предложений")
+            await asyncio.sleep(0.06)
+            res = {
+                "drafts_ready": ready,
+                "gate_blocked": blocked,
+                "skipped": skipped,
+                "city": city_scope,
+            }
             job.complete(
                 res,
-                summary_stage=f"Подготовлено черновиков: {ready}",
+                summary_stage=f"Подготовлено предложений: {ready}",
             )
             return res
 
+        scope_label = f" ({req.city.strip()})" if req.city.strip() else ""
         rec = jobs.start(
             kind="drafts",
-            title="Подготовка черновиков",
+            title=f"Подготовка предложений{scope_label}",
             step_labels=[
-                "Отбор получателей и сигналов",
-                "Написание персональных обращений",
-                "Финальная проверка текстов",
+                "Отбор организаций и сигналов аудита",
+                "Формирование персональных предложений",
+                "Проверка соответствия правилам (Gate)",
             ],
             runner=_run_dr,
         )
         return rec.as_dict()
 
-    @app.post("/api/jobs/sample")
-    async def api_job_sample():
+    @app.post("/api/proposals/prepare")
+    async def api_prepare_proposal(req: PrepareProposalRequest):
+        """Мгновенная подготовка персонального предложения по конкретной компании или ЛПР."""
         cfg = load_config()
-
-        async def _run_smp(job: JobRecord) -> dict:
-            job.set_step(0, percent=35, detail="Создание демонстрационных компаний под ваш профиль")
-            await asyncio.sleep(0.15)
-            stats = await seed_sample_for_active_niche(state, config=cfg)
-            job.set_step(1, percent=85, detail="Расчёт релевантности и сохранение карточек")
-            await asyncio.sleep(0.15)
-            job.complete(
-                stats,
-                summary_stage=f"Добавлено демо-компаний: {stats.get('inserted_companies', 0)}",
+        if not is_niche_configured(cfg):
+            raise HTTPException(
+                status_code=400,
+                detail="Сначала настройте параметры вашего проекта во вкладке «Проект»",
             )
-            return stats
+        prospect: Prospect | None = None
+        if req.prospect_id.strip():
+            prospect = await state.get_prospect(req.prospect_id.strip())
+        elif req.company_id.strip():
+            prospect = await state.ensure_company_prospect(req.company_id.strip())
 
-        rec = jobs.start(
-            kind="sample",
-            title="Загрузка демо-данных",
-            step_labels=[
-                "Генерация карточек под выбранную нишу",
-                "Оценка релевантности",
-            ],
-            runner=_run_smp,
+        if not prospect:
+            raise HTTPException(status_code=404, detail="Организация или контакт не найдены")
+
+        await score_all_prospects(state, use_ai=False, limit=250, config=cfg)
+        prospect = await state.get_prospect(prospect.id) or prospect
+
+        res = await generate_draft_for_prospect(
+            state,
+            prospect,
+            channel=req.channel,
+            mode_override="template",
+            config=cfg,
         )
-        return rec.as_dict()
+        draft_obj = await state.get_draft(res["draft_id"]) if res.get("draft_id") else None
+        return {"ok": True, "result": res, "draft": draft_obj}
 
-    # ── Ниша и продукт (синхронные REST-маршруты и CLI-совместимость) ──
+    # ── Ниша и продукт ──
 
     @app.get("/api/niche/presets")
     async def api_niche_presets():
@@ -460,6 +702,20 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
         cfg = load_config()
         crawl = await crawl_product_site(req.website) if req.website.strip() else {"url": "", "pages": [], "error": ""}
+        if not (crawl.get("pages") or []) and req.crawled_text.strip():
+            crawl = {
+                "url": req.website.strip(),
+                "pages": [
+                    {
+                        "url": req.website.strip(),
+                        "title": req.crawled_title.strip(),
+                        "h1": req.crawled_title.strip(),
+                        "description": "",
+                        "snippet": req.crawled_text.strip()[:3500],
+                    }
+                ],
+                "error": "",
+            }
         profile_data = synthesize_niche_profile(
             website=req.website,
             crawl=crawl,
@@ -477,7 +733,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "crawl_error": crawl.get("error", ""),
         }
 
-    # ── Сигналы, Компании, ЛПР, Черновики ──
+    # ── Сигналы, Компании, ЛПР, Предложения (Черновики) ──
 
     @app.get("/api/signals")
     async def api_signals(status: str | None = None):
@@ -494,13 +750,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return {"ok": True, "code": code.upper(), "status": patch.status}
 
     @app.get("/api/companies")
-    async def api_companies(require: str = "", exclude: str = "", limit: int = 200):
+    async def api_companies(
+        require: str = "",
+        exclude: str = "",
+        city: str = "",
+        limit: int = 200,
+    ):
         req_codes = [c.strip().upper() for c in require.split(",") if c.strip()]
         exc_codes = [c.strip().upper() for c in exclude.split(",") if c.strip()]
         if req_codes or exc_codes:
-            companies = await state.cohort(require=req_codes, exclude=exc_codes)
+            companies = await state.cohort(require=req_codes, exclude=exc_codes, city=city or None)
         else:
-            companies = await state.get_companies(limit=limit)
+            companies = await state.get_companies(limit=limit, city=city or None)
 
         out = []
         for c in companies[:limit]:
@@ -510,20 +771,54 @@ def create_app(db_path: str | None = None) -> FastAPI:
             out.append(d)
         return {"items": out}
 
+    @app.delete("/api/companies/{company_id}")
+    async def api_delete_company(company_id: str):
+        ok = await state.delete_company(company_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Компания не найдена")
+        return {"ok": True, "id": company_id}
+
+    @app.post("/api/workspace/clear")
+    async def api_workspace_clear(req: WorkspaceClearRequest):
+        res = await state.clear_workspace_data(city=req.city or None)
+        return {"ok": True, **res}
+
     @app.get("/api/prospects")
-    async def api_prospects(min_score: int = 0, status: str | None = None, limit: int = 200):
-        prospects = await state.get_prospects(status=status, min_score=min_score, limit=limit)
+    async def api_prospects(
+        min_score: int = 0,
+        status: str | None = None,
+        city: str = "",
+        company_id: str = "",
+        limit: int = 200,
+    ):
+        prospects = await state.get_prospects(
+            status=status,
+            min_score=min_score,
+            company_id=company_id or None,
+            city=city or None,
+            limit=limit,
+        )
         out = []
         for p in prospects:
             d = asdict(p)
             d["full_name"] = p.full_name
-            d["polite_greeting"] = p.polite_greeting
             out.append(d)
         return {"items": out}
 
     @app.get("/api/drafts")
-    async def api_drafts(status: str | None = None, channel: str | None = None):
-        return {"items": await state.list_drafts(status=status, channel=channel, limit=300)}
+    async def api_drafts(
+        status: str | None = None,
+        channel: str | None = None,
+        city: str = "",
+    ):
+        return {
+            "items": await state.list_drafts(
+                status=status,
+                channel=channel,
+                city=city or None,
+                limit=300,
+            )
+        }
 
     @app.patch("/api/drafts/{draft_id}")
     async def api_patch_draft(draft_id: str, patch: StatusPatch):
@@ -532,8 +827,41 @@ def create_app(db_path: str | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not ok:
-            raise HTTPException(status_code=404, detail="Черновик не найден")
+            raise HTTPException(status_code=404, detail="Предложение не найдено")
         return {"ok": True, "id": draft_id, "status": patch.status}
+
+    @app.patch("/api/drafts/{draft_id}/content")
+    async def api_patch_draft_content(draft_id: str, patch: DraftContentPatch):
+        existing = await state.get_draft(draft_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Предложение не найдено")
+        cfg = load_config()
+        gate_res = validate_draft(
+            channel=existing["channel"],
+            subject=patch.subject,
+            body=patch.body,
+            company_domain=existing.get("domain") or "",
+            prospect_email=existing.get("email") or "",
+            prospect_telegram=existing.get("prospect_telegram") or existing.get("company_telegram") or "",
+            config=cfg,
+        )
+        new_status = "pending_review" if gate_res.passed else "gate_blocked"
+        notes = [*gate_res.reasons, *gate_res.warnings]
+        await state.update_draft_content(
+            draft_id,
+            subject=patch.subject,
+            body=patch.body,
+            status=new_status,
+            gate_notes=notes,
+        )
+        updated = await state.get_draft(draft_id)
+        return {
+            "ok": True,
+            "gate_passed": gate_res.passed,
+            "status": new_status,
+            "gate_notes": notes,
+            "draft": updated,
+        }
 
     # ── Прямые этапы конвейера ──
 
@@ -579,7 +907,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 default_industry=industry.strip() or cfg.icp.niche,
             )
             stats = await persist_discovered_items(state, parsed, config=cfg, run_id="web_upload")
-            await score_all_prospects(state, use_ai=False, limit=200, config=cfg)
+            await score_all_prospects(state, use_ai=False, limit=300, config=cfg)
             return {"ok": True, "filename": file.filename, **stats}
         finally:
             tmp_path.unlink(missing_ok=True)
@@ -594,7 +922,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         )
         pairs: list[tuple[DiscoveredItem, Prospect | None]] = []
 
-        for raw in req.items[:60]:
+        for raw in req.items[:200]:
             name = raw.name.strip()
             if not name:
                 continue
@@ -605,7 +933,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 website = ""
 
             hh_url = raw.hh_url.strip()
-            if not website and not hh_url and not raw.phone.strip() and not raw.email.strip():
+            ymaps_url = raw.ymaps_url.strip()
+            twogis_url = raw.twogis_url.strip()
+            source_url = raw.source_url.strip() or website or ymaps_url or twogis_url or hh_url
+            if not website and not hh_url and not ymaps_url and not twogis_url and not raw.phone.strip() and not raw.email.strip():
                 continue
 
             obs_clean: list[dict] = []
@@ -619,7 +950,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         "collector": str(o.get("collector") or raw.source or "live"),
                         "value_num": o.get("value_num"),
                         "value_text": str(o.get("value_text") or "")[:240],
-                        "evidence_url": str(o.get("evidence_url") or website or hh_url or raw.source_url)[:300],
+                        "evidence_url": str(o.get("evidence_url") or source_url)[:300],
                     }
                 )
 
@@ -635,10 +966,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 telegram=raw.telegram.strip(),
                 whatsapp=raw.whatsapp.strip(),
                 vk=raw.vk.strip(),
+                ymaps_url=ymaps_url,
+                twogis_url=twogis_url,
                 hh_url=hh_url,
                 external_id=raw.external_id.strip(),
-                source=raw.source.strip() or "hh_ru",
-                source_url=raw.source_url.strip() or website or hh_url,
+                source=raw.source.strip() or "web_ru",
+                source_url=source_url,
                 description=raw.description.strip()[:400],
                 observations=obs_clean,
             )
@@ -664,27 +997,27 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 industry=item.industry,
                 city=item.city,
                 source=COMPANY_CONTACT_SOURCE if not first_n else "public_contact",
-                source_url=website or hh_url or raw.source_url.strip(),
+                source_url=source_url,
             )
             pairs.append((item, prospect))
 
         stats = await persist_discovered_items(state, pairs, config=cfg, run_id="live_browser_batch")
-        scor = await score_all_prospects(state, use_ai=False, limit=300, config=cfg)
+        scor = await score_all_prospects(state, use_ai=False, limit=400, config=cfg)
         return {"ok": True, **stats, "scored": scor.get("scored", 0)}
 
     @app.post("/api/run/profile")
     async def api_run_profile():
-        return await run_profile(state, limit=30)
+        return await run_profile(state, limit=50)
 
     @app.post("/api/run/prospects")
     async def api_run_prospects():
         cfg = load_config()
-        return await run_people(state, limit=30, config=cfg)
+        return await run_people(state, limit=50, config=cfg)
 
     @app.post("/api/run/score")
     async def api_run_score(use_ai: bool = False):
         cfg = load_config()
-        return await score_all_prospects(state, use_ai=use_ai, limit=200, config=cfg)
+        return await score_all_prospects(state, use_ai=use_ai, limit=300, config=cfg)
 
     @app.post("/api/run/drafts")
     async def api_run_drafts(req: DraftsRequest):
@@ -694,6 +1027,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             channel=req.channel,
             min_score=req.min_score,
             limit=req.limit,
+            city=req.city or None,
             mode_override="template" if req.template_preview else None,
             config=cfg,
         )
@@ -725,7 +1059,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         kind_labels = {
             "train_niche": "Настройка профиля проекта",
             "scout_score": "Квалификация и скоринг ЛПР",
-            "writer_draft": "Подготовка персонального черновика",
+            "writer_draft": "Подготовка персонального предложения",
         }
         enriched = []
         for item in raw_items:
@@ -784,7 +1118,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return Response(
             content=content.encode("utf-8"),
             media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": 'attachment; filename="friday_drafts.csv"'},
+            headers={"Content-Disposition": 'attachment; filename="friday_proposals.csv"'},
         )
 
     @app.get("/api/export/markdown")
@@ -796,6 +1130,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/")
     async def index_page():
-        return FileResponse(WEB_DIR / "index.html")
+        return FileResponse(
+            WEB_DIR / "index.html",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
 
     return app

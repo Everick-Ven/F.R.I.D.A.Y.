@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>F.R.I.D.A.Y.</title>
-  <link rel="stylesheet" href="/static/app.css?v=4" />
+  <link rel="stylesheet" href="/static/app.css?v=5" />
 </head>
 <body>
   <header class="topbar">
@@ -24,14 +24,14 @@
           Поиск и база <span class="nav-badge" id="badge-companies">0</span>
         </button>
         <button type="button" class="nav-btn" data-tab="drafts">
-          Черновики <span class="nav-badge" id="badge-drafts">0</span>
+          Предложения <span class="nav-badge" id="badge-drafts">0</span>
         </button>
         <button type="button" class="nav-btn" data-tab="signals">Сигналы</button>
       </nav>
 
       <div class="topbar-actions">
-        <button type="button" class="ghost-btn sm" id="btn-export-csv">CSV</button>
-        <button type="button" class="ghost-btn sm" id="btn-export-md">MD</button>
+        <button type="button" class="ghost-btn sm" id="btn-export-csv" title="Выгрузить предложения в CSV">CSV</button>
+        <button type="button" class="ghost-btn sm" id="btn-export-md" title="Выгрузить отчёт в Markdown">MD</button>
       </div>
     </div>
   </header>
@@ -61,7 +61,7 @@
         <div class="surface-head">
           <div>
             <h1 class="surface-title">Настройка проекта</h1>
-            <p class="surface-sub">Укажите сайт и опишите ваш продукт — система сформирует портрет клиентов и поисковые запросы.</p>
+            <p class="surface-sub">Укажите сайт и опишите ваш продукт — система изучит сайт, сформирует портрет целевых клиентов и поисковые запросы.</p>
           </div>
           <div class="preset-strip" id="niche-presets-bar"></div>
         </div>
@@ -73,19 +73,19 @@
           </label>
           <label class="field">
             <span class="field-label">Целевая аудитория</span>
-            <input id="train-niche-hint" type="text" placeholder="Например: Адвокаты и адвокатские бюро" autocomplete="off" />
+            <input id="train-niche-hint" type="text" placeholder="Например: Адвокатские бюро и коллегии адвокатов" autocomplete="off" />
           </label>
           <label class="field span-2">
             <span class="field-label">Описание продукта или услуги</span>
             <textarea id="train-brief" rows="3" placeholder="Чем вы помогаете клиентам, ключевые услуги и формат первого шага"></textarea>
           </label>
           <label class="field">
-            <span class="field-label">Города поиска</span>
-            <input id="train-cities" type="text" placeholder="Москва, Санкт-Петербург, Екатеринбург, Казань" />
+            <span class="field-label">Целевые города РФ</span>
+            <input id="train-cities" type="text" placeholder="Ростов-на-Дону, Москва, Санкт-Петербург, Краснодар" />
           </label>
           <div class="field field-end">
             <button type="button" id="btn-train-niche" class="primary-btn full-w">
-              Сформировать профиль
+              Изучить сайт и настроить профиль
             </button>
           </div>
         </div>
@@ -95,14 +95,14 @@
         <div class="surface-head">
           <div>
             <h2 class="surface-title">Параметры профиля</h2>
-            <p class="surface-sub">Используются при поиске компаний, оценке релевантности и подготовке писем.</p>
+            <p class="surface-sub">Используются при поиске организаций, аудите сайтов, оценке релевантности и подготовке предложений.</p>
           </div>
           <button type="button" id="btn-save-niche" class="secondary-btn">Сохранить изменения</button>
         </div>
 
         <div class="grid-2">
           <div class="subpanel">
-            <h3 class="subpanel-title">Отправитель и предложение</h3>
+            <h3 class="subpanel-title">Отправитель и коммерческое предложение</h3>
             <label class="field">
               <span class="field-label">Название компании / бренда</span>
               <input id="cfg-persona-company" type="text" placeholder="Название вашей компании" />
@@ -114,7 +114,7 @@
               </label>
               <label class="field">
                 <span class="field-label">Должность</span>
-                <input id="cfg-persona-role" type="text" placeholder="Руководитель проектов" />
+                <input id="cfg-persona-role" type="text" placeholder="Управляющий партнёр" />
               </label>
             </div>
             <div class="grid-2 compact">
@@ -136,7 +136,7 @@
               <textarea id="cfg-product-desc" rows="3" placeholder="Лаконичное описание ценности для клиента"></textarea>
             </label>
             <label class="field">
-              <span class="field-label">Предлагаемый первый шаг</span>
+              <span class="field-label">Предлагаемый первый шаг (CTA)</span>
               <input id="cfg-offer-entry" type="text" placeholder="прислать короткий разбор из 3 точек роста" />
             </label>
           </div>
@@ -153,16 +153,16 @@
             </label>
             <label class="field">
               <span class="field-label">Города (через запятую)</span>
-              <input id="cfg-icp-cities" type="text" placeholder="Москва, Санкт-Петербург" />
+              <input id="cfg-icp-cities" type="text" placeholder="Ростов-на-Дону, Москва, Краснодар" />
             </label>
             <label class="field">
               <span class="field-label">Целевые должности ЛПР (через запятую)</span>
-              <input id="cfg-icp-titles" type="text" placeholder="управляющий партнёр, генеральный директор" />
+              <input id="cfg-icp-titles" type="text" placeholder="управляющий партнёр, председатель, директор" />
             </label>
             <div class="grid-2 compact">
               <label class="field">
                 <span class="field-label">Сигнальные вакансии</span>
-                <input id="cfg-icp-hiring" type="text" placeholder="маркетолог, РОП" />
+                <input id="cfg-icp-hiring" type="text" placeholder="маркетолог, помощник адвоката" />
               </label>
               <label class="field">
                 <span class="field-label">Отраслевой режим</span>
@@ -178,15 +178,19 @@
         </div>
 
         <details class="clean-details">
-          <summary>Дополнительные параметры и база знаний</summary>
+          <summary>Дополнительные параметры, стоп-лист (DNC) и база знаний</summary>
           <div class="details-body grid-2">
             <label class="field">
               <span class="field-label">Отрасли (через запятую)</span>
-              <input id="cfg-icp-industries" type="text" placeholder="Юридические услуги, Консалтинг" />
+              <input id="cfg-icp-industries" type="text" placeholder="Юридические услуги, Адвокатура" />
             </label>
             <label class="field">
               <span class="field-label">Ориентир стоимости</span>
               <input id="cfg-product-pricing" type="text" placeholder="по расчёту проекта" />
+            </label>
+            <label class="field span-2">
+              <span class="field-label">Стоп-лист (домены, email или @telegram — по одному в строке)</span>
+              <textarea id="cfg-dnc-list" rows="2" placeholder="competitor.ru&#10;info@ignore.ru&#10;@blocked_user"></textarea>
             </label>
             <label class="field span-2">
               <span class="field-label">Преимущества (по одному в строке)</span>
@@ -194,7 +198,7 @@
             </label>
             <label class="field span-2">
               <span class="field-label">Памятка по продукту</span>
-              <textarea id="cfg-skill-md" rows="5"></textarea>
+              <textarea id="cfg-skill-md" rows="4"></textarea>
             </label>
           </div>
         </details>
@@ -209,62 +213,80 @@
           <strong class="metric-value" id="kpi-companies">0</strong>
         </div>
         <div class="metric-card">
-          <span class="metric-label">Руководители</span>
+          <span class="metric-label">Контакты и ЛПР</span>
           <strong class="metric-value" id="kpi-prospects">0</strong>
         </div>
         <div class="metric-card">
-          <span class="metric-label">Сигналы</span>
+          <span class="metric-label">Сигналы аудита</span>
           <strong class="metric-value" id="kpi-observations">0</strong>
         </div>
         <div class="metric-card">
-          <span class="metric-label">Черновики</span>
+          <span class="metric-label">Предложения</span>
           <strong class="metric-value" id="kpi-drafts">0</strong>
         </div>
       </div>
 
       <div class="surface">
         <div class="search-toolbar">
-          <input id="inp-query" class="flex-2" type="text" placeholder="Поисковый запрос (или по умолчанию из профиля)" />
-          <input id="inp-city" class="flex-1" type="text" placeholder="Город" />
-          <select id="sel-provider" class="w-source">
+          <input id="inp-query" class="flex-2" type="text" placeholder="Поисковый запрос (например: адвокатское бюро)" />
+          <input id="inp-city" class="flex-1" type="text" placeholder="Город (например: Ростов-на-Дону)" />
+          <select id="sel-limit" class="w-limit" title="Максимальное количество организаций за поиск">
+            <option value="15">До 15 комп.</option>
+            <option value="30" selected>До 30 комп.</option>
+            <option value="50">До 50 комп.</option>
+            <option value="100">До 100 комп.</option>
+          </select>
+          <select id="sel-provider" class="w-source" title="Источники поиска">
             <option value="auto">Все источники</option>
-            <option value="hh">HeadHunter</option>
-            <option value="web">Веб-поиск</option>
-            <option value="yandex_search">Яндекс Поиск</option>
-            <option value="twogis">2ГИС</option>
+            <option value="web">Веб-поиск (сайты)</option>
             <option value="yandex_maps">Яндекс Карты</option>
+            <option value="hh">HeadHunter</option>
+            <option value="twogis">Геокаталоги / OSM</option>
           </select>
           <button type="button" id="btn-discover" class="primary-btn">Найти компании</button>
         </div>
 
+        <div id="quick-hints-bar" class="quick-hints"></div>
+
         <div class="pipeline-bar">
           <div class="pipeline-left">
             <input id="inp-import-file" type="file" accept=".csv,.json,.jsonl,.txt" class="sr-only" />
-            <button type="button" id="btn-trigger-upload" class="ghost-btn">Импорт списка</button>
-            <button type="button" id="btn-enrich" class="ghost-btn">Обновить сайты и ЛПР</button>
+            <button type="button" id="btn-trigger-upload" class="ghost-btn">Импорт списка (.csv/.json/.txt)</button>
+            <button type="button" id="btn-enrich" class="ghost-btn">Аудит сайтов и поиск ЛПР</button>
           </div>
           <div class="pipeline-right">
-            <select id="sel-draft-channel" class="compact-select">
+            <select id="sel-draft-channel" class="compact-select" title="Канал для подготовки предложений">
               <option value="telegram">Telegram</option>
               <option value="email">Email</option>
               <option value="whatsapp">WhatsApp</option>
             </select>
-            <button type="button" id="btn-generate-drafts" class="secondary-btn accent-border">
-              Создать черновики
+            <button type="button" id="btn-generate-drafts" class="primary-btn">
+              Подготовить предложения
             </button>
           </div>
         </div>
       </div>
 
       <div class="surface">
+        <div class="city-bar">
+          <div class="city-pills-wrap">
+            <span class="filter-caption">Город в таблице:</span>
+            <div id="city-filter-pills" class="city-pills"></div>
+          </div>
+          <button type="button" id="btn-clear-db" class="ghost-btn sm danger-text" title="Очистить текущий город или всю базу">
+            Очистить выборку
+          </button>
+        </div>
+
         <div class="subview-bar">
           <div class="segmented" id="db-subtabs">
             <button type="button" class="seg-btn active" data-subview="companies">Компании</button>
-            <button type="button" class="seg-btn" data-subview="prospects">Руководители (ЛПР)</button>
+            <button type="button" class="seg-btn" data-subview="prospects">Руководители и контакты</button>
           </div>
           <div class="cohort-inline" id="cohort-controls">
-            <input id="inp-require-codes" type="text" placeholder="Фильтр по коду сигнала…" />
-            <button type="button" id="btn-filter-cohort" class="ghost-btn sm">Применить</button>
+            <select id="sel-require-signal" class="compact-select">
+              <option value="">Все сигналы аудита</option>
+            </select>
           </div>
         </div>
 
@@ -273,11 +295,11 @@
             <table>
               <thead>
                 <tr>
-                  <th>Компания</th>
+                  <th>Организация и адрес</th>
                   <th>Город</th>
-                  <th>Контакты</th>
-                  <th>Сигналы</th>
-                  <th>Источник</th>
+                  <th>Сайты и контакты</th>
+                  <th>Аудит стека и сигналы</th>
+                  <th class="col-actions">Действия</th>
                 </tr>
               </thead>
               <tbody id="companies-tbody"></tbody>
@@ -290,12 +312,12 @@
             <table>
               <thead>
                 <tr>
-                  <th>ФИО</th>
+                  <th>ФИО / Контакт</th>
                   <th>Должность</th>
-                  <th>Компания</th>
+                  <th>Организация и город</th>
                   <th>Каналы связи</th>
                   <th>Оценка</th>
-                  <th></th>
+                  <th class="col-actions">Действия</th>
                 </tr>
               </thead>
               <tbody id="prospects-tbody"></tbody>
@@ -305,7 +327,7 @@
       </div>
     </section>
 
-    <!-- РАЗДЕЛ 3: ЧЕРНОВИКИ -->
+    <!-- РАЗДЕЛ 3: ПРЕДЛОЖЕНИЯ -->
     <section id="tab-drafts" class="view">
       <div class="surface">
         <div class="drafts-toolbar">
@@ -314,14 +336,22 @@
             <button type="button" class="seg-btn" data-status="pending_review">На проверке</button>
             <button type="button" class="seg-btn" data-status="approved">Одобрены</button>
             <button type="button" class="seg-btn" data-status="sent_manually">Отправлены</button>
-            <button type="button" class="seg-btn" data-status="rejected">Отклонены</button>
+            <button type="button" class="seg-btn" data-status="gate_blocked">Заблокированы</button>
           </div>
-          <select id="flt-draft-channel" class="compact-select">
-            <option value="">Все каналы</option>
-            <option value="telegram">Telegram</option>
-            <option value="email">Email</option>
-            <option value="whatsapp">WhatsApp</option>
-          </select>
+          <div class="drafts-toolbar-right">
+            <select id="flt-draft-city" class="compact-select">
+              <option value="">Все города</option>
+            </select>
+            <select id="flt-draft-channel" class="compact-select">
+              <option value="">Все каналы</option>
+              <option value="telegram">Telegram</option>
+              <option value="email">Email</option>
+              <option value="whatsapp">WhatsApp</option>
+            </select>
+            <button type="button" id="btn-drafts-tab-generate" class="primary-btn sm">
+              Подготовить предложения
+            </button>
+          </div>
         </div>
 
         <div id="drafts-list" class="drafts-stack"></div>
@@ -333,8 +363,8 @@
       <div class="surface">
         <div class="surface-head">
           <div>
-            <h2 class="surface-title">Каталог сигналов</h2>
-            <p class="surface-sub">Выберите коммерческие и технические признаки, которые учитываются при отборе компаний.</p>
+            <h2 class="surface-title">Каталог сигналов аудита</h2>
+            <p class="surface-sub">Технические и коммерческие признаки, которые система проверяет на сайтах и в карточках компаний РФ.</p>
           </div>
         </div>
         <div class="table-wrap">
@@ -356,6 +386,6 @@
   </main>
 
   <div id="toast" class="toast hidden" role="status"></div>
-  <script src="/static/app.js?v=4"></script>
+  <script src="/static/app.js?v=5"></script>
 </body>
 </html>

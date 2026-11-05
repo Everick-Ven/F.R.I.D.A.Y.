@@ -59,7 +59,7 @@ def test_dashboard_starts_clean_and_supports_niche_presets_and_pipeline(
 
         tasks = client.get("/api/agent-tasks?status=pending").json()["items"]
         assert len(tasks) >= 1
-        assert tasks[0]["kind_label"] == "Подготовка персонального черновика"
+        assert tasks[0]["kind_label"] == "Подготовка персонального предложения"
         assert "prompt_text" not in tasks[0]
 
         # Отмена одной ожидающей задачи из UI
@@ -67,9 +67,15 @@ def test_dashboard_starts_clean_and_supports_niche_presets_and_pipeline(
         assert del_r.status_code == 200
         assert del_r.json()["status"] == "cancelled"
 
-        # Проверяем, что в UI нет ручного копирования промптов, очереди агента и технических заметок
-        html_txt = client.get("/").text
-        js_txt = client.get("/static/app.js").text
+        # Проверяем отсутствие кэширования, заглушек «Демо-данные» и технических промптов
+        root_resp = client.get("/")
+        js_resp = client.get("/static/app.js")
+        assert "no-store" in root_resp.headers.get("cache-control", "")
+        assert "no-store" in js_resp.headers.get("cache-control", "")
+        html_txt = root_resp.text
+        js_txt = js_resp.text
+        assert "Демо-данные" not in html_txt + js_txt
+        assert "btn-sample" not in html_txt + js_txt
         assert "Скопировать полный промпт задачи" not in html_txt + js_txt
         assert "Применить JSON-ответ" not in html_txt + js_txt
         assert "Очередь задач ИИ-агента" not in html_txt + js_txt
@@ -147,16 +153,94 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
         assert summary["config"]["icp"]["niche"] == "Адвокаты и адвокатские бюро"
         assert summary["config"]["compliance"]["regulated_niche"] == "legal_advocates"
 
-        # Демо-карточки под адвокатскую нишу + генерация черновиков с прогрессом
-        smp = client.post("/api/jobs/sample").json()
-        for _ in range(30):
-            smp = client.get(f"/api/jobs/{smp['id']}").json()
-            if smp["status"] != "running":
-                break
-            time.sleep(0.05)
-        assert smp["status"] == "completed"
+        # Импорт живых карточек в двух разных городах (Ростов-на-Дону и Москва) + фильтр города
+        batch_res = client.post(
+            "/api/import/live-batch",
+            json={
+                "items": [
+                    {
+                        "name": "Адвокатское бюро Грата Интернешнл Ростов-на-Дону",
+                        "website": "https://rostovadvocat.ru",
+                        "city": "Ростов-на-Дону",
+                        "address": "Ростов-на-Дону, пр. Михаила Нагибина, 28",
+                        "phone": "+7 (863) 245-08-28",
+                        "source": "web_ru",
+                    },
+                    {
+                        "name": "Адвокатское бюро Премиум",
+                        "ymaps_url": "https://yandex.ru/maps/org/premium/1166100050984/",
+                        "city": "Ростов-на-Дону",
+                        "address": "Ростов-на-Дону, Социалистическая ул., 74",
+                        "phone": "+7 (863) 200-11-22",
+                        "inn": "6165200323",
+                        "source": "yandex_maps",
+                    },
+                    {
+                        "name": "МКА Князев и партнеры",
+                        "website": "https://kniazev.ru",
+                        "city": "Москва",
+                        "phone": "+7 (495) 987-18-70",
+                        "source": "web_ru",
+                    },
+                ]
+            },
+        )
+        assert batch_res.status_code == 200
+        assert batch_res.json()["inserted_companies"] == 3
 
-        dr = client.post("/api/jobs/drafts", json={"channel": "telegram", "limit": 10}).json()
+        # Строгая фильтрация по городу Ростов-на-Дону (без московских карточек!)
+        rostov_comps = client.get("/api/companies?city=Ростов-на-Дону").json()["items"]
+        assert len(rostov_comps) == 2
+        assert all(c["city"] == "Ростов-на-Дону" for c in rostov_comps)
+
+        # Живой аудит страницы компании + извлечение ФИО ЛПР
+        rostov_web_comp = next(c for c in rostov_comps if c["website"])
+        enrich_res = client.post(
+            "/api/enrich/live-pages",
+            json={
+                "pages": [
+                    {
+                        "company_id": rostov_web_comp["id"],
+                        "url": "https://rostovadvocat.ru",
+                        "title": "Адвокатское бюро в Ростове-на-Дону",
+                        "content": (
+                            "![Logo](https://rostovadvocat.ru/wp-content/uploads/logo.png)\n"
+                            "Управляющий партнёр Сердюков Константин Владимирович\n"
+                            "Телефон: +7 (863) 245-08-28, почта: partner@rostovadvocat.ru, ИНН 6164012345"
+                        ),
+                    }
+                ]
+            },
+        )
+        assert enrich_res.status_code == 200
+        assert enrich_res.json()["profiled"] == 1
+        assert enrich_res.json()["prospects_added"] >= 1
+
+        # Точечная кнопка «Подготовить предложение» по конкретной компании + онлайн-редактирование с проверкой Gate
+        prep_res = client.post(
+            "/api/proposals/prepare",
+            json={"company_id": rostov_web_comp["id"], "channel": "telegram"},
+        )
+        assert prep_res.status_code == 200
+        draft_obj = prep_res.json()["draft"]
+        assert draft_obj is not None
+        assert "Константин Владимирович" in draft_obj["body"]
+
+        edit_ok = client.patch(
+            f"/api/drafts/{draft_obj['id']}/content",
+            json={
+                "subject": "",
+                "body": "Константин Владимирович, здравствуйте. Изучил сайт rostovadvocat.ru. Подскажите, актуально ли прислать короткий разбор из 3 точек роста?",
+            },
+        )
+        assert edit_ok.status_code == 200
+        assert edit_ok.json()["gate_passed"] is True
+
+        # Пакетная подготовка предложений только по г. Ростов-на-Дону
+        dr = client.post(
+            "/api/jobs/drafts",
+            json={"channel": "telegram", "city": "Ростов-на-Дону", "limit": 10},
+        ).json()
         for _ in range(40):
             dr = client.get(f"/api/jobs/{dr['id']}").json()
             if dr["status"] != "running":
@@ -165,7 +249,7 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
         assert dr["status"] == "completed"
         assert dr["result"]["drafts_ready"] >= 2
 
-        drafts = client.get("/api/drafts").json()["items"]
+        drafts = client.get("/api/drafts?city=Ростов-на-Дону").json()["items"]
         assert len(drafts) >= 2
         assert all("Не задано" not in d["body"] for d in drafts)
         assert all(d["status"] == "pending_review" for d in drafts)

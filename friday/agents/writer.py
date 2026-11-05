@@ -53,77 +53,113 @@ def _build_template_draft(
     channel: str,
     cfg: FridayConfig,
 ) -> dict:
-    greeting = prospect.polite_greeting
+    raw_greeting = (prospect.polite_greeting or "коллеги").strip()
+    greeting = raw_greeting[:1].upper() + raw_greeting[1:] if raw_greeting else "Коллеги"
     cname = company.name if company and company.name else (prospect.company or "вашей компании")
-    dom = (company.domain or company.website) if company else ""
+    quoted_cname = cname if ("«" in cname or '"' in cname) else f"«{cname}»"
+    dom = (company.domain or "") if company else ""
     city = (company.city if company and company.city else prospect.city) or "вашем регионе"
     obs = _pick_primary_observation(observations)
     codes = {o["signal_code"]: o for o in observations}
 
+    def _lc_first(s: str) -> str:
+        st = (s or "").strip().rstrip(".")
+        if not st:
+            return ""
+        # Не понижаем регистр аббревиатур и собственных имён (Яндекс, Tilda, VK, HTTP, SSL)
+        first_word = st.split()[0]
+        if first_word.isupper() or any(first_word.startswith(p) for p in ("Яндекс", "Tilda", "WordPress", "Битрикс", "VK", "Telegram")):
+            return st
+        return st[:1].lower() + st[1:]
+
     if "HH_HIRING_ROLE" in codes and "NO_ONLINE_CAPTURE" in codes:
         sig_code = "HH_HIRING_ROLE+NO_ONLINE_CAPTURE"
         fact_sentence = (
-            f"Обратил внимание, что в «{cname}» сейчас открыт подбор ({codes['HH_HIRING_ROLE']['value_text']}), "
+            f"Обратил внимание, что в {quoted_cname} сейчас открыт подбор ({_lc_first(codes['HH_HIRING_ROLE']['value_text'])}), "
             f"при этом на сайте {dom} пока нет быстрых форм захвата и кнопок мессенджеров."
-        )
-        audit_summary = (
-            f"1) Сигнал роста на hh.ru ({codes['HH_HIRING_ROLE']['value_text']}). "
-            f"2) На сайте {dom} отсутствует быстрый онлайн-захват обращений."
         )
     elif obs and obs["signal_code"] == "HH_HIRING_ROLE":
         sig_code = "HH_HIRING_ROLE"
         fact_sentence = (
-            f"Увидел у «{cname}» открытую вакансию на hh.ru ({obs.get('value_text', '')}) "
+            f"Увидел у {quoted_cname} открытую вакансию на hh.ru ({_lc_first(obs.get('value_text', ''))}) "
             f"и решил написать напрямую."
         )
-        audit_summary = f"1) Открытый найм на hh.ru: {obs.get('value_text', '')}."
     elif "YANDEX_DIRECT_ACTIVE" in codes and ("NO_ONLINE_CAPTURE" in codes or "NO_YANDEX_METRIKA" in codes):
         sig_code = "YANDEX_DIRECT_ACTIVE"
         fact_sentence = (
             f"Посмотрел сайт {dom}: увидел активную рекламу в Яндекс.Директе, "
             f"но заметил точку потери части обращений на посадочной странице."
         )
-        audit_summary = f"1) На {dom} работает реклама Яндекс.Директа. 2) Обнаружена потеря конверсии на входе."
     elif obs and obs["signal_code"] == "YANDEX_PAGE2_RANK":
         sig_code = "YANDEX_PAGE2_RANK"
         fact_sentence = (
-            f"Изучал выдачу в {city}: сайт {dom} уже стоит в шаге от первой страницы Яндекса "
-            f"({obs.get('value_text', '')})."
+            f"Изучал выдачу в г. {city}: сайт {dom} уже стоит в шаге от первой страницы Яндекса "
+            f"({_lc_first(obs.get('value_text', ''))})."
         )
-        audit_summary = f"1) {obs.get('value_text', '')}. 2) Быстрый резерв роста органического трафика."
     elif obs and obs["signal_code"] in ("LOW_MAP_RATING", "NO_WEBSITE_ON_MAP"):
         sig_code = obs["signal_code"]
         fact_sentence = (
-            f"Посмотрел карточку «{cname}» в геосервисах ({city}) — заметил конкретную точку роста "
-            f"по обращениям ({obs.get('value_text', '')})."
+            f"Посмотрел карточку {quoted_cname} в геосервисах ({city}) — заметил конкретную точку роста: "
+            f"{_lc_first(obs.get('value_text', ''))}."
         )
-        audit_summary = f"1) Карточка геосервиса: {obs.get('value_text', '')}."
     elif obs:
         sig_code = obs["signal_code"]
+        target_ref = f"{quoted_cname} ({dom})" if dom else f"{quoted_cname} ({city})"
         fact_sentence = (
-            f"Посмотрел сайт «{cname}» ({dom or city}) и отметил деталь: {obs.get('value_text', '')}."
+            f"Посмотрел ресурс {target_ref} и отметил точку роста: {_lc_first(obs.get('value_text', ''))}."
         )
-        audit_summary = f"1) Наблюдение: {obs.get('value_text', '')}."
     else:
         sig_code = "ICP_FIT"
+        target_ref = f"{quoted_cname} ({dom})" if dom else f"{quoted_cname} ({city})"
         fact_sentence = (
-            f"Познакомился с деятельностью «{cname}» в {city} — мы работаем как раз с компаниями вашей сферы."
+            f"Изучил публичный профиль {target_ref} в г. {city} — мы работаем как раз с практиками и компаниями вашего профиля."
         )
-        audit_summary = f"1) Профильная компания ниши «{cfg.icp.niche}» ({city})."
 
-    offer_raw = cfg.product.description.strip()
-    max_offer_words = 26 if channel in ("telegram", "whatsapp") else 52
+    audit_points: list[str] = []
+    for idx, o in enumerate(observations[:3], start=1):
+        txt = (o.get("value_text") or o["signal_code"]).strip().rstrip(".")
+        audit_points.append(f"{idx}) {txt}.")
+    if company and company.tech_stack:
+        audit_points.append(f"Стек: {', '.join(company.tech_stack[:4])}.")
+    if company and company.address:
+        audit_points.append(f"Локация: {company.address}.")
+    if not audit_points:
+        audit_points.append(f"1) Профильная организация ниши «{cfg.icp.niche}» ({city}).")
+    audit_summary = " ".join(audit_points)
+
+    offer_raw = cfg.product.description.strip().replace("!", ".")
+    max_offer_words = 30 if channel in ("telegram", "whatsapp") else 55
     offer_words = offer_raw.split()
+    dangling_tail = {
+        "и", "а", "но", "или", "да", "либо", "в", "во", "на", "с", "со",
+        "к", "ко", "по", "из", "от", "до", "для", "при", "за", "над", "под",
+        "о", "об", "у", "без", "между", "через", "учётом", "учетом",
+    }
     if len(offer_words) > max_offer_words:
-        trimmed = " ".join(offer_words[:max_offer_words]).rstrip(",;:-— ")
+        cut = offer_words[:max_offer_words]
+        # Предпочитаем обрезать на ближайшей запятой или точке во второй половине фразы
+        comma_idx = -1
+        for i in range(len(cut) - 1, max(8, len(cut) // 2), -1):
+            if cut[i].endswith((",", ".", ";")):
+                comma_idx = i
+                break
+        if comma_idx != -1:
+            cut = cut[: comma_idx + 1]
+        while cut and cut[-1].strip(",;:-—.").lower() in dangling_tail:
+            cut.pop()
+        trimmed = " ".join(cut).rstrip(",;:-— ")
         offer_line = trimmed if trimmed.endswith(".") else f"{trimmed}."
     else:
         offer_line = offer_raw if offer_raw.endswith(".") else f"{offer_raw}."
 
-    cta_goal = (cfg.product.offer.entry or "прислать короткий разбор из 3 пунктов").strip().rstrip(".?")
-    person_name = cfg.persona.name.strip() if cfg.persona.name and cfg.persona.name.strip() != "Не задано" else ""
+    cta_goal = (cfg.product.offer.entry or "прислать короткий разбор из 3 пунктов").strip().rstrip(".?!")
+    placeholder_names = {"не задано", "ваше имя", "имя отправителя", ""}
+    raw_pname = (cfg.persona.name or "").strip()
+    person_name = raw_pname if raw_pname.lower() not in placeholder_names else ""
     role_name = cfg.persona.role.strip() if cfg.persona.role else ""
-    comp_name = cfg.persona.company.strip() if cfg.persona.company and cfg.persona.company not in ("Ваша компания", "Наш проект") else ""
+    placeholder_comps = {"ваша компания", "наш проект", "название компании", ""}
+    raw_cname = (cfg.persona.company or "").strip()
+    comp_name = raw_cname if raw_cname.lower() not in placeholder_comps else ""
 
     if person_name and comp_name:
         sender_sign = f"{person_name}, {comp_name}"
@@ -134,6 +170,8 @@ def _build_template_draft(
     else:
         sender_sign = role_name or "Команда проекта"
 
+    fact_sentence = fact_sentence.replace("!", ".")
+
     if channel in ("telegram", "whatsapp"):
         body = (
             f"{greeting}, здравствуйте. {fact_sentence}\n\n"
@@ -143,7 +181,7 @@ def _build_template_draft(
         )
         subject = ""
     else:
-        subject = f"вопрос по «{cname}» ({dom or city})"[:78]
+        subject = f"разбор для «{cname}» ({dom or city})".replace("!", "")[:78]
         body = (
             f"{greeting}, добрый день.\n\n"
             f"{fact_sentence}\n\n"
@@ -298,13 +336,22 @@ async def run_drafts(
     *,
     channel: str = "telegram",
     min_score: int | None = None,
-    limit: int = 20,
+    limit: int = 50,
+    city: str | None = None,
     mode_override: str | None = None,
     config: FridayConfig | None = None,
 ) -> dict:
     cfg = config or load_config()
     threshold = min_score if min_score is not None else cfg.icp.min_fit_score
-    prospects = await state.get_prospects(min_score=threshold, limit=limit)
+
+    # Гарантируем, что у найденных компаний в выбранном городе есть карточка получателя
+    companies = await state.get_companies(limit=max(limit * 2, 100), city=city)
+    for comp in companies[:limit]:
+        await state.ensure_company_prospect(comp.id)
+
+    prospects = await state.get_prospects(min_score=threshold, city=city, limit=limit)
+    if not prospects and threshold > 0:
+        prospects = await state.get_prospects(min_score=0, city=city, limit=limit)
 
     created = 0
     blocked = 0

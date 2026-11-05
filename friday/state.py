@@ -411,10 +411,24 @@ class StateManager:
             async with db.execute(sql, tuple(params)) as cur:
                 return [dict(r) for r in await cur.fetchall()]
 
+    @staticmethod
+    def _matches_city(city_filter: str | None, *candidates: str) -> bool:
+        if not city_filter or not city_filter.strip():
+            return True
+        needle = city_filter.strip().lower().replace("ё", "е")
+        if needle in ("все", "все города", "all", "*"):
+            return True
+        for raw in candidates:
+            hay = (raw or "").strip().lower().replace("ё", "е")
+            if needle in hay or (hay and hay in needle and len(hay) >= 4):
+                return True
+        return False
+
     async def cohort(
         self,
         require: list[str] | None = None,
         exclude: list[str] | None = None,
+        city: str | None = None,
     ) -> list[Company]:
         require = [c for c in (require or []) if c]
         exclude = [c for c in (exclude or []) if c]
@@ -432,7 +446,10 @@ class StateManager:
         sql = f"SELECT * FROM companies c WHERE {' AND '.join(where)} ORDER BY c.created_at DESC"
         async with self._connect() as db:
             async with db.execute(sql, tuple(params)) as cur:
-                return [self._company_from_row(r) for r in await cur.fetchall()]
+                rows = [self._company_from_row(r) for r in await cur.fetchall()]
+        if city and city.strip():
+            rows = [c for c in rows if self._matches_city(city, c.city, c.address)]
+        return rows
 
     # ── Companies ──
 
@@ -654,13 +671,58 @@ class StateManager:
                 row = await cur.fetchone()
                 return self._company_from_row(row) if row else None
 
-    async def get_companies(self, limit: int = 500) -> list[Company]:
+    async def get_companies(self, limit: int = 500, city: str | None = None) -> list[Company]:
         async with self._connect() as db:
             async with db.execute(
-                "SELECT * FROM companies ORDER BY created_at DESC LIMIT ?",
-                (limit,),
+                "SELECT * FROM companies ORDER BY created_at DESC",
             ) as cur:
-                return [self._company_from_row(r) for r in await cur.fetchall()]
+                rows = [self._company_from_row(r) for r in await cur.fetchall()]
+        if city and city.strip():
+            rows = [c for c in rows if self._matches_city(city, c.city, c.address)]
+        return rows[:limit]
+
+    async def list_distinct_cities(self) -> list[dict]:
+        async with self._connect() as db:
+            async with db.execute("SELECT city FROM companies WHERE TRIM(city) != ''") as cur:
+                counts: dict[str, int] = {}
+                labels: dict[str, str] = {}
+                for r in await cur.fetchall():
+                    raw = (r["city"] or "").strip()
+                    if not raw:
+                        continue
+                    key = raw.lower().replace("ё", "е")
+                    counts[key] = counts.get(key, 0) + 1
+                    labels.setdefault(key, raw)
+        items = [{"city": labels[k], "count": counts[k]} for k in counts]
+        items.sort(key=lambda x: (-x["count"], x["city"]))
+        return items
+
+    async def delete_company(self, company_id: str) -> bool:
+        async with self._connect() as db:
+            await db.execute("DELETE FROM drafts WHERE company_id = ?", (company_id,))
+            await db.execute("DELETE FROM observations WHERE company_id = ?", (company_id,))
+            await db.execute("DELETE FROM prospects WHERE company_id = ?", (company_id,))
+            cur = await db.execute("DELETE FROM companies WHERE id = ?", (company_id,))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def clear_workspace_data(self, city: str | None = None) -> dict:
+        if city and city.strip() and city.strip().lower() not in ("все", "все города", "all", "*"):
+            targets = await self.get_companies(limit=5000, city=city)
+            removed = 0
+            for comp in targets:
+                if await self.delete_company(comp.id):
+                    removed += 1
+            return {"deleted_companies": removed, "city": city.strip()}
+
+        async with self._connect() as db:
+            await db.execute("DELETE FROM drafts")
+            await db.execute("DELETE FROM observations")
+            await db.execute("DELETE FROM prospects")
+            cur = await db.execute("DELETE FROM companies")
+            await db.execute("DELETE FROM agent_tasks")
+            await db.commit()
+            return {"deleted_companies": cur.rowcount, "city": ""}
 
     async def companies_needing_profile(self, limit: int = 100, stale_days: int = 90) -> list[Company]:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=stale_days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -811,6 +873,7 @@ class StateManager:
         status: str | None = None,
         min_score: int = 0,
         company_id: str | None = None,
+        city: str | None = None,
         limit: int = 500,
     ) -> list[Prospect]:
         where, params = [], []
@@ -826,11 +889,40 @@ class StateManager:
         sql = "SELECT * FROM prospects"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY score DESC, created_at DESC LIMIT ?"
-        params.append(limit)
+        sql += " ORDER BY score DESC, created_at DESC"
         async with self._connect() as db:
             async with db.execute(sql, tuple(params)) as cur:
-                return [self._prospect_from_row(r) for r in await cur.fetchall()]
+                rows = [self._prospect_from_row(r) for r in await cur.fetchall()]
+        if city and city.strip():
+            rows = [p for p in rows if self._matches_city(city, p.city)]
+        return rows[:limit]
+
+    async def ensure_company_prospect(self, company_id: str) -> Prospect | None:
+        comp = await self.get_company(company_id)
+        if not comp:
+            return None
+        existing = await self.get_prospects(company_id=company_id, limit=10)
+        if existing:
+            named = [p for p in existing if p.first_name.strip()]
+            return named[0] if named else existing[0]
+        p = Prospect(
+            company_id=comp.id,
+            title="Руководитель / партнёр",
+            role_kind="decision_maker",
+            phone=comp.phone,
+            telegram=comp.telegram,
+            whatsapp=comp.whatsapp,
+            vk=comp.vk,
+            tenchat=comp.tenchat,
+            company=comp.name,
+            industry=comp.industry,
+            city=comp.city,
+            source=comp.source or "company_card",
+            source_url=comp.website or comp.source_url,
+            score=55,
+        )
+        pid, _ = await self.upsert_prospect(p)
+        return await self.get_prospect(pid)
 
     async def update_prospect_scoring(
         self,
@@ -909,12 +1001,50 @@ class StateManager:
                 row = await cur.fetchone()
                 return row["id"] if row else did
 
+    async def get_draft(self, draft_id: str) -> dict | None:
+        rows = await self.list_drafts(limit=1000)
+        for item in rows:
+            if item.get("id") == draft_id:
+                return item
+        return None
+
+    async def update_draft_content(
+        self,
+        draft_id: str,
+        *,
+        subject: str,
+        body: str,
+        status: str,
+        gate_notes: list[str],
+    ) -> bool:
+        now = _utcnow_str()
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                UPDATE drafts
+                SET subject = ?, body = ?, status = ?, gate_notes_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    subject.strip(),
+                    body.strip(),
+                    status,
+                    json.dumps(gate_notes, ensure_ascii=False),
+                    now,
+                    draft_id,
+                ),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
     async def list_drafts(
         self,
         *,
         status: str | None = None,
         channel: str | None = None,
         prospect_id: str | None = None,
+        company_id: str | None = None,
+        city: str | None = None,
         limit: int = 200,
     ) -> list[dict]:
         where, params = [], []
@@ -927,13 +1057,18 @@ class StateManager:
         if prospect_id:
             where.append("d.prospect_id = ?")
             params.append(prospect_id)
+        if company_id:
+            where.append("d.company_id = ?")
+            params.append(company_id)
 
         sql = """
             SELECT d.*,
                    p.first_name, p.middle_name, p.last_name, p.title,
                    p.email, p.telegram AS prospect_telegram, p.whatsapp AS prospect_whatsapp,
-                   p.phone AS prospect_phone, p.score, p.registry_id,
+                   p.phone AS prospect_phone, p.score, p.registry_id, p.city AS prospect_city,
                    c.name AS company_name, c.domain, c.website, c.city, c.industry,
+                   c.address AS company_address, c.phone AS company_phone,
+                   c.ymaps_url, c.hh_url, c.source_url AS company_source_url,
                    c.telegram AS company_telegram
             FROM drafts d
             JOIN prospects p ON p.id = d.prospect_id
@@ -941,16 +1076,18 @@ class StateManager:
         """
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY p.score DESC, d.updated_at DESC LIMIT ?"
-        params.append(limit)
+        sql += " ORDER BY p.score DESC, d.updated_at DESC"
         async with self._connect() as db:
             async with db.execute(sql, tuple(params)) as cur:
                 out = []
                 for r in await cur.fetchall():
                     item = dict(r)
                     item["gate_notes"] = _parse_json_list(item.pop("gate_notes_json", "[]"))
+                    if city and city.strip():
+                        if not self._matches_city(city, item.get("city") or "", item.get("prospect_city") or "", item.get("company_address") or ""):
+                            continue
                     out.append(item)
-                return out
+                return out[:limit]
 
     async def set_draft_status(self, draft_id: str, status: str) -> bool:
         if status not in ("pending_review", "approved", "sent_manually", "rejected", "gate_blocked"):
