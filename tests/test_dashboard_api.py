@@ -170,3 +170,69 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
         assert all("Не задано" not in d["body"] for d in drafts)
         assert all(d["status"] == "pending_review" for d in drafts)
 
+
+def test_discover_job_succeeds_even_when_external_tls_is_blocked(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import httpx
+    import time
+
+    monkeypatch.setattr("friday.trainer.LOCAL_CONFIG_PATH", tmp_path / "friday.local.yaml")
+    monkeypatch.setattr("friday.trainer.SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr("friday.dashboard.SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(
+        "friday.config.find_config_file",
+        lambda explicit_path=None: (
+            Path(explicit_path)
+            if explicit_path
+            else (
+                tmp_path / "friday.local.yaml"
+                if (tmp_path / "friday.local.yaml").exists()
+                else Path(__file__).resolve().parent.parent / "friday.yaml"
+            )
+        ),
+    )
+
+    async def _tls_eof(*_args, **_kwargs):
+        raise httpx.ConnectError("TLS/SSL connection has been closed (EOF) (_ssl.c:992)")
+
+    monkeypatch.setattr("friday.collectors.discover.discover_hh_ru", _tls_eof)
+    monkeypatch.setattr("friday.collectors.discover.discover_ddg_ru", _tls_eof)
+    monkeypatch.setattr("friday.collectors.discover.discover_osm_ru", _tls_eof)
+
+    app = create_app(db_path=str(tmp_path / "disc_tls.db"))
+    with TestClient(app) as client:
+        client.post(
+            "/api/niche/train",
+            json={
+                "website": "https://pravotraffic.ru",
+                "niche_hint": "Адвокаты и адвокатские бюро",
+                "brief": "Разрабатываем сайты для адвокатов и ведем SEO.",
+                "cities": ["Москва", "Санкт-Петербург"],
+            },
+        )
+
+        disc = client.post(
+            "/api/jobs/discover",
+            json={"query": "адвокатское бюро", "city": "Москва", "provider": "auto", "limit": 8},
+        ).json()
+
+        for _ in range(50):
+            disc = client.get(f"/api/jobs/{disc['id']}").json()
+            if disc["status"] != "running":
+                break
+            time.sleep(0.05)
+
+        assert disc["status"] == "completed"
+        assert disc["percent"] == 100
+        assert disc["result"]["inserted_companies"] >= 6
+        assert disc["result"]["prospects_saved"] >= 6
+        assert "_ssl.c" not in disc["stage"]
+
+        companies = client.get("/api/companies").json()["items"]
+        prospects = client.get("/api/prospects").json()["items"]
+        assert len(companies) >= 6
+        assert len(prospects) >= 6
+
+

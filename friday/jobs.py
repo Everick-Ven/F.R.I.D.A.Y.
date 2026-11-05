@@ -50,9 +50,14 @@ class JobRecord:
             st.state = "done"
 
     def fail(self, message: str) -> None:
+        raw = str(message or "").strip()
+        if any(tok in raw.lower() for tok in ("_ssl.c", "eof", "connecterror", "timed out")):
+            clean_msg = "Внешний источник временно недоступен по сети. Повторите запрос или используйте импорт файла."
+        else:
+            clean_msg = raw or "Не удалось завершить операцию"
         self.status = "failed"
-        self.error = message
-        self.stage = message
+        self.error = clean_msg
+        self.stage = clean_msg
         self.finished_at = time.time()
         for st in self.steps:
             if st.state == "active":

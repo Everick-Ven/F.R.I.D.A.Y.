@@ -376,7 +376,7 @@ async def profile_single_company(
                     signal_code="SITE_UNREACHABLE",
                     company_id=company.id,
                     collector="profile",
-                    value_text=str(http_err)[:160],
+                    value_text="Сайт недоступен по сети",
                     evidence_url=http_url,
                     run_id=run_id,
                 )
@@ -387,7 +387,7 @@ async def profile_single_company(
                 signal_code="SITE_UNREACHABLE",
                 company_id=company.id,
                 collector="profile",
-                value_text=str(https_err)[:160],
+                value_text="Сайт недоступен по сети",
                 evidence_url=https_url,
                 run_id=run_id,
             )

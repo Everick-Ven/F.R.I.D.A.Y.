@@ -233,7 +233,7 @@ async def discover_hh_ru(
     items: list[DiscoveredItem] = []
     seen_emp_ids: set[str] = set()
 
-    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.5), headers=headers) as client:
         resp = await client.get(
             "https://api.hh.ru/vacancies",
             params={
@@ -602,7 +602,7 @@ async def discover_ddg_ru(query: str, city: str, *, limit: int = 20) -> list[Dis
     }
     items: list[DiscoveredItem] = []
     seen_domains: set[str] = set()
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.5), follow_redirects=True) as client:
         resp = await client.post(
             "https://html.duckduckgo.com/html/",
             data={"q": full_q, "kl": "ru-ru"},
@@ -668,7 +668,7 @@ async def discover_osm_ru(query: str, city: str, *, limit: int = 25) -> list[Dis
     out center {min(limit, 50)};
     """
     items: list[DiscoveredItem] = []
-    async with httpx.AsyncClient(timeout=18.0) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.5)) as client:
         resp = await client.post(
             "https://overpass-api.de/api/interpreter",
             data={"data": overpass_ql},
@@ -927,6 +927,10 @@ async def persist_discovered_items(
             if p_created:
                 inserted_prospects += 1
 
+        if (item.external_id or "").startswith("catalog:"):
+            await state.mark_profile_checked(cid)
+            await state.mark_prospects_checked(cid)
+
     return {
         "inserted_companies": inserted_companies,
         "updated_companies": updated_companies,
@@ -934,6 +938,13 @@ async def persist_discovered_items(
         "recorded_observations": recorded_obs,
         "skipped_dnc": skipped_dnc,
     }
+
+
+_PROVIDER_ALIASES = {
+    "hh": "hh_ru",
+    "web": "ddg_ru",
+    "osm": "osm_ru",
+}
 
 
 async def run_discover(
@@ -945,60 +956,99 @@ async def run_discover(
     limit: int = 25,
     config: FridayConfig | None = None,
 ) -> dict:
-    """Запускает поиск целевых компаний РФ без использования LLM ($0)."""
+    """Запускает поиск целевых компаний РФ с устойчивой обработкой сетевых ошибок."""
     cfg = config or load_config()
+    norm_provider = _PROVIDER_ALIASES.get(provider.strip().lower(), provider.strip().lower() or "auto")
     run_id = await state.start_run(
         stage="discover",
-        provider=provider,
+        provider=norm_provider,
         params={"query": query, "city": city, "limit": limit},
     )
     try:
-        collected: list[DiscoveredItem] = []
+        collected_pairs: list[tuple[DiscoveredItem, Prospect | None]] = []
         used_providers: list[str] = []
+        network_errors = 0
 
-        if provider in ("auto", "yandex_search") and os.getenv("YANDEX_SEARCH_API_KEY"):
-            res = await discover_yandex_search(query, city, limit=limit)
-            if res:
-                collected.extend(res)
-                used_providers.append("yandex_search")
+        if norm_provider in ("auto", "yandex_search") and os.getenv("YANDEX_SEARCH_API_KEY"):
+            try:
+                res = await discover_yandex_search(query, city, limit=limit)
+                if res:
+                    collected_pairs.extend((it, None) for it in res)
+                    used_providers.append("yandex_search")
+            except (httpx.HTTPError, OSError):
+                network_errors += 1
 
-        if provider in ("auto", "twogis") and os.getenv("TWOGIS_API_KEY"):
-            res = await discover_twogis(query, city, limit=limit)
-            if res:
-                collected.extend(res)
-                used_providers.append("twogis")
+        if norm_provider in ("auto", "twogis") and os.getenv("TWOGIS_API_KEY"):
+            try:
+                res = await discover_twogis(query, city, limit=limit)
+                if res:
+                    collected_pairs.extend((it, None) for it in res)
+                    used_providers.append("twogis")
+            except (httpx.HTTPError, OSError):
+                network_errors += 1
 
-        if provider in ("auto", "yandex_maps") and os.getenv("YANDEX_MAPS_API_KEY"):
-            res = await discover_yandex_maps(query, city, limit=limit)
-            if res:
-                collected.extend(res)
-                used_providers.append("yandex_maps")
+        if norm_provider in ("auto", "yandex_maps") and os.getenv("YANDEX_MAPS_API_KEY"):
+            try:
+                res = await discover_yandex_maps(query, city, limit=limit)
+                if res:
+                    collected_pairs.extend((it, None) for it in res)
+                    used_providers.append("yandex_maps")
+            except (httpx.HTTPError, OSError):
+                network_errors += 1
 
-        if provider in ("auto", "hh_ru"):
+        if norm_provider in ("auto", "hh_ru"):
             hiring_roles = cfg.icp.hiring_signals[:2] if cfg.icp.hiring_signals else [""]
             hh_found: list[DiscoveredItem] = []
             for role in hiring_roles:
-                hh_res = await discover_hh_ru(query, city, hiring_role=role, limit=max(10, limit // max(1, len(hiring_roles))))
-                hh_found.extend(hh_res)
+                try:
+                    hh_res = await discover_hh_ru(
+                        query,
+                        city,
+                        hiring_role=role,
+                        limit=max(10, limit // max(1, len(hiring_roles))),
+                    )
+                    hh_found.extend(hh_res)
+                except (httpx.HTTPError, OSError):
+                    network_errors += 1
+                    break
             if hh_found:
-                collected.extend(hh_found[:limit])
+                collected_pairs.extend((it, None) for it in hh_found[:limit])
                 used_providers.append("hh_ru")
 
-        if provider == "ddg_ru" or (provider == "auto" and len(collected) < limit):
-            res = await discover_ddg_ru(query, city, limit=limit)
-            if res:
-                collected.extend(res)
-                used_providers.append("ddg_ru")
+        if norm_provider == "ddg_ru" or (norm_provider == "auto" and len(collected_pairs) < limit):
+            try:
+                res = await discover_ddg_ru(query, city, limit=limit)
+                if res:
+                    collected_pairs.extend((it, None) for it in res)
+                    used_providers.append("ddg_ru")
+            except (httpx.HTTPError, OSError):
+                network_errors += 1
 
-        if provider == "osm_ru" or (provider == "auto" and len(collected) < max(5, limit // 2)):
-            res = await discover_osm_ru(query, city, limit=limit)
-            if res:
-                collected.extend(res)
-                used_providers.append("osm_ru")
+        if norm_provider == "osm_ru" or (norm_provider == "auto" and len(collected_pairs) < max(5, limit // 2)):
+            try:
+                res = await discover_osm_ru(query, city, limit=limit)
+                if res:
+                    collected_pairs.extend((it, None) for it in res)
+                    used_providers.append("osm_ru")
+            except (httpx.HTTPError, OSError):
+                network_errors += 1
+
+        # Если внешние поисковые сети недоступны на уровне контейнера/сети, используем резервный каталог РФ
+        if not collected_pairs and network_errors > 0:
+            from friday.collectors.ru_catalog_fallback import build_offline_catalog_items
+
+            fallback_pairs = build_offline_catalog_items(
+                query,
+                city,
+                config=cfg,
+                limit=min(limit, 8),
+            )
+            collected_pairs.extend(fallback_pairs)
+            used_providers.append("ru_catalog")
 
         stats = await persist_discovered_items(
             state,
-            [(it, None) for it in collected],
+            collected_pairs,
             config=cfg,
             run_id=run_id,
         )

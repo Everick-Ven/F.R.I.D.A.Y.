@@ -230,15 +230,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
             job.set_step(2, percent=90, detail="Оценка релевантности найденных карточек")
             scor = await score_all_prospects(state, use_ai=False, limit=200, config=cfg)
+            found_companies = disc.get("inserted_companies", 0) + disc.get("updated_companies", 0)
+            found_prospects = disc.get("inserted_prospects", 0) + peop.get("prospects_saved", 0)
             res = {
                 "inserted_companies": disc.get("inserted_companies", 0),
-                "profiled": prof.get("profiled", 0),
-                "prospects_saved": peop.get("prospects_saved", 0),
+                "updated_companies": disc.get("updated_companies", 0),
+                "profiled": prof.get("checked", 0),
+                "prospects_saved": found_prospects,
                 "scored": scor.get("scored", 0),
+                "providers_used": disc.get("providers_used", []),
             }
             job.complete(
                 res,
-                summary_stage=f"Найдено компаний: {res['inserted_companies']} · ЛПР: {res['prospects_saved']}",
+                summary_stage=f"Найдено компаний: {found_companies} · Руководителей: {found_prospects}",
             )
             return res
 
@@ -266,7 +270,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             job.set_step(2, percent=90, detail="Расчёт оценки соответствия профилю")
             scor = await score_all_prospects(state, use_ai=False, limit=200, config=cfg)
             res = {
-                "profiled": prof.get("profiled", 0),
+                "profiled": prof.get("checked", 0),
                 "prospects_saved": peop.get("prospects_saved", 0),
                 "scored": scor.get("scored", 0),
             }
