@@ -978,7 +978,7 @@ function populateSignalDropdown() {
   const curVal = sel.value;
   const opts = [`<option value="">Все сигналы аудита</option>`];
   for (const s of state.signalsCatalog) {
-    opts.push(`<option value="${esc(s.code)}">${esc(s.label)} (${esc(s.code)})</option>`);
+    opts.push(`<option value="${esc(s.code)}">${esc(s.label)}</option>`);
   }
   sel.innerHTML = opts.join("");
   sel.value = curVal;
@@ -1108,9 +1108,40 @@ function refreshWorkspaceTables() {
   }
 }
 
+const FALLBACK_SIGNAL_LABELS_RU = {
+  HH_HIRING_ROLE: "Открытая вакансия на hh.ru",
+  HH_OPEN_ROLES: "Активный найм в компании",
+  YANDEX_PAGE2_RANK: "Топ-20 Яндекса (резерв роста)",
+  YANDEX_DIRECT_ACTIVE: "Активна реклама Яндекс.Директ",
+  VK_PIXEL_ACTIVE: "Пиксель VK Рекламы",
+  NO_ONLINE_CAPTURE: "Нет форм захвата на сайте",
+  NO_YANDEX_METRIKA: "Нет счётчика Яндекс.Метрики",
+  NO_MESSENGER_WIDGET: "Нет виджетов мессенджеров",
+  NO_MOBILE_VIEWPORT: "Нет мобильной адаптации",
+  LOW_MAP_RATING: "Точка роста рейтинга на картах",
+  NO_WEBSITE_ON_MAP: "В геокарточке не указан сайт",
+  TWOGIS_RATING: "Рейтинг в геокаталоге",
+  TWOGIS_REVIEWS: "Отзывы в геокаталоге",
+  THIN_SERVICE_STRUCTURE: "Узкая структура разделов сайта",
+  OUTDATED_COPYRIGHT: "Устаревший копирайт сайта",
+  SSL_ISSUE: "Проблема с SSL-сертификатом",
+  NO_HTTPS_REDIRECT: "Нет редиректа на HTTPS",
+  SLOW_SITE: "Медленная загрузка сайта",
+  SITE_UNREACHABLE: "Сайт недоступен",
+  CALLTRACKING_ACTIVE: "Подключён коллтрекинг",
+  CRM_WIDGET_ACTIVE: "Подключён виджет CRM",
+  ONLINE_BOOKING_ACTIVE: "Подключена онлайн-запись",
+  TECH_STACK_RU: "Определена CMS сайта",
+  TELEGRAM_PUBLIC: "Публичный Telegram",
+  WHATSAPP_PUBLIC: "Публичный WhatsApp",
+  DECISION_MAKER_FOUND: "Найдены ФИО и должность ЛПР",
+  PERSONAL_EMAIL_FOUND: "Прямой e-mail руководителя",
+};
+
 function signalLabelByCode(code) {
   const found = state.signalsCatalog.find((s) => s.code === code);
-  return found ? found.label : code;
+  if (found && found.label) return found.label;
+  return FALLBACK_SIGNAL_LABELS_RU[code] || "Сигнал аудита";
 }
 
 async function loadCompanies() {
@@ -1180,7 +1211,10 @@ async function loadCompanies() {
 
       const obsBadges = (c.observations || [])
         .slice(0, 3)
-        .map((o) => `<span class="tag blue" title="${esc(o.value_text || o.signal_code)}">${esc(signalLabelByCode(o.signal_code))}</span>`);
+        .map((o) => {
+          const lbl = o.signal_label || signalLabelByCode(o.signal_code);
+          return `<span class="tag blue" title="${esc(o.value_text || lbl)}">${esc(lbl)}</span>`;
+        });
 
       const allBadges = [...stackBadges, ...obsBadges].join(" ") || `<span class="cell-sub">${esc(srcLabels[c.source] || c.source)}</span>`;
 
@@ -1556,18 +1590,29 @@ async function loadSignals() {
     proposed: ["Отключён", "amber"],
     rejected: ["Скрыт", "rose"],
   };
+  const catFallback = {
+    hiring: "Найм и рост команды",
+    marketing: "Маркетинг и реклама",
+    website: "Сайт и конверсия",
+    profile: "Технический аудит сайта",
+    seo: "Поисковая видимость",
+    maps: "Карты и геосервисы",
+    people: "Руководители и контакты",
+    contacts: "Контакты и мессенджеры",
+    tech: "Технологический стек",
+  };
   tbody.innerHTML = data.items
     .map((s) => {
       const [lbl, tone] = statusLabels[s.status] || [s.status, ""];
       const nextStatus = s.status === "confirmed" ? "rejected" : "confirmed";
       const btnText = s.status === "confirmed" ? "Отключить" : "Включить";
+      const catText = s.category_label || catFallback[s.category] || "Аудит";
       return `
         <tr>
           <td>
             <div class="cell-primary">${esc(s.label)}</div>
-            <div class="cell-sub">${esc(s.code)}</div>
           </td>
-          <td>${esc(s.category)}</td>
+          <td>${esc(catText)}</td>
           <td class="cell-sub">${esc(s.description)}</td>
           <td><span class="tag ${tone}">${esc(lbl)}</span></td>
           <td class="col-actions">

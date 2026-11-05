@@ -38,6 +38,7 @@ from friday.jobs import JobManager, JobRecord
 from friday.models.prospect import COMPANY_CONTACT_SOURCE, Prospect
 from friday.paths import SKILLS_DIR
 from friday.pipeline import bootstrap_state, seed_sample_for_active_niche
+from friday.signals import category_label_ru, signal_label_ru
 from friday.state import StateManager
 from friday.trainer import (
     NICHE_TEMPLATES_RU,
@@ -740,7 +741,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/api/signals")
     async def api_signals(status: str | None = None):
-        return {"items": await state.list_signal_codes(status=status)}
+        raw = await state.list_signal_codes(status=status)
+        items = [
+            {
+                **row,
+                "category_label": category_label_ru(row.get("category", "")),
+            }
+            for row in raw
+        ]
+        return {"items": items}
 
     @app.patch("/api/signals/{code}")
     async def api_patch_signal(code: str, patch: StatusPatch):
@@ -769,8 +778,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
         out = []
         for c in companies[:limit]:
             obs = await state.get_observations(company_id=c.id)
+            enriched_obs = [
+                {
+                    **o,
+                    "signal_label": signal_label_ru(o.get("signal_code", "")),
+                }
+                for o in obs
+            ]
             d = asdict(c)
-            d["observations"] = obs
+            d["observations"] = enriched_obs
+            d["signals_ru"] = [signal_label_ru(sc) for sc in (c.signals or [])]
             out.append(d)
         return {"items": out}
 

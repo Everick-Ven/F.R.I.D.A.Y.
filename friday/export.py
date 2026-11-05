@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 
+from friday.signals import signal_label_ru
 from friday.state import StateManager
 
 
@@ -57,7 +58,7 @@ async def export_drafts_csv(
                 tg,
                 r.get("email", ""),
                 r.get("prospect_phone", ""),
-                r.get("signal_used", ""),
+                signal_label_ru(r.get("signal_used", "")),
                 r.get("subject", ""),
                 r.get("body", ""),
                 r.get("audit_summary", ""),
@@ -82,7 +83,7 @@ async def export_drafts_markdown(
         lines.append(f"## {idx}. {r.get('company_name') or r.get('domain')} — {fio} ({r.get('score', 0)}/100)")
         lines.append(
             f"- **Отрасль / город**: {r.get('industry') or '—'} · {r.get('city') or '—'}\n"
-            f"- **Канал**: `{r.get('channel')}` | **Статус**: `{r.get('status')}` | **Сигнал**: `{r.get('signal_used')}`\n"
+            f"- **Канал**: `{r.get('channel')}` | **Статус**: `{r.get('status')}` | **Сигнал**: {signal_label_ru(r.get('signal_used', ''))}\n"
             f"- **Контакты**: Telegram: {tg} | Email: {r.get('email') or '—'} | Тел.: {r.get('prospect_phone') or '—'}"
         )
         if r.get("subject"):

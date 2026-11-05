@@ -332,6 +332,48 @@ FREE_SIGNAL_CODES: frozenset[str] = frozenset(
 )
 ALL_SIGNAL_CODES: frozenset[str] = frozenset(sig["code"] for sig in SIGNAL_CATALOG)
 
+SIGNAL_LABELS_RU: dict[str, str] = {
+    sig["code"]: sig["label"] for sig in SIGNAL_CATALOG
+}
+SIGNAL_LABELS_RU.update(
+    {
+        "ICP_FIT": "Соответствие целевому профилю",
+        "HH_HIRING_ROLE+NO_ONLINE_CAPTURE": "Активный найм на hh.ru + нет захвата заявок на сайте",
+    }
+)
+
+CATEGORY_LABELS_RU: dict[str, str] = {
+    "hiring": "Найм и рост команды",
+    "marketing": "Маркетинг и реклама",
+    "website": "Сайт и конверсия",
+    "profile": "Технический аудит сайта",
+    "seo": "Поисковая видимость",
+    "maps": "Карты и геосервисы",
+    "people": "Руководители и контакты",
+    "contacts": "Контакты и мессенджеры",
+    "tech": "Технологический стек",
+    "company": "Профиль организации",
+}
+
+
+def signal_label_ru(code: str) -> str:
+    raw = (code or "").strip()
+    if not raw:
+        return ""
+    if raw in SIGNAL_LABELS_RU:
+        return SIGNAL_LABELS_RU[raw]
+    if "+" in raw:
+        parts = [SIGNAL_LABELS_RU.get(p.strip(), "") for p in raw.split("+")]
+        parts = [p for p in parts if p]
+        if parts:
+            return " + ".join(parts)
+    return SIGNAL_LABELS_RU.get(raw.upper(), "Фактор аудита")
+
+
+def category_label_ru(cat: str) -> str:
+    raw = (cat or "").strip().lower()
+    return CATEGORY_LABELS_RU.get(raw, "Аудит")
+
 
 async def ensure_signal_catalog(state, auto_confirm_core: bool = True) -> int:
     """Зарегистрировать универсальный каталог сигналов РФ в БД без перезаписи решений пользователя."""

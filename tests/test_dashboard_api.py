@@ -216,6 +216,16 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
         assert enrich_res.json()["profiled"] == 1
         assert enrich_res.json()["prospects_added"] >= 1
 
+        # Проверяем, что в заметках ЛПР и названиях сигналов нет сырых английских кодов вроде DECISION_MAKER_FOUND
+        pros_items = client.get("/api/prospects?city=Ростов-на-Дону").json()["items"]
+        assert all("DECISION_MAKER_FOUND" not in (p.get("personalization_notes") or "") for p in pros_items)
+        assert all("NO_ONLINE_CAPTURE" not in (p.get("personalization_notes") or "") for p in pros_items)
+        comp_items = client.get("/api/companies?city=Ростов-на-Дону").json()["items"]
+        for c in comp_items:
+            for obs in c.get("observations") or []:
+                assert obs.get("signal_label")
+                assert "DECISION_MAKER_FOUND" not in obs["signal_label"]
+
         # Точечная кнопка «Подготовить предложение» по конкретной компании + онлайн-редактирование с проверкой Gate
         prep_res = client.post(
             "/api/proposals/prepare",

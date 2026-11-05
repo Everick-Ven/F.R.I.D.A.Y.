@@ -12,6 +12,7 @@ from __future__ import annotations
 from friday.config import FridayConfig
 from friday.models.company import Company
 from friday.models.prospect import Prospect
+from friday.signals import signal_label_ru
 
 SIGNAL_WEIGHTS: dict[str, int] = {
     "HH_HIRING_ROLE": 18,
@@ -119,8 +120,12 @@ def compute_fit_score(
         delta = SIGNAL_WEIGHTS.get(code, 0)
         if delta:
             score += delta
-            detail = obs.get("value_text") or code
-            reasons.append(f"{code}: {detail}")
+            label = signal_label_ru(code)
+            detail = (obs.get("value_text") or "").strip()
+            if detail and detail.lower() != label.lower():
+                reasons.append(detail)
+            else:
+                reasons.append(label)
 
     # Синергетические связки сигналов (сильнейшие поводы для касания в любой нише)
     if ("YANDEX_DIRECT_ACTIVE" in seen_codes or "VK_PIXEL_ACTIVE" in seen_codes) and (
