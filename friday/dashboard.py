@@ -678,7 +678,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
     # ── Ниша и продукт ──
 
     @app.get("/api/niche/presets")
-    async def api_niche_presets():
+    async def api_niche_presets(request: Request, response: Response, ui: str = ""):
+        # Если браузер выполняет старый закэшированный JS (без ?ui=5), принудительно сбрасываем HTTP-кэш домена предпросмотра
+        if ui != "5" and "testclient" not in (request.headers.get("user-agent") or "").lower():
+            response.headers["Clear-Site-Data"] = '"cache"'
         return {"items": NICHE_TEMPLATES_RU}
 
     @app.post("/api/niche/save")
@@ -1128,7 +1131,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
-    @app.get("/")
+    @app.api_route("/", methods=["GET", "HEAD"])
     async def index_page():
         return FileResponse(
             WEB_DIR / "index.html",

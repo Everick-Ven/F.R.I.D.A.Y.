@@ -1035,7 +1035,7 @@ function populateConfigForm(cfg, skills) {
 }
 
 async function loadPresets() {
-  const data = await api("/api/niche/presets");
+  const data = await api("/api/niche/presets?ui=5");
   state.presets = data.items || [];
   const bar = $("niche-presets-bar");
   bar.innerHTML = "";
