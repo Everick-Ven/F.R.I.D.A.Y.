@@ -1,12 +1,12 @@
-"""Мозг F.R.I.D.A.Y. — полная архитектура Harvey без шаблонов:
-1. `api`    — прямой вызов LLM API (OpenRouter, OpenAI, Anthropic, DeepSeek, локальный Ollama и др.);
-2. `claude` — локальный изолированный Claude Code CLI (`--safe-mode --tools ""` без истории и MCP);
-3. `codex`  — локальный изолированный Codex CLI (`--sandbox read-only`);
-4. `agent`  — очередь типизированных задач `agent_tasks` для ИИ-агента рабочей среды (Arena, Claude Code, Cursor).
+"""Мозг F.R.I.D.A.Y. — самонастраивающийся движок по схеме Harvey (`AutoBrain`).
 
-Никаких зашитых текстовых шаблонов в Python нет: каждое письмо создаётся индивидуально по проверенным
-фактам (`<untrusted>`), системным правилам `prompts/writer.md`, базам знаний `skills/*.md`, опциональному
-проходу `humanize.py` и проходит обязательный детерминированный шлюз `friday/gate.py` (ФЗ-38 / КПЭА).
+Ключевой принцип:
+- Пользователь НЕ выбирает вручную модели, провайдеров, температуру или режим Humanizer.
+- Система сама автоматически определяет доступный и наиболее сильный движок генерации
+  (ключ Anthropic / OpenRouter / OpenAI / DeepSeek из окружения -> локальный изолированный Claude Code CLI ->
+  локальный Codex CLI -> локальная модель Ollama -> ИИ-агент рабочей среды),
+  сама подбирает оптимальную модель, температуру под отрасль и канал, включает двухпроходную
+  редакторскую чистку `Humanizer` и прогоняет результат через детерминированный шлюз `friday/gate.py`.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from friday.claude_runtime import (
     run_claude_isolated,
     run_codex_isolated,
 )
-from friday.config import FridayConfig, load_config, load_env
+from friday.config import EnvConfig, FridayConfig, load_config, load_env
 from friday.gate import validate_draft
 from friday.models.draft import Draft
 from friday.paths import DATA_DIR, PROMPTS_DIR, SKILLS_DIR
@@ -41,6 +41,7 @@ PROVIDER_LABELS = {
     "api": "LLM API",
     "claude": "Claude Code CLI",
     "codex": "Codex CLI",
+    "ollama": "Ollama Local",
     "agent": "ИИ-агент рабочей среды",
 }
 
@@ -50,7 +51,7 @@ class BrainError(RuntimeError):
 
 
 class BrainUnavailableError(BrainError):
-    """Выбранный провайдер Мозга недоступен или требует настройки."""
+    """Прямой рантайм LLM недоступен в текущем окружении."""
 
 
 class AgentTaskQueued(Exception):
@@ -158,21 +159,74 @@ def mask_api_key(key: str) -> str:
     return f"{k[:6]}•••{k[-4:]}"
 
 
-async def get_configured_api_key(state: StateManager | None = None) -> str:
-    if state is not None:
-        stored = (await state.get_setting(SETTING_LLM_API_KEY)).strip()
-        if stored:
-            return stored
-    return load_env().effective_llm_key()
+def _auto_select_api_target(cfg: FridayConfig, env: EnvConfig, explicit_key: str) -> tuple[str, str, str]:
+    """Сам выбирает лучший URL и флагманскую модель для делового текста по формату доступного ключа."""
+    key = (explicit_key or env.effective_llm_key()).strip()
+    explicit_model = (cfg.brain.model or "").strip()
+    explicit_base = (cfg.brain.api_base_url or "").strip()
+
+    if not key:
+        return (explicit_base or "https://openrouter.ai/api/v1", explicit_model or "anthropic/claude-3.5-sonnet", "")
+
+    # 1. Нативный ключ Anthropic (`sk-ant-...` или ANTHROPIC_API_KEY)
+    if key.startswith("sk-ant-") or (env.anthropic_api_key and key == env.anthropic_api_key):
+        base = "https://api.anthropic.com/v1"
+        model = explicit_model if (explicit_model and "claude" in explicit_model) else "claude-3-5-sonnet-latest"
+        return (base, model, key)
+
+    # 2. Ключ OpenRouter (`sk-or-...` или OPENROUTER_API_KEY) — каскад лучших моделей копирайтинга
+    if key.startswith("sk-or-") or (env.openrouter_api_key and key == env.openrouter_api_key):
+        base = "https://openrouter.ai/api/v1"
+        model = explicit_model or "anthropic/claude-3.5-sonnet"
+        return (base, model, key)
+
+    # 3. Ключ DeepSeek
+    if env.deepseek_api_key and key == env.deepseek_api_key:
+        return ("https://api.deepseek.com/v1", explicit_model or "deepseek-chat", key)
+
+    # 4. Ключ OpenAI (`sk-...` или OPENAI_API_KEY)
+    if env.openai_api_key and key == env.openai_api_key:
+        model = explicit_model if (explicit_model and "/" not in explicit_model) else "gpt-4o"
+        return ("https://api.openai.com/v1", model, key)
+
+    return (
+        explicit_base or "https://openrouter.ai/api/v1",
+        explicit_model or "anthropic/claude-3.5-sonnet",
+        key,
+    )
 
 
-def _is_local_unauthenticated_api(base_url: str) -> bool:
-    low = (base_url or "").strip().lower()
-    return "://localhost" in low or "://127.0.0.1" in low
+async def _probe_local_ollama() -> str:
+    """Проверяет, запущена ли локально Ollama (`127.0.0.1:11434`), и выбирает сильнейшую русскую/многоязычную модель."""
+    try:
+        async with httpx.AsyncClient(timeout=0.6) as client:
+            r = await client.get("http://127.0.0.1:11434/api/tags")
+        if r.status_code != 200:
+            return ""
+        models = [str(m.get("name") or "") for m in (r.json().get("models") or []) if m.get("name")]
+        if not models:
+            return ""
+        preferred = ("qwen2.5", "qwen3", "llama3", "mistral", "gemma")
+        for pref in preferred:
+            for m in models:
+                if pref in m.lower():
+                    return m
+        return models[0]
+    except Exception:
+        return ""
+
+
+def optimal_temperature(cfg: FridayConfig, task: str = "") -> float:
+    """Автоматический подбор температуры под задачу и строгость отрасли."""
+    if task == "humanize":
+        return 0.28
+    if cfg.compliance.regulated_niche != "none":
+        return 0.46
+    return 0.56
 
 
 class Brain:
-    """Движок мышления F.R.I.D.A.Y. по схеме Harvey (`think` / `think_json` + preflight)."""
+    """Самонастраивающийся Мозг F.R.I.D.A.Y. по схеме Harvey (`AutoBrain`)."""
 
     def __init__(
         self,
@@ -188,13 +242,25 @@ class Brain:
     async def get_api_key(self) -> str:
         if self._api_key_override:
             return self._api_key_override
-        return await get_configured_api_key(self.state)
+        if self.state is not None:
+            stored = (await self.state.get_setting(SETTING_LLM_API_KEY)).strip()
+            if stored:
+                return stored
+        return load_env().effective_llm_key()
+
+    async def resolve_optimal_target(self) -> tuple[str, str, str]:
+        stored_or_override = ""
+        if self._api_key_override:
+            stored_or_override = self._api_key_override
+        elif self.state is not None:
+            stored_or_override = (await self.state.get_setting(SETTING_LLM_API_KEY)).strip()
+        return _auto_select_api_target(self.config, load_env(), stored_or_override)
 
     async def inspect_status(self) -> dict:
-        """Возвращает детальную диагностику доступных рантаймов Мозга для UI и CLI."""
+        """Автоматически определяет лучший доступный движок и оптимальные параметры генерации."""
         cfg_b = self.config.brain
-        api_key = await self.get_api_key()
-        has_api = bool(api_key) or _is_local_unauthenticated_api(cfg_b.api_base_url)
+        base_url, best_model, api_key = await self.resolve_optimal_target()
+        has_api = bool(api_key)
 
         claude_ok = False
         claude_reason = ""
@@ -212,14 +278,24 @@ class Brain:
         except CliRuntimeError as exc:
             codex_reason = str(exc)
 
+        ollama_model = ""
+        if not has_api and not claude_ok and not codex_ok:
+            ollama_model = await _probe_local_ollama()
+
         selected = cfg_b.provider
         if selected == "auto":
             if has_api:
                 effective = "api"
             elif claude_ok:
                 effective = "claude"
+                best_model = cfg_b.model or "sonnet"
             elif codex_ok:
                 effective = "codex"
+                best_model = cfg_b.model or "auto"
+            elif ollama_model:
+                effective = "ollama"
+                base_url = "http://127.0.0.1:11434/v1"
+                best_model = ollama_model
             else:
                 effective = "agent"
         else:
@@ -229,6 +305,7 @@ class Brain:
             (effective == "api" and has_api)
             or (effective == "claude" and claude_ok)
             or (effective == "codex" and codex_ok)
+            or (effective == "ollama" and bool(ollama_model))
         )
 
         return {
@@ -236,37 +313,39 @@ class Brain:
             "effective_provider": effective,
             "effective_label": PROVIDER_LABELS.get(effective, effective),
             "direct_inference_ready": ready_direct,
-            "api_base_url": cfg_b.api_base_url,
-            "model": cfg_b.model,
-            "reasoning_effort": cfg_b.reasoning_effort,
-            "has_api_key": bool(api_key),
+            "api_base_url": base_url,
+            "model": best_model,
+            "reasoning_effort": "high",
+            "has_api_key": has_api,
             "masked_api_key": mask_api_key(api_key),
-            "humanizer": bool(self.config.writer.humanizer),
+            "humanizer": True,
             "runtimes": {
                 "api": {"available": has_api},
                 "claude": {"available": claude_ok, "reason": claude_reason},
                 "codex": {"available": codex_ok, "reason": codex_reason},
+                "ollama": {"available": bool(ollama_model), "model": ollama_model},
                 "agent": {"available": True},
             },
         }
 
-    @property
-    def provider_tag(self) -> str:
-        b = self.config.brain
-        if b.provider in ("claude", "codex", "agent"):
-            return b.provider
-        return f"api:{b.model}" if b.model else "api"
+    async def _call_http_llm(
+        self,
+        prompt: str,
+        *,
+        timeout: float = 90.0,
+        task: str = "",
+        base_override: str = "",
+        model_override: str = "",
+    ) -> str:
+        auto_base, auto_model, api_key = await self.resolve_optimal_target()
+        base = (base_override or auto_base).strip().rstrip("/")
+        model = (model_override or auto_model).strip()
+        temp = optimal_temperature(self.config, task=task)
+        is_local = "://localhost" in base.lower() or "://127.0.0.1" in base.lower()
 
-    async def _call_http_llm(self, prompt: str, *, timeout: float = 90.0) -> str:
-        b = self.config.brain
-        base = (b.api_base_url or "https://openrouter.ai/api/v1").strip().rstrip("/")
-        api_key = await self.get_api_key()
-        if not api_key and not _is_local_unauthenticated_api(base):
-            raise BrainUnavailableError(
-                "Не задан API-ключ LLM. Укажите ключ OpenRouter / OpenAI / DeepSeek в настройках «Мозг (LLM)»."
-            )
+        if not api_key and not is_local:
+            raise BrainUnavailableError("API-ключ LLM не обнаружен в окружении.")
 
-        # Поддержка нативного Anthropic Messages API (`api.anthropic.com`)
         if "api.anthropic.com" in base.lower():
             url = base if base.endswith("/messages") else f"{base}/messages"
             if "/v1/" not in url and not url.endswith("/v1/messages"):
@@ -276,11 +355,11 @@ class Brain:
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             }
-            model_name = b.model.split("/", 1)[-1] if "/" in b.model else (b.model or "claude-3-5-sonnet-latest")
+            model_name = model.split("/", 1)[-1] if "/" in model else (model or "claude-3-5-sonnet-latest")
             payload = {
                 "model": model_name,
                 "max_tokens": 1024,
-                "temperature": 0.55,
+                "temperature": temp,
                 "messages": [{"role": "user", "content": prompt}],
             }
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -291,7 +370,6 @@ class Brain:
             blocks = data.get("content") or []
             return "".join(bl.get("text", "") for bl in blocks if isinstance(bl, dict)).strip()
 
-        # Стандартный OpenAI-совместимый эндпоинт (OpenRouter, OpenAI, DeepSeek, Qwen, Ollama, vLLM)
         url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
         headers = {"Content-Type": "application/json"}
         if api_key:
@@ -301,8 +379,8 @@ class Brain:
             headers["X-Title"] = "F.R.I.D.A.Y."
 
         payload = {
-            "model": b.model or "anthropic/claude-3.5-sonnet",
-            "temperature": 0.55,
+            "model": model or "anthropic/claude-3.5-sonnet",
+            "temperature": temp,
             "messages": [{"role": "user", "content": prompt}],
         }
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -323,20 +401,35 @@ class Brain:
         timeout: float = 120.0,
         task: str = "",
     ) -> tuple[str, str]:
-        """Выполняет прямой вызов активной модели и возвращает `(raw_text, provider_used)`."""
+        """Выполняет вызов автоматически выбранной оптимальной модели и возвращает `(raw_text, provider_used)`."""
         info = await self.inspect_status()
         eff = info["effective_provider"]
 
         if eff == "api":
-            text = await self._call_http_llm(prompt, timeout=timeout)
-            return text, f"api:{self.config.brain.model}"
+            text = await self._call_http_llm(
+                prompt,
+                timeout=timeout,
+                task=task,
+                base_override=info["api_base_url"],
+                model_override=info["model"],
+            )
+            return text, f"api:{info['model']}"
+        if eff == "ollama":
+            text = await self._call_http_llm(
+                prompt,
+                timeout=timeout,
+                task=task,
+                base_override="http://127.0.0.1:11434/v1",
+                model_override=info["model"],
+            )
+            return text, f"ollama:{info['model']}"
         if eff == "claude":
             if not info["runtimes"]["claude"]["available"]:
                 raise BrainUnavailableError(info["runtimes"]["claude"]["reason"])
             text = await asyncio.to_thread(
                 run_claude_isolated,
                 prompt,
-                model=self.config.brain.model,
+                model=info["model"] if info["model"] != "anthropic/claude-3.5-sonnet" else "sonnet",
                 timeout=timeout,
             )
             return text, "claude"
@@ -346,15 +439,13 @@ class Brain:
             text = await asyncio.to_thread(
                 run_codex_isolated,
                 prompt,
-                model=self.config.brain.model,
-                reasoning_effort=self.config.brain.reasoning_effort,
+                model="" if info["model"] in ("auto", "anthropic/claude-3.5-sonnet") else info["model"],
+                reasoning_effort="high",
                 timeout=timeout,
             )
             return text, "codex"
 
-        raise BrainUnavailableError(
-            "Прямой провайдер LLM (API-ключ или локальный Claude/Codex CLI) не настроен; активен режим очереди ИИ-агента."
-        )
+        raise BrainUnavailableError("Прямой рантайм LLM недоступен; активен ИИ-агент рабочей среды.")
 
     async def think_json(
         self,
@@ -463,7 +554,9 @@ async def apply_agent_task_result(
         subject = str(parsed.get("subject") or "").strip()
         body = str(parsed.get("body") or "").strip()
         audit_summary = str(parsed.get("audit_summary") or "").strip()
-        signal_used = str(parsed.get("signal_used") or "").strip()
+        raw_sig = str(parsed.get("signal_used") or "").strip()
+        from friday.signals import signal_label_ru
+        signal_used = signal_label_ru(raw_sig) if raw_sig.isupper() and "_" in raw_sig else raw_sig
         if not body:
             raise BrainError("Поле `body` (текст черновика) не должно быть пустым")
 

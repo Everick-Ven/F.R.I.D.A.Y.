@@ -88,20 +88,19 @@ class BrainConfig(BaseModel):
     provider: BrainProvider = "auto"
     mode: Literal["agent"] = "agent"
     api_base_url: str = "https://openrouter.ai/api/v1"
-    model: str = "anthropic/claude-3.5-sonnet"
-    reasoning_effort: Literal["low", "medium", "high"] = "medium"
+    model: str = ""
+    reasoning_effort: Literal["low", "medium", "high"] = "high"
     tasks_dir: str = "data/agent_tasks"
 
     @field_validator("mode", mode="before")
     @classmethod
     def _coerce_legacy_mode(cls, v) -> str:
-        # Шаблонный режим полностью удалён: любые старые значения приводятся к "agent"
         return "agent"
 
 
 class WriterConfig(BaseModel):
     email_rules: str = ""
-    humanizer: bool = False
+    humanizer: bool = True
 
 
 class ComplianceConfig(BaseModel):
@@ -152,6 +151,7 @@ class EnvConfig(BaseModel):
     openai_api_key: str = ""
     openrouter_api_key: str = ""
     anthropic_api_key: str = ""
+    deepseek_api_key: str = ""
     yandex_search_api_key: str = ""
     yandex_search_folder_id: str = ""
     yandex_xml_url: str = ""
@@ -161,9 +161,10 @@ class EnvConfig(BaseModel):
     def effective_llm_key(self) -> str:
         return (
             self.llm_api_key
+            or self.anthropic_api_key
             or self.openrouter_api_key
             or self.openai_api_key
-            or self.anthropic_api_key
+            or self.deepseek_api_key
         ).strip()
 
     def as_dict(self) -> dict[str, str]:
@@ -269,6 +270,7 @@ def load_env(env_path: str | Path | None = None) -> EnvConfig:
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
+        deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
         yandex_search_api_key=os.getenv("YANDEX_SEARCH_API_KEY", "").strip(),
         yandex_search_folder_id=os.getenv("YANDEX_SEARCH_FOLDER_ID", "").strip(),
         yandex_xml_url=os.getenv("YANDEX_XML_URL", "").strip(),

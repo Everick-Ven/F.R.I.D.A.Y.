@@ -162,6 +162,7 @@ class PrepareProposalRequest(BaseModel):
     company_id: str = ""
     prospect_id: str = ""
     channel: str = "telegram"
+    variation_seed: str = ""
 
 
 class BrainSettingsSaveRequest(BaseModel):
@@ -654,6 +655,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     channel=req.channel,
                     config=cfg,
                     brain=active_brain,
+                    autonomous_ui=True,
                 )
                 if r.get("needs_browser_llm"):
                     browser_packets.append(r["prompt_packet"])
@@ -724,6 +726,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 prospect,
                 channel=req.channel,
                 config=cfg,
+                autonomous_ui=True,
+                variation_seed=req.variation_seed.strip(),
             )
         except BrainError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -789,13 +793,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/api/brain/browser-config")
     async def api_brain_browser_config():
-        """Возвращает параметры подключения к LLM API для браузерного моста (когда сервер в песочнице без интернета)."""
+        """Возвращает автоматически выбранные параметры LLM API для прозрачного браузерного моста."""
         cfg = load_config()
         brain = Brain(state=state, config=cfg)
-        key = await brain.get_api_key()
+        base_url, model, key = await brain.resolve_api_target()
         return {
-            "api_base_url": cfg.brain.api_base_url,
-            "model": cfg.brain.model,
+            "api_base_url": base_url,
+            "model": model,
             "api_key": key,
             "humanizer": humanizer_enabled(cfg),
         }

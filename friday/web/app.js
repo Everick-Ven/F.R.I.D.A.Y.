@@ -872,20 +872,6 @@ async function loadSummary() {
   state.config = data.config;
   state.brain = data.brain || null;
   state.cities = data.cities || [];
-
-  if (state.brain && $("brain-status-label")) {
-    const b = state.brain;
-    const shortModel = b.model ? b.model.split("/").pop() : "";
-    const lbl =
-      b.effective_provider === "api"
-        ? `Мозг: ${shortModel || "LLM API"}`
-        : `Мозг: ${b.effective_label || b.effective_provider}`;
-    $("brain-status-label").textContent = lbl;
-    const bDot = $("brain-status-dot");
-    if (bDot) {
-      bDot.className = "status-indicator " + (b.direct_inference_ready ? "ok" : "warn");
-    }
-  }
   state.signalsCatalog = sigData.items || [];
 
   const configured = Boolean(data.niche_configured);
@@ -1357,15 +1343,7 @@ async function loadProspects() {
   });
 }
 
-/* ── Мост прямого вызова LLM из браузера + Настройки Мозга (схема Harvey без шаблонов) ── */
-const LLM_PRESETS = {
-  openrouter: { provider: "api", baseUrl: "https://openrouter.ai/api/v1", model: "anthropic/claude-3.5-sonnet" },
-  deepseek: { provider: "api", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
-  openai: { provider: "api", baseUrl: "https://api.openai.com/v1", model: "gpt-4o" },
-  anthropic: { provider: "api", baseUrl: "https://api.anthropic.com/v1", model: "claude-3-5-sonnet-latest" },
-  ollama: { provider: "api", baseUrl: "http://localhost:11434/v1", model: "qwen2.5:14b" },
-};
-
+/* ── Автоматический мост LLM (работает в фоне без ручных настроек пользователя) ── */
 async function callBrowserLlmText(prompt, browserCfg) {
   const base = String(browserCfg.api_base_url || "https://openrouter.ai/api/v1").trim().replace(/\/+$/, "");
   const apiKey = String(browserCfg.api_key || "").trim();
@@ -1385,7 +1363,7 @@ async function callBrowserLlmText(prompt, browserCfg) {
       body: JSON.stringify({
         model: cleanModel,
         max_tokens: 1024,
-        temperature: 0.55,
+        temperature: 0.48,
         messages: [{ role: "user", content: prompt }],
       }),
     });
@@ -1406,7 +1384,7 @@ async function callBrowserLlmText(prompt, browserCfg) {
     headers,
     body: JSON.stringify({
       model,
-      temperature: 0.55,
+      temperature: 0.48,
       messages: [{ role: "user", content: prompt }],
     }),
   });
@@ -1420,7 +1398,7 @@ async function executeBrowserLlmPacket(pkt, channel, cachedBrowserCfg = null) {
   const rawText = await callBrowserLlmText(pkt.combined_prompt, bCfg);
   let humanizedText = null;
 
-  if (bCfg.humanizer) {
+  if (bCfg.humanizer !== false) {
     try {
       const start = rawText.indexOf("{");
       const end = rawText.lastIndexOf("}");
@@ -1451,82 +1429,13 @@ async function executeBrowserLlmPacket(pkt, channel, cachedBrowserCfg = null) {
   });
 }
 
-async function openBrainModal() {
-  const modal = $("brain-modal");
-  if (!modal) return;
-  try {
-    const info = await api("/api/brain/status");
-    state.brain = info;
-    $("brain-provider").value = info.configured_provider || "auto";
-    $("brain-model").value = info.model || "anthropic/claude-3.5-sonnet";
-    $("brain-base-url").value = info.api_base_url || "https://openrouter.ai/api/v1";
-    $("brain-api-key").value = "";
-    $("brain-key-hint").textContent = info.has_api_key ? `(сохранён: ${info.masked_api_key})` : "(не задан)";
-    $("brain-humanizer").checked = Boolean(info.humanizer);
-    $("brain-email-rules").value = info.email_rules || "";
-
-    const rt = info.runtimes || {};
-    const parts = [
-      `Активный режим: ${info.effective_label}`,
-      `LLM API: ${rt.api?.available ? "готов" : "ключ не задан"}`,
-      `Claude CLI: ${rt.claude?.available ? "доступен" : "не установлен"}`,
-      `Codex CLI: ${rt.codex?.available ? "доступен" : "не установлен"}`,
-    ];
-    $("brain-runtimes-info").textContent = parts.join(" · ");
-
-    renderModalFeedbackList(info.feedback || []);
-    modal.classList.remove("hidden");
-  } catch (e) {
-    toast(e.message, true);
-  }
-}
-
-function renderModalFeedbackList(items) {
-  const wrap = $("brain-feedback-wrap");
-  if (!wrap) return;
-  if (!items.length) {
-    wrap.innerHTML = `<div class="cell-sub">Замечаний автора пока нет. Вы можете оставлять их прямо на карточках писем («Замечание автору»), и Writer будет учитывать их как в Harvey.</div>`;
-    return;
-  }
-  wrap.innerHTML = `
-    <div class="field-label">Сохранённая обратная связь владельца (${items.length}):</div>
-    <div class="feedback-chip-list">
-      ${items
-        .map(
-          (f) => `
-        <div class="feedback-chip-item">
-          <span><strong>${esc(f.about || "черновик")}:</strong> ${esc(f.comment)}</span>
-          <button type="button" class="ghost-btn sm danger-text" data-del-feedback="${esc(f.id)}">Удалить</button>
-        </div>`
-        )
-        .join("")}
-    </div>
-  `;
-  wrap.querySelectorAll("[data-del-feedback]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      await api(`/api/feedback/${encodeURIComponent(btn.dataset.delFeedback)}`, { method: "DELETE" });
-      const refreshed = await api("/api/brain/status");
-      renderModalFeedbackList(refreshed.feedback || []);
-    });
-  });
-}
-
-function formatBrainProviderBadge(providerRaw) {
-  const p = String(providerRaw || "agent");
-  if (p === "claude") return "Claude CLI";
-  if (p === "codex") return "Codex CLI";
-  if (p.startsWith("api:")) return `LLM · ${p.slice(4).split("/").pop()}`;
-  if (p === "api") return "LLM API";
-  return "ИИ-агент (Harvey)";
-}
-
-/* ── Мгновенная подготовка предложения по 1 компании или ЛПР (схема Harvey без шаблонов) ── */
+/* ── Мгновенная подготовка предложения по 1 компании или ЛПР ── */
 async function prepareProposalFor(targetPayload, btnEl) {
   const channel = $("sel-draft-channel")?.value || "telegram";
   if (btnEl) {
     btnEl.disabled = true;
     btnEl._origText = btnEl.textContent;
-    btnEl.textContent = "Пишем письмо…";
+    btnEl.textContent = "Готовим…";
   }
   try {
     let resp = await api("/api/proposals/prepare", {
@@ -1536,11 +1445,6 @@ async function prepareProposalFor(targetPayload, btnEl) {
 
     if (resp.result?.needs_browser_llm && resp.result?.prompt_packet) {
       resp = await executeBrowserLlmPacket(resp.result.prompt_packet, channel);
-    } else if (resp.result?.queued) {
-      await loadSummary();
-      toast("Задача поставлена ИИ-агенту (без шаблонов). Для генерации в 1 клик укажите ключ LLM в окне «Мозг».");
-      openBrainModal();
-      return;
     }
 
     await loadSummary();
@@ -1548,7 +1452,7 @@ async function prepareProposalFor(targetPayload, btnEl) {
     document.querySelectorAll("#draft-status-pills .seg-btn").forEach((b) => {
       b.classList.toggle("active", b.dataset.status === "");
     });
-    toast(`Персональное письмо написано (${channel.toUpperCase()})`);
+    toast(`Персональное предложение подготовлено (${channel.toUpperCase()})`);
     switchTab("drafts");
     if (resp.draft?.id) {
       setTimeout(() => {
@@ -1634,7 +1538,6 @@ async function loadDrafts() {
 
       const isEditing = state.editingDraftId === d.id;
       const isGivingFeedback = state.feedbackDraftId === d.id;
-      const providerBadge = formatBrainProviderBadge(d.brain_provider);
       const aboutTarget = `${d.company_name || d.domain || "черновик"} (${fio})`;
 
       return `
@@ -1645,7 +1548,6 @@ async function loadDrafts() {
               <div class="draft-person">${esc(fio)}${d.title ? " · " + esc(d.title) : ""}</div>
             </div>
             <div class="draft-badges">
-              <span class="tag blue" title="Автор черновика">${esc(providerBadge)}</span>
               <span class="tag">${esc(d.channel.toUpperCase())}</span>
               <span class="tag ${stTone}">${esc(stLabel)}</span>
               <span class="score-pill ${Number(d.score) >= 65 ? "high" : ""}">${esc(d.score ?? 0)}</span>
@@ -1790,7 +1692,10 @@ async function loadDrafts() {
           }),
         });
         state.feedbackDraftId = null;
-        await prepareProposalFor({ prospect_id: btn.dataset.fbProspect }, btn);
+        await prepareProposalFor(
+          { prospect_id: btn.dataset.fbProspect, variation_seed: String(Date.now()) },
+          btn
+        );
       } catch (e) {
         toast(e.message, true);
       }
@@ -1798,7 +1703,12 @@ async function loadDrafts() {
   });
 
   list.querySelectorAll("[data-rewrite-prospect]").forEach((btn) => {
-    btn.addEventListener("click", () => prepareProposalFor({ prospect_id: btn.dataset.rewriteProspect }, btn));
+    btn.addEventListener("click", () =>
+      prepareProposalFor(
+        { prospect_id: btn.dataset.rewriteProspect, variation_seed: String(Date.now()) },
+        btn
+      )
+    );
   });
 
   list.querySelectorAll("[data-save-edit]").forEach((btn) => {
@@ -1976,18 +1886,12 @@ async function triggerBatchProposals() {
         }
 
         const ready = job.result?.drafts_ready ?? 0;
-        const queued = job.result?.queued_agent_tasks ?? 0;
         if (cityScope) {
           state.draftCityFilter = cityScope;
           populateDraftCityDropdown();
         }
-        if (ready > 0) {
-          toast(`Написано персональных писем: ${ready}`);
-          switchTab("drafts");
-        } else if (queued > 0) {
-          toast(`Поставлено задач ИИ-агенту: ${queued}. Для генерации в 1 клик укажите ключ LLM в окне «Мозг».`);
-          openBrainModal();
-        }
+        toast(`Подготовлено персональных предложений: ${ready}`);
+        switchTab("drafts");
       }
     );
   } catch (e) {
@@ -2004,66 +1908,6 @@ function bindEvents() {
   });
 
   $("project-pill-btn").addEventListener("click", () => switchTab("project"));
-  $("btn-open-brain")?.addEventListener("click", openBrainModal);
-  $("btn-close-brain")?.addEventListener("click", () => $("brain-modal")?.classList.add("hidden"));
-  $("btn-cancel-brain")?.addEventListener("click", () => $("brain-modal")?.classList.add("hidden"));
-
-  document.querySelectorAll("[data-llm-preset]").forEach((chip) => {
-    chip.addEventListener("click", () => {
-      const pr = LLM_PRESETS[chip.dataset.llmPreset];
-      if (!pr) return;
-      $("brain-provider").value = pr.provider;
-      $("brain-base-url").value = pr.baseUrl;
-      $("brain-model").value = pr.model;
-    });
-  });
-
-  $("btn-clear-api-key")?.addEventListener("click", async () => {
-    try {
-      await api("/api/brain/save", {
-        method: "POST",
-        body: JSON.stringify({
-          provider: $("brain-provider").value,
-          api_base_url: $("brain-base-url").value.trim(),
-          model: $("brain-model").value.trim(),
-          humanizer: $("brain-humanizer").checked,
-          email_rules: $("brain-email-rules").value,
-          clear_api_key: true,
-        }),
-      });
-      await openBrainModal();
-      await loadSummary();
-      toast("Сохранённый API-ключ удалён");
-    } catch (e) {
-      toast(e.message, true);
-    }
-  });
-
-  $("btn-save-brain")?.addEventListener("click", async () => {
-    const btn = $("btn-save-brain");
-    btn.disabled = true;
-    try {
-      const keyVal = $("brain-api-key").value.trim();
-      await api("/api/brain/save", {
-        method: "POST",
-        body: JSON.stringify({
-          provider: $("brain-provider").value,
-          api_base_url: $("brain-base-url").value.trim(),
-          model: $("brain-model").value.trim(),
-          api_key: keyVal || null,
-          humanizer: $("brain-humanizer").checked,
-          email_rules: $("brain-email-rules").value,
-        }),
-      });
-      $("brain-modal")?.classList.add("hidden");
-      await loadSummary();
-      toast("Настройки Мозга и правила автора сохранены");
-    } catch (e) {
-      toast(e.message, true);
-    } finally {
-      btn.disabled = false;
-    }
-  });
 
   document.querySelectorAll("#db-subtabs .seg-btn").forEach((b) => {
     b.addEventListener("click", () => switchSubView(b.dataset.subview));

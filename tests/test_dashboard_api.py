@@ -96,6 +96,9 @@ def test_dashboard_starts_clean_and_supports_niche_presets_and_pipeline(
         js_txt = js_resp.text
         assert "Демо-данные" not in html_txt + js_txt
         assert "btn-sample" not in html_txt + js_txt
+        assert "btn-open-brain" not in html_txt + js_txt
+        assert "brain-modal" not in html_txt + js_txt
+        assert "Настройки Мозга" not in html_txt + js_txt
         assert "Скопировать полный промпт задачи" not in html_txt + js_txt
         assert "Применить JSON-ответ" not in html_txt + js_txt
         assert "Очередь задач ИИ-агента" not in html_txt + js_txt
@@ -241,8 +244,31 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
                 assert obs.get("signal_label")
                 assert "DECISION_MAKER_FOUND" not in obs["signal_label"]
 
-        # Подключаем LLM провайдер по схеме Harvey (без шаблонов!) + проверяем Feedback и онлайн-правку
-        async def _mock_harvey_llm(self, prompt: str, *, timeout: float = 90.0) -> str:
+        # Проверяем, что БЕЗ КАКИХ-ЛИБО РУЧНЫХ НАСТРОЕК МОЗГА кнопка «Подготовить предложение» работает с 1 клика!
+        zero_cfg_prep = client.post(
+            "/api/proposals/prepare",
+            json={"company_id": rostov_web_comp["id"], "channel": "telegram"},
+        )
+        assert zero_cfg_prep.status_code == 200
+        zero_draft = zero_cfg_prep.json()["draft"]
+        assert zero_draft is not None
+        assert "Константин Владимирович" in zero_draft["body"]
+        assert "—" not in zero_draft["body"]
+
+        # А при наличии ключа в окружении система САМА выбирает лучшую модель и Humanizer без участия пользователя
+        async def _mock_harvey_llm(self, prompt: str, *, timeout: float = 90.0, **kwargs) -> str:
+            if "draft_to_humanize" in prompt:
+                return json.dumps(
+                    {
+                        "subject": "",
+                        "body": (
+                            "Константин Владимирович, здравствуйте. Посмотрел rostovadvocat.ru на WordPress, "
+                            "разделы практик есть, но быстрой записи для доверителей не увидел. "
+                            "Обращения с поиска сейчас принимаете только по телефону?"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             if "Константин Владимирович" in prompt:
                 body = (
                     "Константин Владимирович, здравствуйте. Посмотрел сайт rostovadvocat.ru на WordPress, "
@@ -265,27 +291,8 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
                 ensure_ascii=False,
             )
 
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-auto-selected-key")
         monkeypatch.setattr("friday.brain.Brain._call_http_llm", _mock_harvey_llm)
-        monkeypatch.setattr(
-            "friday.dashboard.save_local_config",
-            lambda c, target_path=None: __import__("friday.config", fromlist=["save_local_config"]).save_local_config(
-                c, tmp_path / "friday.local.yaml"
-            ),
-        )
-        monkeypatch.setattr("friday.config.PROJECT_ROOT", tmp_path)
-        b_save = client.post(
-            "/api/brain/save",
-            json={
-                "provider": "api",
-                "api_base_url": "https://openrouter.ai/api/v1",
-                "model": "anthropic/claude-3.5-sonnet",
-                "api_key": "sk-or-test-harvey-key",
-                "humanizer": False,
-                "email_rules": "",
-            },
-        )
-        assert b_save.status_code == 200
-        assert b_save.json()["direct_inference_ready"] is True
 
         prep_res = client.post(
             "/api/proposals/prepare",
@@ -294,7 +301,7 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
         assert prep_res.status_code == 200
         draft_obj = prep_res.json()["draft"]
         assert draft_obj is not None
-        assert draft_obj["brain_provider"] == "api:anthropic/claude-3.5-sonnet"
+        assert draft_obj["brain_provider"] == "api:claude-3-5-sonnet-latest"
         assert "Константин Владимирович" in draft_obj["body"]
 
         # Сохранение замечания владельца (Feedback, как в Harvey)

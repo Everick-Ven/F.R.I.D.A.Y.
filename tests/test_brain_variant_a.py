@@ -153,7 +153,7 @@ async def test_harvey_writer_prompt_feedback_email_rules_and_direct_llm_with_hum
     # Проверим живой цикл Brain (1-я попытка нарушает ФЗ-38 -> авто-повтор с замечаниями Gate -> Humanizer -> успех!)
     calls: list[str] = []
 
-    async def fake_http_llm(self, prompt: str, *, timeout: float = 90.0) -> str:
+    async def fake_http_llm(self, prompt: str, *, timeout: float = 90.0, **kwargs) -> str:
         calls.append(prompt)
         if "draft_to_humanize" in prompt:
             return json.dumps(
