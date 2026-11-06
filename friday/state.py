@@ -199,7 +199,32 @@ MIGRATIONS: list[str] = [
         value TEXT DEFAULT '',
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS writing_feedback (
+        id TEXT PRIMARY KEY,
+        prospect_id TEXT DEFAULT '',
+        company_id TEXT DEFAULT '',
+        draft_id TEXT DEFAULT '',
+        about TEXT DEFAULT '',
+        comment TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_writing_feedback_created ON writing_feedback(created_at DESC);
+    """,
     """
+    CREATE TABLE IF NOT EXISTS writing_feedback (
+        id TEXT PRIMARY KEY,
+        prospect_id TEXT DEFAULT '',
+        company_id TEXT DEFAULT '',
+        draft_id TEXT DEFAULT '',
+        about TEXT DEFAULT '',
+        comment TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_writing_feedback_created ON writing_feedback(created_at DESC);
+    """,
 ]
 
 
@@ -1198,6 +1223,81 @@ class StateManager:
                 """,
                 (_utcnow_str(), task_id),
             )
+            await db.commit()
+            return cur.rowcount > 0
+
+    # ── Settings & Harvey Writing Feedback ─────────────────────────────────
+
+    async def delete_setting(self, key: str) -> None:
+        async with self._connect() as db:
+            await db.execute("DELETE FROM settings WHERE key = ?", (key,))
+            await db.commit()
+
+    async def add_writing_feedback(
+        self,
+        comment: str,
+        *,
+        about: str = "общие правила писем",
+        prospect_id: str = "",
+        company_id: str = "",
+        draft_id: str = "",
+    ) -> str:
+        cleaned = (comment or "").strip()
+        if not cleaned:
+            return ""
+        fid = _new_id()
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO writing_feedback (id, prospect_id, company_id, draft_id, about, comment, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fid,
+                    (prospect_id or "").strip(),
+                    (company_id or "").strip(),
+                    (draft_id or "").strip(),
+                    (about or "черновик").strip()[:120],
+                    cleaned[:1000],
+                    _utcnow_str(),
+                ),
+            )
+            await db.commit()
+        return fid
+
+    async def get_writing_feedback(
+        self,
+        prospect_ids: list[str] | None = None,
+        *,
+        limit: int = 15,
+    ) -> list[dict]:
+        """Возвращает заметки владельца (новейшие первыми): общие + относящиеся к указанным ЛПР."""
+        async with self._connect() as db:
+            if prospect_ids:
+                placeholders = ",".join("?" for _ in prospect_ids)
+                sql = f"""
+                    SELECT id, prospect_id, company_id, draft_id, about, comment, created_at
+                    FROM writing_feedback
+                    WHERE prospect_id = '' OR prospect_id IN ({placeholders})
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                """
+                params = (*prospect_ids, limit)
+            else:
+                sql = """
+                    SELECT id, prospect_id, company_id, draft_id, about, comment, created_at
+                    FROM writing_feedback
+                    WHERE prospect_id = ''
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                """
+                params = (limit,)
+            async with db.execute(sql, params) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def delete_writing_feedback(self, feedback_id: str) -> bool:
+        async with self._connect() as db:
+            cur = await db.execute("DELETE FROM writing_feedback WHERE id = ?", (feedback_id,))
             await db.commit()
             return cur.rowcount > 0
 

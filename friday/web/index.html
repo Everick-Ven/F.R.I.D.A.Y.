@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>F.R.I.D.A.Y.</title>
-  <link rel="stylesheet" href="/static/app.css?v=7" />
+  <link rel="stylesheet" href="/static/app.css?v=8" />
 </head>
 <body>
   <header class="topbar">
@@ -30,6 +30,10 @@
       </nav>
 
       <div class="topbar-actions">
+        <button type="button" class="secondary-btn sm" id="btn-open-brain" title="Настройки языковой модели, Humanizer и правил автора (схема Harvey)">
+          <span class="status-indicator ok" id="brain-status-dot"></span>
+          <span id="brain-status-label">Мозг: ИИ-агент</span>
+        </button>
         <button type="button" class="ghost-btn sm" id="btn-export-csv" title="Выгрузить предложения в CSV">CSV</button>
         <button type="button" class="ghost-btn sm" id="btn-export-md" title="Выгрузить отчёт в Markdown">MD</button>
       </div>
@@ -137,7 +141,7 @@
             </label>
             <label class="field">
               <span class="field-label">Предлагаемый первый шаг (CTA)</span>
-              <input id="cfg-offer-entry" type="text" placeholder="прислать короткий разбор из 3 точек роста" />
+              <input id="cfg-offer-entry" type="text" placeholder="прислать короткий разбор из 3 пунктов" />
             </label>
           </div>
 
@@ -385,7 +389,75 @@
     </section>
   </main>
 
+  <!-- Модальное окно: Мозг и правила автора (схема Harvey без шаблонов) -->
+  <div id="brain-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="brain-modal-title">
+    <div class="modal-box">
+      <div class="surface-head" style="margin-bottom: 14px;">
+        <div>
+          <h2 class="surface-title" id="brain-modal-title">Мозг и правила автора (схема Harvey)</h2>
+          <p class="surface-sub">Никаких зашитых шаблонов: каждое письмо пишется индивидуально по фактам карточки, правилам и навыкам.</p>
+        </div>
+        <button type="button" class="ghost-btn sm" id="btn-close-brain">Закрыть</button>
+      </div>
+
+      <div class="preset-strip" style="margin-bottom: 14px;">
+        <button type="button" class="preset-chip" data-llm-preset="openrouter">OpenRouter (Claude / GPT / DeepSeek)</button>
+        <button type="button" class="preset-chip" data-llm-preset="deepseek">DeepSeek API</button>
+        <button type="button" class="preset-chip" data-llm-preset="openai">OpenAI API</button>
+        <button type="button" class="preset-chip" data-llm-preset="anthropic">Anthropic API</button>
+        <button type="button" class="preset-chip" data-llm-preset="ollama">Ollama (локально)</button>
+      </div>
+
+      <div class="grid-2 compact">
+        <label class="field">
+          <span class="field-label">Режим Мозга (`brain.provider`)</span>
+          <select id="brain-provider">
+            <option value="auto">Автовыбор (API → Claude CLI → Codex CLI → Агент)</option>
+            <option value="api">Внешний LLM API (OpenRouter / OpenAI / DeepSeek)</option>
+            <option value="claude">Claude Code CLI (локальная подписка, без инструментов)</option>
+            <option value="codex">Codex CLI (локальная подписка, read-only)</option>
+            <option value="agent">ИИ-агент рабочей среды (Arena / Cursor / Claude Code)</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field-label">Модель</span>
+          <input id="brain-model" type="text" placeholder="anthropic/claude-3.5-sonnet" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">Базовый URL API</span>
+          <input id="brain-base-url" type="text" placeholder="https://openrouter.ai/api/v1" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">API-ключ <span id="brain-key-hint" class="cell-sub"></span></span>
+          <div style="display:flex; gap:8px;">
+            <input id="brain-api-key" type="password" placeholder="sk-or-v1-... (оставьте пустым, чтобы не менять)" autocomplete="new-password" />
+            <button type="button" class="ghost-btn sm" id="btn-clear-api-key" title="Удалить сохранённый ключ">Сбросить</button>
+          </div>
+        </label>
+      </div>
+
+      <div id="brain-runtimes-info" class="draft-note" style="margin-top: 12px;"></div>
+
+      <label class="checkbox-row" style="margin-top: 14px;">
+        <input type="checkbox" id="brain-humanizer" />
+        <span><strong>Включить проход Humanizer</strong> (второй редакторский проход модели: убирает следы ИИ, длинные тире и канцелярит)</span>
+      </label>
+
+      <label class="field" style="margin-top: 14px;">
+        <span class="field-label">Свои правила писем (`writer.email_rules` — опционально, заменяют базовую форму 75 слов / без питча)</span>
+        <textarea id="brain-email-rules" rows="3" placeholder="Оставьте пустым для классического стандарта Harvey (до 75 слов, 1 наблюдение из фактов + 1 спокойный вопрос, без презентации продукта в лоб)."></textarea>
+      </label>
+
+      <div id="brain-feedback-wrap" style="margin-top: 14px;"></div>
+
+      <div class="modal-footer">
+        <button type="button" class="ghost-btn" id="btn-cancel-brain">Отмена</button>
+        <button type="button" class="primary-btn" id="btn-save-brain">Сохранить настройки Мозга</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden" role="status"></div>
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>

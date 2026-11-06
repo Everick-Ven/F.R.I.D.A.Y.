@@ -17,10 +17,18 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from friday.agents.scout import score_all_prospects
-from friday.agents.writer import generate_draft_for_prospect, run_drafts
+from friday.agents.writer import (
+    build_writer_prompt,
+    finalize_llm_draft,
+    generate_draft_for_prospect,
+    run_drafts,
+)
 from friday.brain import (
+    SETTING_LLM_API_KEY,
+    Brain,
     BrainError,
     apply_agent_task_result,
+    extract_json_object,
 )
 from friday.collectors.discover import (
     DiscoveredItem,
@@ -31,9 +39,17 @@ from friday.collectors.discover import (
 )
 from friday.collectors.people import extract_people_from_html, run_people
 from friday.collectors.profile import inspect_company_html, run_profile
-from friday.config import is_niche_configured, load_config
+from friday.config import (
+    EmailRulesError,
+    is_niche_configured,
+    load_config,
+    load_email_rules,
+    save_email_rules,
+    save_local_config,
+)
 from friday.export import export_drafts_csv, export_drafts_markdown
 from friday.gate import validate_draft
+from friday.humanize import acceptable_rewrite, build_humanizer_prompt, humanizer_enabled
 from friday.jobs import JobManager, JobRecord
 from friday.models.prospect import COMPANY_CONTACT_SOURCE, Prospect
 from friday.paths import SKILLS_DIR
@@ -135,19 +151,44 @@ class DraftsRequest(BaseModel):
     min_score: int | None = None
     city: str = ""
     limit: int = Field(default=50, ge=1, le=200)
-    template_preview: bool = False
 
 
 class SingleDraftRequest(BaseModel):
     prospect_id: str
     channel: str = "telegram"
-    template_preview: bool = False
 
 
 class PrepareProposalRequest(BaseModel):
     company_id: str = ""
     prospect_id: str = ""
     channel: str = "telegram"
+
+
+class BrainSettingsSaveRequest(BaseModel):
+    provider: str = "auto"
+    api_base_url: str = "https://openrouter.ai/api/v1"
+    model: str = "anthropic/claude-3.5-sonnet"
+    reasoning_effort: str = "medium"
+    api_key: str | None = None
+    clear_api_key: bool = False
+    humanizer: bool = False
+    email_rules: str = ""
+
+
+class ApplyLlmDraftRequest(BaseModel):
+    prospect_id: str
+    channel: str = "telegram"
+    raw_response: str | dict
+    humanized_response: str | dict | None = None
+    provider_used: str = "api"
+
+
+class WritingFeedbackRequest(BaseModel):
+    comment: str
+    about: str = ""
+    prospect_id: str = ""
+    company_id: str = ""
+    draft_id: str = ""
 
 
 class DraftContentPatch(BaseModel):
@@ -246,11 +287,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
         cities = await state.list_distinct_cities()
         prod_skill = SKILLS_DIR / "product_knowledge.md"
         comp_skill = SKILLS_DIR / "competitive_intel.md"
+        brain_info = await Brain(state=state, config=cfg).inspect_status()
         return {
             "summary": summary,
             "cities": cities,
             "niche_configured": is_niche_configured(cfg),
             "config": cfg.model_dump(),
+            "brain": brain_info,
             "active_jobs": jobs.active_jobs(),
             "skills": {
                 "product_knowledge_md": prod_skill.read_text(encoding="utf-8") if prod_skill.exists() else "",
@@ -591,45 +634,54 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
             ready = 0
             blocked = 0
-            skipped = 0
+            queued = 0
+            browser_packets: list[dict] = []
             target_list = prospects[: req.limit]
             total = max(1, len(target_list))
+            active_brain = Brain(state=state, config=cfg)
 
-            job.set_step(1, percent=42, detail="Подготовка персональных предложений")
+            job.set_step(1, percent=42, detail="Генерация персональных предложений через Мозг (схема Harvey)")
             for idx, p in enumerate(target_list, start=1):
                 pct = 40 + int((idx / total) * 52)
                 job.set_step(
                     1,
                     percent=min(94, pct),
-                    detail=f"Подготовка предложения ({idx} из {len(target_list)}): {p.company or p.full_name}",
+                    detail=f"Персональное письмо ({idx} из {len(target_list)}): {p.company or p.full_name}",
                 )
                 r = await generate_draft_for_prospect(
                     state,
                     p,
                     channel=req.channel,
-                    mode_override="template",
                     config=cfg,
+                    brain=active_brain,
                 )
-                if r.get("gate_passed"):
+                if r.get("needs_browser_llm"):
+                    browser_packets.append(r["prompt_packet"])
+                elif r.get("queued"):
+                    queued += 1
+                elif r.get("gate_passed"):
                     ready += 1
-                elif r.get("status") == "gate_blocked":
-                    blocked += 1
                 else:
-                    skipped += 1
-                await asyncio.sleep(0.03)
+                    blocked += 1
+                await asyncio.sleep(0.02)
 
-            job.set_step(2, percent=97, detail="Проверка качества и сохранение предложений")
-            await asyncio.sleep(0.06)
-            res = {
+            job.set_step(2, percent=97, detail="Проверка качества и комплаенса (Gate)")
+            await asyncio.sleep(0.04)
+            res: dict = {
                 "drafts_ready": ready,
                 "gate_blocked": blocked,
-                "skipped": skipped,
+                "queued_agent_tasks": queued,
                 "city": city_scope,
             }
-            job.complete(
-                res,
-                summary_stage=f"Подготовлено предложений: {ready}",
-            )
+            if browser_packets:
+                res["needs_browser_llm"] = True
+                res["prompt_packets"] = browser_packets
+                summary_msg = f"Подготовлено {len(browser_packets)} пакетов для прямого вызова LLM"
+            elif ready > 0:
+                summary_msg = f"Написано персональных писем: {ready}"
+            else:
+                summary_msg = f"В очереди ИИ-агента: {queued}"
+            job.complete(res, summary_stage=summary_msg)
             return res
 
         scope_label = f" ({req.city.strip()})" if req.city.strip() else ""
@@ -637,9 +689,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
             kind="drafts",
             title=f"Подготовка предложений{scope_label}",
             step_labels=[
-                "Отбор организаций и сигналов аудита",
-                "Формирование персональных предложений",
-                "Проверка соответствия правилам (Gate)",
+                "Отбор организаций и проверенных фактов",
+                "Индивидуальная генерация писем (Harvey Writer)",
+                "Проверка комплаенса и анти-ИИ правил (Gate)",
             ],
             runner=_run_dr,
         )
@@ -647,7 +699,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.post("/api/proposals/prepare")
     async def api_prepare_proposal(req: PrepareProposalRequest):
-        """Мгновенная подготовка персонального предложения по конкретной компании или ЛПР."""
+        """Индивидуальная подготовка персонального письма по схеме Harvey (без Python-шаблонов)."""
         cfg = load_config()
         if not is_niche_configured(cfg):
             raise HTTPException(
@@ -666,15 +718,139 @@ def create_app(db_path: str | None = None) -> FastAPI:
         await score_all_prospects(state, use_ai=False, limit=250, config=cfg)
         prospect = await state.get_prospect(prospect.id) or prospect
 
-        res = await generate_draft_for_prospect(
-            state,
-            prospect,
-            channel=req.channel,
-            mode_override="template",
-            config=cfg,
-        )
+        try:
+            res = await generate_draft_for_prospect(
+                state,
+                prospect,
+                channel=req.channel,
+                config=cfg,
+            )
+        except BrainError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         draft_obj = await state.get_draft(res["draft_id"]) if res.get("draft_id") else None
         return {"ok": True, "result": res, "draft": draft_obj}
+
+    @app.post("/api/proposals/apply-llm")
+    async def api_apply_llm_proposal(req: ApplyLlmDraftRequest):
+        """Принимает JSON-ответ от прямого браузерного вызова LLM, проверяет Humanizer + Gate и сохраняет."""
+        cfg = load_config()
+        prospect = await state.get_prospect(req.prospect_id.strip())
+        if not prospect:
+            raise HTTPException(status_code=404, detail="Получатель не найден")
+        try:
+            original_parsed = extract_json_object(req.raw_response)
+            final_parsed = original_parsed
+            if req.humanized_response is not None:
+                try:
+                    cand = extract_json_object(req.humanized_response)
+                    if acceptable_rewrite(original_parsed, cand):
+                        final_parsed = dict(original_parsed)
+                        final_parsed["subject"] = str(cand.get("subject") or "").strip()
+                        final_parsed["body"] = str(cand.get("body") or "").strip()
+                except BrainError:
+                    pass
+            res = await finalize_llm_draft(
+                state,
+                prospect,
+                final_parsed,
+                channel=req.channel,
+                provider_used=req.provider_used or f"api:{cfg.brain.model}",
+                config=cfg,
+            )
+        except BrainError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        draft_obj = await state.get_draft(res["draft_id"]) if res.get("draft_id") else None
+        return {"ok": True, "result": res, "draft": draft_obj}
+
+    @app.post("/api/proposals/humanizer-prompt")
+    async def api_build_humanizer_prompt(draft_json: dict):
+        return {"prompt": build_humanizer_prompt(draft_json)}
+
+    # ── Мозг (LLM / Claude CLI / Codex CLI / ИИ-агент) + Правила автора + Feedback (Harvey) ──
+
+    @app.get("/api/brain/status")
+    async def api_brain_status():
+        cfg = load_config()
+        info = await Brain(state=state, config=cfg).inspect_status()
+        try:
+            rules_txt = load_email_rules(cfg)
+            rules_err = ""
+        except EmailRulesError as exc:
+            rules_txt = ""
+            rules_err = str(exc)
+        feedback_items = await state.get_writing_feedback(limit=20)
+        return {
+            **info,
+            "email_rules": rules_txt,
+            "email_rules_error": rules_err,
+            "feedback": feedback_items,
+        }
+
+    @app.get("/api/brain/browser-config")
+    async def api_brain_browser_config():
+        """Возвращает параметры подключения к LLM API для браузерного моста (когда сервер в песочнице без интернета)."""
+        cfg = load_config()
+        brain = Brain(state=state, config=cfg)
+        key = await brain.get_api_key()
+        return {
+            "api_base_url": cfg.brain.api_base_url,
+            "model": cfg.brain.model,
+            "api_key": key,
+            "humanizer": humanizer_enabled(cfg),
+        }
+
+    @app.post("/api/brain/save")
+    async def api_brain_save(req: BrainSettingsSaveRequest):
+        cfg = load_config()
+        allowed_providers = {"auto", "api", "claude", "codex", "agent"}
+        prov = req.provider.strip().lower()
+        if prov not in allowed_providers:
+            raise HTTPException(status_code=400, detail=f"Неизвестный провайдер Мозга: {prov}")
+
+        cfg.brain.provider = prov  # type: ignore[assignment]
+        if req.api_base_url.strip():
+            cfg.brain.api_base_url = req.api_base_url.strip()
+        if req.model.strip():
+            cfg.brain.model = req.model.strip()
+        if req.reasoning_effort in ("low", "medium", "high"):
+            cfg.brain.reasoning_effort = req.reasoning_effort  # type: ignore[assignment]
+
+        cfg.writer.humanizer = bool(req.humanizer)
+        rules_clean = (req.email_rules or "").strip()
+        save_email_rules(rules_clean, cfg)
+        cfg.writer.email_rules = "skills/email_rules.md" if rules_clean else ""
+        save_local_config(cfg)
+
+        if req.clear_api_key:
+            await state.delete_setting(SETTING_LLM_API_KEY)
+        elif req.api_key is not None and req.api_key.strip():
+            await state.set_setting(SETTING_LLM_API_KEY, req.api_key.strip())
+
+        return await api_brain_status()
+
+    @app.get("/api/feedback")
+    async def api_list_feedback(prospect_id: str = ""):
+        pids = [prospect_id.strip()] if prospect_id.strip() else None
+        return {"items": await state.get_writing_feedback(pids, limit=30)}
+
+    @app.post("/api/feedback")
+    async def api_add_feedback(req: WritingFeedbackRequest):
+        if not req.comment.strip():
+            raise HTTPException(status_code=400, detail="Текст замечания не может быть пустым")
+        fid = await state.add_writing_feedback(
+            req.comment,
+            about=req.about or "черновик",
+            prospect_id=req.prospect_id,
+            company_id=req.company_id,
+            draft_id=req.draft_id,
+        )
+        return {"ok": True, "id": fid}
+
+    @app.delete("/api/feedback/{feedback_id}")
+    async def api_delete_feedback(feedback_id: str):
+        deleted = await state.delete_writing_feedback(feedback_id)
+        return {"ok": deleted}
 
     # ── Ниша и продукт ──
 
@@ -1048,7 +1224,6 @@ def create_app(db_path: str | None = None) -> FastAPI:
             min_score=req.min_score,
             limit=req.limit,
             city=req.city or None,
-            mode_override="template" if req.template_preview else None,
             config=cfg,
         )
 
@@ -1062,7 +1237,6 @@ def create_app(db_path: str | None = None) -> FastAPI:
             state,
             p,
             channel=req.channel,
-            mode_override="template" if req.template_preview else None,
             config=cfg,
         )
 

@@ -342,15 +342,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_score.add_argument("--ai", action="store_true", help="Поставить задачи углублённого скоринга ИИ-агенту")
     p_score.add_argument("-n", "--limit", type=int, default=100)
 
-    p_drafts = sub.add_parser("drafts", help="Подготовить черновики писем (Вариант А: задачи ИИ-агенту)")
+    p_drafts = sub.add_parser("drafts", help="Подготовить персональные черновики писем через Мозг (схема Harvey)")
     p_drafts.add_argument("--channel", default="telegram", choices=["telegram", "email", "whatsapp"])
     p_drafts.add_argument("--min-score", type=int, default=None)
     p_drafts.add_argument("-n", "--limit", type=int, default=20)
-    p_drafts.add_argument(
-        "--template",
-        action="store_true",
-        help="Сразу собрать детерминированные предпросмотровые черновики без ожидания ИИ-агента",
-    )
 
     p_tasks = sub.add_parser("tasks", help="Очередь задач для ИИ-агента рабочей среды (Вариант А)")
     tsub = p_tasks.add_subparsers(dest="tasks_action", required=True)
@@ -376,7 +371,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--provider", default="auto")
     p_run.add_argument("--channel", default="telegram", choices=["telegram", "email", "whatsapp"])
     p_run.add_argument("-n", "--limit", type=int, default=15)
-    p_run.add_argument("--template", action="store_true")
 
     sub.add_parser("sample", help="Загрузить 2 тестовые карточки под текущую настроенную нишу")
 
@@ -456,13 +450,11 @@ async def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if args.cmd == "drafts":
-        mode_ov = "template" if args.template else None
         res = await run_drafts(
             state,
             channel=args.channel,
             min_score=args.min_score,
             limit=args.limit,
-            mode_override=mode_ov,
             config=cfg,
         )
         console.print(f"[green]Подготовка черновиков:[/green] {res}")
@@ -489,7 +481,6 @@ async def _dispatch(args: argparse.Namespace) -> int:
             provider=args.provider,
             limit=args.limit,
             channel=args.channel,
-            mode_override="template" if args.template else None,
             config=cfg,
         )
         console.print(f"[green]Конвейер завершён:[/green] {res}")

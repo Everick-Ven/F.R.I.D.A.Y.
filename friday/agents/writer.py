@@ -1,295 +1,264 @@
-"""Агент-автор (Writer): подготовка персонализированных черновиков B2B-писем (Telegram / Email / WhatsApp).
+"""Агент-автор (Writer) — 1-в-1 архитектура Harvey для персональных B2B-писем (Telegram / Email / WhatsApp).
 
-Вариант А (`brain.mode = "agent"` — по умолчанию):
-- Собирает карточку компании, ЛПР, подтверждённые сигналы из `observations` (изолированные в `<untrusted>`),
-  настройки продукта из `friday.local.yaml` и `skills/product_knowledge.md`, а также правила ФЗ-38.
-- Создаёт структурированные задачи `writer_draft` для ИИ-агента рабочей среды (`data/agent_tasks/`).
-- Когда ИИ-агент применяет готовый текст через `friday tasks apply`, каждый черновик в обязательном
-  порядке проходит детерминированный шлюз `friday.gate.validate_draft` (ФЗ-38 ст. 5 + нишевые запреты).
-
-Режим `template` (`brain.mode = "template"` или `mode_override="template"`):
-- Мгновенно собирает аккуратный предпросмотровый черновик по фактическому сигналу без ожидания агента.
+Ключевой принцип (без каких-либо Python-шаблонов):
+- Первое письмо пишется ИНДИВИДУАЛЬНО под каждого конкретного получателя живой языковой моделью
+  (`Brain`: LLM API / OpenRouter, изолированный Claude Code CLI, Codex CLI или ИИ-агент рабочей среды)
+  строго по проверенным фактам (`<untrusted>`), системному промпту `prompts/writer.md`, базам знаний `skills/*.md`,
+  пользовательским правилам `writer.email_rules` и заметкам обратной связи `writing_feedback`.
+- Опционально выполняется второй редакторский проход `friday.humanize` (`writer.humanizer: true`).
+- Каждый черновик проходит детерминированный комплаенс-шлюз `friday.gate.validate_draft` (ФЗ-38 + КПЭА + анти-ИИ).
 """
 
 from __future__ import annotations
 
-from friday.brain import enqueue_agent_task, load_prompt, load_skills
-from friday.config import FridayConfig, load_config
+import httpx
+
+from friday.brain import (
+    Brain,
+    BrainError,
+    BrainUnavailableError,
+    enqueue_agent_task,
+    extract_json_object,
+    load_prompt,
+    load_skills,
+)
+from friday.config import EmailRulesError, FridayConfig, load_config, load_email_rules
 from friday.gate import validate_draft
+from friday.humanize import build_humanizer_prompt, humanize_draft, humanizer_enabled
 from friday.models.company import Company
 from friday.models.draft import Draft
 from friday.models.prospect import Prospect
+from friday.signals import signal_label_ru
 from friday.state import StateManager
 from friday.untrusted import UNTRUSTED_RULE, wrap_untrusted
 
-HIGH_VALUE_SIGNALS = [
-    "HH_HIRING_ROLE",
-    "YANDEX_PAGE2_RANK",
-    "YANDEX_DIRECT_ACTIVE",
-    "NO_ONLINE_CAPTURE",
-    "NO_YANDEX_METRIKA",
-    "NO_MESSENGER_WIDGET",
-    "NO_MOBILE_VIEWPORT",
-    "LOW_MAP_RATING",
-    "NO_WEBSITE_ON_MAP",
-    "THIN_SERVICE_STRUCTURE",
-    "SSL_ISSUE",
-    "SLOW_SITE",
-]
+MAX_WRITE_ATTEMPTS = 3
+
+PERSONAL_SHAPE_MESSENGER = (
+    "- До 70 слов (включая приветствие и короткую подпись). Одно конкретное проверяемое наблюдение "
+    "из блока ФАКТЫ выше и один предметный спокойный вопрос.\n"
+    "- Без рекламной презентации продукта в лоб, без ссылок в первом сообщении, без длинных тире (—) и без «!».\n"
+    "- Поле `subject` оставьте пустым (`\"\"`)."
+)
+
+PERSONAL_SHAPE_EMAIL = (
+    "- До 75 слов. Одно конкретное проверяемое наблюдение из блока ФАКТЫ выше и один предметный спокойный вопрос.\n"
+    "- Без рекламной презентации продукта в лоб, без ссылок в первом письме, без длинных тире (—) и без «!».\n"
+    "- Поле `subject`: 2–5 слов со строчной буквы, естественно, без «КП» и без обманного «Re:»."
+)
 
 
-def _pick_primary_observation(observations: list[dict]) -> dict | None:
-    by_code = {o["signal_code"]: o for o in observations}
-    for code in HIGH_VALUE_SIGNALS:
-        if code in by_code:
-            return by_code[code]
-    return observations[0] if observations else None
+def operator_rules_block(rules: str) -> str:
+    """Пользовательские правила автора писем (`writer.email_rules`), как в Harvey."""
+    cleaned = (rules or "").strip()
+    if not cleaned:
+        return ""
+    return (
+        "\n\nПРАВИЛА АВТОРА (OPERATOR'S EMAIL RULES) — написаны владельцем системы. "
+        "По длине, структуре, упоминанию продукта, теме и подписи эти правила заменяют базовую форму выше "
+        "там, где они расходятся. Но они НИКОГДА не отменяют правило ФАКТОВ (говорить о получателе можно "
+        "только то, что явно есть в блоке ФАКТЫ, ничего не выдумывая), запрет на фальшивый «Re:/Fwd:» "
+        "и требования ФЗ-38 / КПЭА:\n"
+        f"{cleaned}"
+    )
 
 
-def _build_template_draft(
-    prospect: Prospect,
-    company: Company | None,
-    observations: list[dict],
-    channel: str,
-    cfg: FridayConfig,
-) -> dict:
-    raw_greeting = (prospect.polite_greeting or "коллеги").strip()
-    greeting = raw_greeting[:1].upper() + raw_greeting[1:] if raw_greeting else "Коллеги"
-    cname = company.name if company and company.name else (prospect.company or "вашей компании")
-    quoted_cname = cname if ("«" in cname or '"' in cname) else f"«{cname}»"
-    dom = (company.domain or "") if company else ""
-    city = (company.city if company and company.city else prospect.city) or "вашем регионе"
-    obs = _pick_primary_observation(observations)
-    codes = {o["signal_code"]: o for o in observations}
-
-    def _lc_first(s: str) -> str:
-        st = (s or "").strip().rstrip(".")
-        if not st:
-            return ""
-        # Не понижаем регистр аббревиатур и собственных имён (Яндекс, Tilda, VK, HTTP, SSL)
-        first_word = st.split()[0]
-        if first_word.isupper() or any(first_word.startswith(p) for p in ("Яндекс", "Tilda", "WordPress", "Битрикс", "VK", "Telegram")):
-            return st
-        return st[:1].lower() + st[1:]
-
-    if "HH_HIRING_ROLE" in codes and "NO_ONLINE_CAPTURE" in codes:
-        sig_code = "HH_HIRING_ROLE+NO_ONLINE_CAPTURE"
-        fact_sentence = (
-            f"Обратил внимание, что в {quoted_cname} сейчас открыт подбор ({_lc_first(codes['HH_HIRING_ROLE']['value_text'])}), "
-            f"при этом на сайте {dom} пока нет быстрых форм захвата и кнопок мессенджеров."
-        )
-    elif obs and obs["signal_code"] == "HH_HIRING_ROLE":
-        sig_code = "HH_HIRING_ROLE"
-        fact_sentence = (
-            f"Увидел у {quoted_cname} открытую вакансию на hh.ru ({_lc_first(obs.get('value_text', ''))}) "
-            f"и решил написать напрямую."
-        )
-    elif "YANDEX_DIRECT_ACTIVE" in codes and ("NO_ONLINE_CAPTURE" in codes or "NO_YANDEX_METRIKA" in codes):
-        sig_code = "YANDEX_DIRECT_ACTIVE"
-        fact_sentence = (
-            f"Посмотрел сайт {dom}: увидел активную рекламу в Яндекс.Директе, "
-            f"но заметил точку потери части обращений на посадочной странице."
-        )
-    elif obs and obs["signal_code"] == "YANDEX_PAGE2_RANK":
-        sig_code = "YANDEX_PAGE2_RANK"
-        fact_sentence = (
-            f"Изучал выдачу в г. {city}: сайт {dom} уже стоит в шаге от первой страницы Яндекса "
-            f"({_lc_first(obs.get('value_text', ''))})."
-        )
-    elif obs and obs["signal_code"] in ("LOW_MAP_RATING", "NO_WEBSITE_ON_MAP"):
-        sig_code = obs["signal_code"]
-        fact_sentence = (
-            f"Посмотрел карточку {quoted_cname} в геосервисах ({city}) — заметил конкретную точку роста: "
-            f"{_lc_first(obs.get('value_text', ''))}."
-        )
-    elif obs:
-        sig_code = obs["signal_code"]
-        target_ref = f"{quoted_cname} ({dom})" if dom else f"{quoted_cname} ({city})"
-        fact_sentence = (
-            f"Посмотрел ресурс {target_ref} и отметил точку роста: {_lc_first(obs.get('value_text', ''))}."
-        )
-    else:
-        sig_code = "ICP_FIT"
-        target_ref = f"{quoted_cname} ({dom})" if dom else f"{quoted_cname} ({city})"
-        fact_sentence = (
-            f"Изучил публичный профиль {target_ref} в г. {city} — мы работаем как раз с практиками и компаниями вашего профиля."
-        )
-
-    audit_points: list[str] = []
-    for idx, o in enumerate(observations[:3], start=1):
-        txt = (o.get("value_text") or o["signal_code"]).strip().rstrip(".")
-        audit_points.append(f"{idx}) {txt}.")
-    if company and company.tech_stack:
-        audit_points.append(f"Стек: {', '.join(company.tech_stack[:4])}.")
-    if company and company.address:
-        audit_points.append(f"Локация: {company.address}.")
-    if not audit_points:
-        audit_points.append(f"1) Профильная организация ниши «{cfg.icp.niche}» ({city}).")
-    audit_summary = " ".join(audit_points)
-
-    offer_raw = cfg.product.description.strip().replace("!", ".")
-    max_offer_words = 30 if channel in ("telegram", "whatsapp") else 55
-    offer_words = offer_raw.split()
-    dangling_tail = {
-        "и", "а", "но", "или", "да", "либо", "в", "во", "на", "с", "со",
-        "к", "ко", "по", "из", "от", "до", "для", "при", "за", "над", "под",
-        "о", "об", "у", "без", "между", "через", "учётом", "учетом",
-    }
-    if len(offer_words) > max_offer_words:
-        cut = offer_words[:max_offer_words]
-        # Предпочитаем обрезать на ближайшей запятой или точке во второй половине фразы
-        comma_idx = -1
-        for i in range(len(cut) - 1, max(8, len(cut) // 2), -1):
-            if cut[i].endswith((",", ".", ";")):
-                comma_idx = i
-                break
-        if comma_idx != -1:
-            cut = cut[: comma_idx + 1]
-        while cut and cut[-1].strip(",;:-—.").lower() in dangling_tail:
-            cut.pop()
-        trimmed = " ".join(cut).rstrip(",;:-— ")
-        offer_line = trimmed if trimmed.endswith(".") else f"{trimmed}."
-    else:
-        offer_line = offer_raw if offer_raw.endswith(".") else f"{offer_raw}."
-
-    cta_goal = (cfg.product.offer.entry or "прислать короткий разбор из 3 пунктов").strip().rstrip(".?!")
-    placeholder_names = {"не задано", "ваше имя", "имя отправителя", ""}
-    raw_pname = (cfg.persona.name or "").strip()
-    person_name = raw_pname if raw_pname.lower() not in placeholder_names else ""
-    role_name = cfg.persona.role.strip() if cfg.persona.role else ""
-    placeholder_comps = {"ваша компания", "наш проект", "название компании", ""}
-    raw_cname = (cfg.persona.company or "").strip()
-    comp_name = raw_cname if raw_cname.lower() not in placeholder_comps else ""
-
-    if person_name and comp_name:
-        sender_sign = f"{person_name}, {comp_name}"
-    elif person_name:
-        sender_sign = f"{person_name}, {role_name}".strip(", ")
-    elif comp_name:
-        sender_sign = f"Команда {comp_name}"
-    else:
-        sender_sign = role_name or "Команда проекта"
-
-    fact_sentence = fact_sentence.replace("!", ".")
-
-    if channel in ("telegram", "whatsapp"):
-        body = (
-            f"{greeting}, здравствуйте. {fact_sentence}\n\n"
-            f"{offer_line}\n"
-            f"Подскажите, актуально ли {cta_goal} прямо сюда в чат?\n\n"
-            f"С уважением, {sender_sign}"
-        )
-        subject = ""
-    else:
-        subject = f"разбор для «{cname}» ({dom or city})".replace("!", "")[:78]
-        body = (
-            f"{greeting}, добрый день.\n\n"
-            f"{fact_sentence}\n\n"
-            f"{offer_line}\n\n"
-            f"Подскажите, уместно ли {cta_goal} в ответном письме без лишних созвонов?\n\n"
-            f"С уважением,\n{sender_sign}"
-        )
-
-    return {
-        "subject": subject,
-        "body": body,
-        "audit_summary": audit_summary,
-        "signal_used": sig_code,
-    }
+async def _feedback_block(state: StateManager, prospect_ids: list[str]) -> str:
+    """Заметки владельца с карточек черновиков (`writing_feedback`), новейшие первыми — как в Harvey."""
+    try:
+        notes = await state.get_writing_feedback(prospect_ids)
+    except Exception:
+        return ""
+    if not notes:
+        return ""
+    lines = "\n".join(
+        f"- {str(n.get('created_at') or '')[:10]} ({n.get('about') or 'черновик'}): "
+        f"{' '.join(str(n.get('comment') or '').split())[:500]}"
+        for n in notes
+    )
+    return (
+        "\n\nОБРАТНАЯ СВЯЗЬ ВЛАДЕЛЬЦА (OWNER FEEDBACK) — замечания владельца системы к предыдущим "
+        "черновикам, от новых к старым (свежее замечание имеет приоритет). Учтите их при написании, "
+        "не нарушая правило ФАКТОВ и ограничения ФЗ-38:\n"
+        f"{lines}"
+    )
 
 
-async def generate_draft_for_prospect(
+def _is_general_inbox(prospect: Prospect, company: Company | None) -> bool:
+    if (prospect.role_kind or "").strip() == "company_inbox":
+        return True
+    if not (prospect.first_name or "").strip():
+        return True
+    if company and prospect.full_name.strip().lower() == (company.name or "").strip().lower():
+        return True
+    return False
+
+
+async def build_writer_prompt(
     state: StateManager,
     prospect: Prospect,
     *,
     channel: str = "telegram",
-    mode_override: str | None = None,
     config: FridayConfig | None = None,
+    retry_feedback: str = "",
 ) -> dict:
+    """Собирает полный промпт Harvey `Writer` (системные правила + навыки + feedback + `<untrusted>` факты)."""
     cfg = config or load_config()
-    effective_mode = mode_override or cfg.brain.mode
-
     company = await state.get_company(prospect.company_id) if prospect.company_id else None
     observations = await state.get_observations(company_id=prospect.company_id) if prospect.company_id else []
 
-    if effective_mode == "agent":
-        # Не плодим дубликаты ожидающих задач для одного и того же ЛПР и канала
-        pending = await state.list_agent_tasks(status="pending")
-        for existing in pending:
-            if existing["kind"] == "writer_draft":
-                pl = existing.get("payload") or {}
-                if pl.get("prospect_id") == prospect.id and pl.get("channel") == channel:
-                    return {
-                        "queued": True,
-                        "already_pending": True,
-                        "task_id": existing["id"],
-                        "prospect_id": prospect.id,
-                        "channel": channel,
-                    }
+    rules = load_email_rules(cfg)
+    address_hint = (
+        "строго на «Вы» по Имени и Отчеству (если ФИО известно)"
+        if cfg.persona.address_style == "formal_vy" or cfg.compliance.regulated_niche == "legal_advocates"
+        else "уважительно на «Вы» по имени (или Имени Отчеству для старших руководителей)"
+    )
+    benefits_str = "\n".join(f"- {b}" for b in (cfg.product.key_benefits or [])) or "- Не указаны"
 
-        sys_prompt = "\n\n".join(
-            p
-            for p in [
-                load_prompt("system"),
-                load_prompt("writer"),
-                load_skills(["product_knowledge", "competitive_intel", "ru_compliance", "outreach_frameworks_ru"]),
-                UNTRUSTED_RULE,
-            ]
-            if p
-        )
-        obs_lines = "\n".join(
-            f"- {o['signal_code']}: {o.get('value_text', '')} ({o.get('evidence_url', '')})"
-            for o in observations
-        ) or "- Нет дополнительных технических наблюдений"
+    target_niche_val = cfg.icp.niche or ", ".join(cfg.icp.industries)
+    sys_part = load_prompt(
+        "system",
+        company_name=cfg.persona.company,
+        product_name=cfg.product.name,
+        product_description=cfg.product.description,
+        target_niche=target_niche_val,
+    )
+    writer_part = load_prompt(
+        "writer",
+        persona_name=cfg.persona.name,
+        persona_role=cfg.persona.role,
+        persona_company=cfg.persona.company,
+        persona_tone=cfg.persona.tone,
+        address_style_hint=address_hint,
+        product_name=cfg.product.name,
+        product_description=cfg.product.description,
+        product_benefits=benefits_str,
+        product_pricing=cfg.product.pricing or "обсуждается индивидуально",
+        entry_offer=cfg.product.offer.entry or "короткий предметный разбор по сайту и выдаче",
+        target_niche=target_niche_val,
+    )
+    skills_part = load_skills(
+        ["product_knowledge", "competitive_intel", "ru_compliance", "outreach_frameworks_ru"]
+    )
+    fb_part = await _feedback_block(state, [prospect.id])
+    op_part = operator_rules_block(rules)
 
-        untrusted_context = wrap_untrusted(
-            f"Компания: {company.name if company else prospect.company}\n"
-            f"Отрасль: {company.industry if company else prospect.industry}\n"
-            f"ИНН: {company.inn if company else ''}\n"
-            f"Домен: {company.domain if company else ''}\n"
-            f"Город: {prospect.city}\n"
-            f"Описание сайта: {company.description if company else ''}\n"
-            f"Технологический стек: {', '.join(company.tech_stack) if company else ''}\n"
-            f"Получатель (ЛПР): {prospect.full_name} (обращение: «{prospect.polite_greeting}»)\n"
-            f"Должность: {prospect.title}\n"
-            f"Заметки разведки: {prospect.personalization_notes}\n"
-            f"Подтверждённые сигналы:\n{obs_lines}",
-            source="prospect_card",
-        )
-        user_prompt = (
-            f"Канал сообщения: {channel}\n"
-            f"Регулируемая ниша комплаенса: {cfg.compliance.regulated_niche}\n"
-            f"Отправитель: {cfg.persona.name}, {cfg.persona.role} ({cfg.persona.company})\n"
-            f"Продукт отправителя: {cfg.product.name} ({cfg.product.category})\n"
-            f"Описание продукта: {cfg.product.description}\n"
-            f"Условия / цена: {cfg.product.pricing}\n"
-            f"Мягкий первый шаг (Entry Offer): {cfg.product.offer.entry}\n\n"
-            f"{untrusted_context}\n\n"
-            'Сформируй персональный черновик строго в формате JSON: {"subject": "...", "body": "...", "audit_summary": "...", "signal_used": "..."}.'
-        )
-        tid, tfile = await enqueue_agent_task(
-            state,
-            cfg,
-            kind="writer_draft",
-            payload={"prospect_id": prospect.id, "company_id": prospect.company_id, "channel": channel},
-            system_prompt=sys_prompt,
-            user_prompt=user_prompt,
-        )
-        return {
-            "queued": True,
-            "task_id": tid,
-            "task_file": tfile,
-            "prospect_id": prospect.id,
-            "channel": channel,
-        }
+    general_inbox = _is_general_inbox(prospect, company)
+    cname = (company.name if company and company.name else prospect.company) or "Организация"
 
-    # Детерминированный режим предпросмотра (`template`)
-    generated = _build_template_draft(prospect, company, observations, channel, cfg)
-    subject = str(generated.get("subject", "")).strip()
-    body = str(generated.get("body", "")).strip()
-    audit_summary = str(generated.get("audit_summary", "")).strip()
-    signal_used = str(generated.get("signal_used", "")).strip()
+    facts: list[str] = []
+    if general_inbox:
+        facts.append(f"- Имя получателя: неизвестно (общий контакт организации «{cname}»)")
+        inbox_rule = (
+            "\n- Письмо идёт на общий контакт организации (его прочитает управляющий партнёр, руководитель "
+            "или помощник). Не выдумывайте имя человека; начните с «Здравствуйте.» или «Коллеги, здравствуйте.»."
+        )
+    else:
+        facts.append(f"- Получатель (ЛПР): {prospect.full_name}")
+        facts.append(f"- Вежливое обращение: {prospect.polite_greeting}")
+        if prospect.title:
+            facts.append(f"- Должность / статус: {prospect.title}")
+        inbox_rule = (
+            f"\n- Обращайтесь к конкретному человеку («{prospect.polite_greeting}, здравствуйте.») "
+            "живым естественным текстом без переменных {{...}}."
+        )
 
+    facts.append(f"- Организация: {cname}")
+    city_val = (company.city if company and company.city else prospect.city) or ""
+    if city_val:
+        facts.append(f"- Город: {city_val}")
+    if company and company.address:
+        facts.append(f"- Адрес офиса: {company.address}")
+    if company and company.domain:
+        facts.append(f"- Домен сайта: {company.domain}")
+    elif company and company.ymaps_url:
+        facts.append("- Сайт: отдельный сайт не указан (организация представлена карточкой в Яндекс.Картах)")
+    if company and company.description:
+        facts.append(f"- Описание с сайта / карточки: {company.description}")
+    if company and company.tech_stack:
+        facts.append(f"- Обнаруженные технологии на сайте: {', '.join(company.tech_stack[:6])}")
+
+    non_dm_obs = [o for o in observations if o.get("signal_code") != "DECISION_MAKER_FOUND"]
+    chosen_obs = (non_dm_obs or observations)[:4]
+    for o in chosen_obs:
+        lbl = signal_label_ru(o["signal_code"])
+        detail = (o.get("value_text") or "").strip()
+        facts.append(f"- Наблюдение ({lbl}): {detail}")
+
+    if prospect.personalization_notes:
+        facts.append(f"- Заметки разведки: {prospect.personalization_notes}")
+
+    default_shape = PERSONAL_SHAPE_EMAIL if channel == "email" else PERSONAL_SHAPE_MESSENGER
+    if rules:
+        shape_instructions = (
+            "- Следуйте разделу ПРАВИЛА АВТОРА выше по длине, структуре, упоминанию продукта и теме.\n"
+            "- Пишите готовый живой текст без шаблонных скобок {{...}}."
+        )
+    else:
+        shape_instructions = default_shape
+
+    retry_section = ""
+    if retry_feedback.strip():
+        retry_section = (
+            "\n\nПРЕДЫДУЩАЯ ПОПЫТКА ОТКЛОНЕНА ШЛЮЗОМ КАЧЕСТВА — ИСПРАВЬТЕ ЭТИ ОШИБКИ:\n"
+            f"{retry_feedback.strip()}\n"
+        )
+
+    system_bundle = "\n\n".join(p for p in [sys_part, writer_part, skills_part] if p) + fb_part + op_part
+
+    user_bundle = (
+        f"Напишите ОДНО персональное первое сообщение для этого получателя.\n"
+        f"Канал отправки: {channel}\n"
+        f"Регулируемая ниша комплаенса: {cfg.compliance.regulated_niche}\n\n"
+        "ФАКТЫ — всё, что достоверно известно об организации и человеке с их сайта и открытых карточек. "
+        "Каждое утверждение о получателе в письме обязано опираться ТОЛЬКО на эти факты. "
+        "Если факта здесь нет — вы его не знаете, ничего не додумывайте:\n"
+        f"{wrap_untrusted(chr(10).join(facts), source='prospect_research')}\n\n"
+        f"{UNTRUSTED_RULE}\n\n"
+        "Требования к этому сообщению:\n"
+        f"{shape_instructions}"
+        f"{inbox_rule}"
+        f"{retry_section}\n\n"
+        "Помимо самого письма заполните короткую фактическую сводку `audit_summary` (1–3 коротких факта "
+        "для карточки менеджера в системе, на русском языке без английских кодов) и `signal_used` "
+        "(краткое русское название главного сигнала, на котором построен заход).\n\n"
+        'Верните ТОЛЬКО валидный JSON строго такого вида: {"subject": "...", "body": "...", "audit_summary": "...", "signal_used": "..."}'
+    )
+
+    combined_prompt = f"{system_bundle}\n\n---\n\n{user_bundle}"
+    return {
+        "system_prompt": system_bundle,
+        "user_prompt": user_bundle,
+        "combined_prompt": combined_prompt,
+        "prospect_id": prospect.id,
+        "company_id": prospect.company_id,
+        "channel": channel,
+        "humanizer_enabled": humanizer_enabled(cfg),
+    }
+
+
+async def finalize_llm_draft(
+    state: StateManager,
+    prospect: Prospect,
+    raw_output: str | dict,
+    *,
+    channel: str = "telegram",
+    provider_used: str = "agent",
+    config: FridayConfig | None = None,
+) -> dict:
+    """Разбирает JSON от модели, проверяет шлюзом `friday.gate` и сохраняет черновик в SQLite."""
+    cfg = config or load_config()
+    parsed = extract_json_object(raw_output)
+    subject = str(parsed.get("subject") or "").strip() if channel == "email" else ""
+    body = str(parsed.get("body") or "").strip()
+    audit_summary = str(parsed.get("audit_summary") or "").strip()
+    raw_sig = str(parsed.get("signal_used") or "").strip()
+    signal_used = signal_label_ru(raw_sig) if raw_sig.isupper() and "_" in raw_sig else raw_sig
+
+    if not body:
+        raise BrainError("Модель вернула пустое поле `body`.")
+
+    company = await state.get_company(prospect.company_id) if prospect.company_id else None
     gate_res = validate_draft(
         channel=channel,
         subject=subject,
@@ -312,11 +281,19 @@ async def generate_draft_for_prospect(
         signal_used=signal_used,
         status=status,
         gate_notes=notes,
-        brain_provider="template",
+        brain_provider=provider_used,
     )
     did = await state.upsert_draft(draft)
     if gate_res.passed and prospect.status == "new":
         await state.set_prospect_status(prospect.id, "draft_ready")
+
+    # Если в очереди висела ожидающая задача writer_draft для этого ЛПР/канала — закрываем её
+    pending = await state.list_agent_tasks(status="pending")
+    for t in pending:
+        if t["kind"] == "writer_draft":
+            pl = t.get("payload") or {}
+            if pl.get("prospect_id") == prospect.id and pl.get("channel") == channel:
+                await state.complete_agent_task(t["id"], str(raw_output if isinstance(raw_output, str) else parsed))
 
     return {
         "ok": gate_res.passed,
@@ -327,7 +304,111 @@ async def generate_draft_for_prospect(
         "status": status,
         "gate_passed": gate_res.passed,
         "gate_notes": notes,
-        "provider": "template",
+        "provider": provider_used,
+    }
+
+
+async def generate_draft_for_prospect(
+    state: StateManager,
+    prospect: Prospect,
+    *,
+    channel: str = "telegram",
+    config: FridayConfig | None = None,
+    brain: Brain | None = None,
+) -> dict:
+    """Генерирует персональное письмо через активный `Brain` (как в Harvey) без шаблонов."""
+    cfg = config or load_config()
+    try:
+        load_email_rules(cfg)
+    except EmailRulesError as exc:
+        raise BrainError(f"Ошибка в пользовательских правилах писем (writer.email_rules): {exc}") from exc
+
+    active_brain = brain or Brain(state=state, config=cfg)
+    brain_info = await active_brain.inspect_status()
+
+    # 1. Прямая генерация через настроенную модель (`api`, `claude` CLI или `codex` CLI)
+    if brain_info["direct_inference_ready"]:
+        retry_notes = ""
+        last_result: dict | None = None
+        for attempt in range(1, MAX_WRITE_ATTEMPTS + 1):
+            pkt = await build_writer_prompt(
+                state,
+                prospect,
+                channel=channel,
+                config=cfg,
+                retry_feedback=retry_notes,
+            )
+            try:
+                raw_text, provider_used = await active_brain.think(
+                    pkt["combined_prompt"],
+                    task="personal_outreach",
+                )
+            except httpx.HTTPError as net_exc:
+                # В облачной песочнице с закрытым серверным интернетом передаём пакет в браузерный мост LLM
+                if brain_info["effective_provider"] == "api" and brain_info["has_api_key"]:
+                    return {
+                        "ok": False,
+                        "queued": False,
+                        "needs_browser_llm": True,
+                        "reason": str(net_exc),
+                        "prompt_packet": pkt,
+                        "humanizer_prompt_template": build_humanizer_prompt({"subject": "", "body": ""})
+                        if humanizer_enabled(cfg)
+                        else "",
+                    }
+                raise BrainError(f"Сетевая ошибка обращения к LLM API: {net_exc}") from net_exc
+
+            parsed = extract_json_object(raw_text)
+            if humanizer_enabled(cfg):
+                parsed = await humanize_draft(active_brain, parsed, enabled=True)
+
+            last_result = await finalize_llm_draft(
+                state,
+                prospect,
+                parsed,
+                channel=channel,
+                provider_used=provider_used,
+                config=cfg,
+            )
+            if last_result["gate_passed"]:
+                return last_result
+            retry_notes = "\n".join(f"- {n}" for n in last_result.get("gate_notes") or [])
+
+        return last_result or {"ok": False, "queued": False, "status": "gate_blocked"}
+
+    # 2. Режим ИИ-агента рабочей среды (`agent`): ставим реальную задачу с полным контекстом Harvey (без шаблонов!)
+    pkt = await build_writer_prompt(state, prospect, channel=channel, config=cfg)
+    pending = await state.list_agent_tasks(status="pending")
+    for existing in pending:
+        if existing["kind"] == "writer_draft":
+            pl = existing.get("payload") or {}
+            if pl.get("prospect_id") == prospect.id and pl.get("channel") == channel:
+                return {
+                    "ok": True,
+                    "queued": True,
+                    "already_pending": True,
+                    "task_id": existing["id"],
+                    "prospect_id": prospect.id,
+                    "channel": channel,
+                    "prompt_packet": pkt,
+                }
+
+    tid, tfile = await enqueue_agent_task(
+        state,
+        cfg,
+        kind="writer_draft",
+        payload={"prospect_id": prospect.id, "company_id": prospect.company_id, "channel": channel},
+        system_prompt=pkt["system_prompt"],
+        user_prompt=pkt["user_prompt"],
+    )
+    return {
+        "ok": True,
+        "queued": True,
+        "task_id": tid,
+        "task_file": tfile,
+        "prospect_id": prospect.id,
+        "channel": channel,
+        "prompt_packet": pkt,
     }
 
 
@@ -338,13 +419,12 @@ async def run_drafts(
     min_score: int | None = None,
     limit: int = 50,
     city: str | None = None,
-    mode_override: str | None = None,
     config: FridayConfig | None = None,
+    brain: Brain | None = None,
 ) -> dict:
     cfg = config or load_config()
     threshold = min_score if min_score is not None else cfg.icp.min_fit_score
 
-    # Гарантируем, что у найденных компаний в выбранном городе есть карточка получателя
     companies = await state.get_companies(limit=max(limit * 2, 100), city=city)
     for comp in companies[:limit]:
         await state.ensure_company_prospect(comp.id)
@@ -353,28 +433,36 @@ async def run_drafts(
     if not prospects and threshold > 0:
         prospects = await state.get_prospects(min_score=0, city=city, limit=limit)
 
+    active_brain = brain or Brain(state=state, config=cfg)
     created = 0
     blocked = 0
     queued = 0
+    browser_packets: list[dict] = []
 
     for p in prospects:
         res = await generate_draft_for_prospect(
             state,
             p,
             channel=channel,
-            mode_override=mode_override,
             config=cfg,
+            brain=active_brain,
         )
-        if res.get("queued"):
+        if res.get("needs_browser_llm"):
+            browser_packets.append(res["prompt_packet"])
+        elif res.get("queued"):
             queued += 1
         elif res.get("gate_passed"):
             created += 1
         else:
             blocked += 1
 
-    return {
+    out: dict = {
         "processed": len(prospects),
         "drafts_ready": created,
         "gate_blocked": blocked,
         "queued_agent_tasks": queued,
     }
+    if browser_packets:
+        out["needs_browser_llm"] = True
+        out["prompt_packets"] = browser_packets
+    return out

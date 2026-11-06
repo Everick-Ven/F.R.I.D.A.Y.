@@ -42,7 +42,6 @@ async def run_full_pipeline(
     limit: int = 20,
     channel: str = "telegram",
     use_ai_scoring: bool = False,
-    mode_override: str | None = None,
     config: FridayConfig | None = None,
 ) -> dict:
     """Запускает цепочку этапов конвейера для настроенной ниши (без какой-либо автоотправки)."""
@@ -65,7 +64,7 @@ async def run_full_pipeline(
     prof = await run_profile(state, limit=limit)
     peop = await run_people(state, limit=limit, config=cfg)
     scor = await score_all_prospects(state, use_ai=use_ai_scoring, limit=limit * 3, config=cfg)
-    drft = await run_drafts(state, channel=channel, limit=limit, mode_override=mode_override, config=cfg)
+    drft = await run_drafts(state, channel=channel, limit=limit, config=cfg)
 
     return {
         "niche_configured": is_niche_configured(cfg),

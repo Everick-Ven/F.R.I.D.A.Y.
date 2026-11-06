@@ -6,6 +6,7 @@ friday.local.yaml
 skills/product_knowledge.md
 skills/competitive_intel.md
 skills/outreach_rules.local.md
+skills/email_rules.md
 
 # Local database, exports, logs & agent task queue
 data/

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from fastapi.testclient import TestClient
 
@@ -52,20 +53,39 @@ def test_dashboard_starts_clean_and_supports_niche_presets_and_pipeline(
         assert sample_res.status_code == 200
         assert sample_res.json()["inserted_companies"] == 2
 
-        # 4. Постановка задач черновиков ИИ-агенту рабочей среды (Вариант А)
-        q_res = client.post("/api/run/drafts", json={"channel": "telegram", "template_preview": False})
+        # 4. Постановка задач черновиков ИИ-агенту рабочей среды (без шаблонов)
+        q_res = client.post("/api/run/drafts", json={"channel": "telegram"})
         assert q_res.status_code == 200
         assert q_res.json()["queued_agent_tasks"] >= 1
 
         tasks = client.get("/api/agent-tasks?status=pending").json()["items"]
         assert len(tasks) >= 1
+        writer_task_id = tasks[0]["id"]
         assert tasks[0]["kind_label"] == "Подготовка персонального предложения"
         assert "prompt_text" not in tasks[0]
 
-        # Отмена одной ожидающей задачи из UI
-        del_r = client.delete(f"/api/agent-tasks/{tasks[0]['id']}")
-        assert del_r.status_code == 200
-        assert del_r.json()["status"] == "cancelled"
+        # ИИ-агент применяет индивидуальное письмо (без шаблона), проверяем выгрузку CSV
+        comp_res = client.post(
+            f"/api/agent-tasks/{writer_task_id}/complete",
+            json={
+                "response_json": json.dumps(
+                    {
+                        "subject": "",
+                        "body": "Алексей Викторович, здравствуйте. Увидел открытую вакансию в вашей компании на hh.ru, при этом на сайте пока нет быстрой формы для входящих запросов. Подскажите, кто сейчас разбирает обращения новых клиентов?",
+                        "audit_summary": "Открыт подбор в отдел продаж, на сайте нет онлайн-захвата.",
+                        "signal_used": "Поиск профильного сотрудника (hh.ru)",
+                    },
+                    ensure_ascii=False,
+                )
+            },
+        )
+        assert comp_res.status_code == 200
+        assert comp_res.json()["outcome"]["gate_passed"] is True
+
+        if len(tasks) >= 2:
+            del_r = client.delete(f"/api/agent-tasks/{tasks[1]['id']}")
+            assert del_r.status_code == 200
+            assert del_r.json()["status"] == "cancelled"
 
         # Проверяем отсутствие кэширования, заглушек «Демо-данные» и технических промптов
         root_resp = client.get("/")
@@ -81,11 +101,6 @@ def test_dashboard_starts_clean_and_supports_niche_presets_and_pipeline(
         assert "Очередь задач ИИ-агента" not in html_txt + js_txt
         assert "ФЗ-38" not in html_txt
         assert "SQLite" not in html_txt
-
-        # 5. И быстрый предпросмотр шаблонных черновиков + экспорт CSV
-        tpl_res = client.post("/api/run/drafts", json={"channel": "telegram", "template_preview": True})
-        assert tpl_res.status_code == 200
-        assert tpl_res.json()["drafts_ready"] >= 1
 
         csv_r = client.get("/api/export/csv")
         assert csv_r.status_code == 200
@@ -226,7 +241,52 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
                 assert obs.get("signal_label")
                 assert "DECISION_MAKER_FOUND" not in obs["signal_label"]
 
-        # Точечная кнопка «Подготовить предложение» по конкретной компании + онлайн-редактирование с проверкой Gate
+        # Подключаем LLM провайдер по схеме Harvey (без шаблонов!) + проверяем Feedback и онлайн-правку
+        async def _mock_harvey_llm(self, prompt: str, *, timeout: float = 90.0) -> str:
+            if "Константин Владимирович" in prompt:
+                body = (
+                    "Константин Владимирович, здравствуйте. Посмотрел сайт rostovadvocat.ru на WordPress, "
+                    "страницы практик есть, но быстрой формы записи для доверителей не увидел. "
+                    "Подскажите, обращения с поиска сейчас принимаете только по телефону?"
+                )
+            else:
+                body = (
+                    "Здравствуйте. Нашёл карточку «Адвокатское бюро Премиум» в Яндекс.Картах по Ростову-на-Дону, "
+                    "при этом отдельный сайт бюро там не привязан. "
+                    "Подскажите, планируете ли в этом году выводить практику в органический поиск Яндекса?"
+                )
+            return json.dumps(
+                {
+                    "subject": "",
+                    "body": body,
+                    "audit_summary": "Проверены открытые карточки и сайт бюро в Ростове-на-Дону.",
+                    "signal_used": "Отсутствие формы захвата на сайте",
+                },
+                ensure_ascii=False,
+            )
+
+        monkeypatch.setattr("friday.brain.Brain._call_http_llm", _mock_harvey_llm)
+        monkeypatch.setattr(
+            "friday.dashboard.save_local_config",
+            lambda c, target_path=None: __import__("friday.config", fromlist=["save_local_config"]).save_local_config(
+                c, tmp_path / "friday.local.yaml"
+            ),
+        )
+        monkeypatch.setattr("friday.config.PROJECT_ROOT", tmp_path)
+        b_save = client.post(
+            "/api/brain/save",
+            json={
+                "provider": "api",
+                "api_base_url": "https://openrouter.ai/api/v1",
+                "model": "anthropic/claude-3.5-sonnet",
+                "api_key": "sk-or-test-harvey-key",
+                "humanizer": False,
+                "email_rules": "",
+            },
+        )
+        assert b_save.status_code == 200
+        assert b_save.json()["direct_inference_ready"] is True
+
         prep_res = client.post(
             "/api/proposals/prepare",
             json={"company_id": rostov_web_comp["id"], "channel": "telegram"},
@@ -234,19 +294,32 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
         assert prep_res.status_code == 200
         draft_obj = prep_res.json()["draft"]
         assert draft_obj is not None
+        assert draft_obj["brain_provider"] == "api:anthropic/claude-3.5-sonnet"
         assert "Константин Владимирович" in draft_obj["body"]
+
+        # Сохранение замечания владельца (Feedback, как в Harvey)
+        fb_res = client.post(
+            "/api/feedback",
+            json={
+                "comment": "Не упоминать адрес офиса в первом сообщении.",
+                "about": "Адвокатское бюро Грата",
+                "prospect_id": draft_obj["prospect_id"],
+                "draft_id": draft_obj["id"],
+            },
+        )
+        assert fb_res.status_code == 200
 
         edit_ok = client.patch(
             f"/api/drafts/{draft_obj['id']}/content",
             json={
                 "subject": "",
-                "body": "Константин Владимирович, здравствуйте. Изучил сайт rostovadvocat.ru. Подскажите, актуально ли прислать короткий разбор из 3 точек роста?",
+                "body": "Константин Владимирович, здравствуйте. Изучил сайт rostovadvocat.ru. Подскажите, актуально ли прислать короткий разбор из 3 конкретных пунктов?",
             },
         )
         assert edit_ok.status_code == 200
         assert edit_ok.json()["gate_passed"] is True
 
-        # Пакетная подготовка предложений только по г. Ростов-на-Дону
+        # Пакетная подготовка персональных писем через Мозг только по г. Ростов-на-Дону
         dr = client.post(
             "/api/jobs/drafts",
             json={"channel": "telegram", "city": "Ростов-на-Дону", "limit": 10},
@@ -261,6 +334,7 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
 
         drafts = client.get("/api/drafts?city=Ростов-на-Дону").json()["items"]
         assert len(drafts) >= 2
+        assert all(d["brain_provider"] != "template" for d in drafts)
         assert all("Не задано" not in d["body"] for d in drafts)
         assert all(d["status"] == "pending_review" for d in drafts)
 

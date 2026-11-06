@@ -77,9 +77,31 @@ class ICPConfig(BaseModel):
     min_fit_score: int = 50
 
 
+BrainProvider = Literal["auto", "api", "claude", "codex", "agent"]
+
+
+class EmailRulesError(ValueError):
+    """Файл пользовательских правил писем не читается или пуст."""
+
+
 class BrainConfig(BaseModel):
-    mode: Literal["agent", "template"] = "agent"
+    provider: BrainProvider = "auto"
+    mode: Literal["agent"] = "agent"
+    api_base_url: str = "https://openrouter.ai/api/v1"
+    model: str = "anthropic/claude-3.5-sonnet"
+    reasoning_effort: Literal["low", "medium", "high"] = "medium"
     tasks_dir: str = "data/agent_tasks"
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _coerce_legacy_mode(cls, v) -> str:
+        # Шаблонный режим полностью удалён: любые старые значения приводятся к "agent"
+        return "agent"
+
+
+class WriterConfig(BaseModel):
+    email_rules: str = ""
+    humanizer: bool = False
 
 
 class ComplianceConfig(BaseModel):
@@ -108,6 +130,7 @@ class FridayConfig(BaseModel):
     product: ProductConfig = Field(default_factory=ProductConfig)
     icp: ICPConfig = Field(default_factory=ICPConfig)
     brain: BrainConfig = Field(default_factory=BrainConfig)
+    writer: WriterConfig = Field(default_factory=WriterConfig)
     compliance: ComplianceConfig = Field(default_factory=ComplianceConfig)
     usage: UsageConfig = Field(default_factory=UsageConfig)
     source_path: str = Field(default="", exclude=True)
@@ -125,11 +148,23 @@ class FridayConfig(BaseModel):
 
 
 class EnvConfig(BaseModel):
+    llm_api_key: str = ""
+    openai_api_key: str = ""
+    openrouter_api_key: str = ""
+    anthropic_api_key: str = ""
     yandex_search_api_key: str = ""
     yandex_search_folder_id: str = ""
     yandex_xml_url: str = ""
     yandex_maps_api_key: str = ""
     twogis_api_key: str = ""
+
+    def effective_llm_key(self) -> str:
+        return (
+            self.llm_api_key
+            or self.openrouter_api_key
+            or self.openai_api_key
+            or self.anthropic_api_key
+        ).strip()
 
     def as_dict(self) -> dict[str, str]:
         return self.model_dump()
@@ -188,11 +223,52 @@ def save_local_config(cfg: FridayConfig, target_path: str | Path | None = None) 
     return dest
 
 
+def load_email_rules(cfg: FridayConfig) -> str:
+    """Читает пользовательские правила автора писем (`writer.email_rules`), как в Harvey."""
+    rel = (cfg.writer.email_rules or "").strip()
+    if not rel:
+        default_local = PROJECT_ROOT / "skills" / "email_rules.md"
+        if default_local.exists():
+            txt = read_user_text(default_local).strip()
+            return txt[:6000]
+        return ""
+    p = Path(rel)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    if not p.exists():
+        raise EmailRulesError(f"Файл правил писем не найден: {rel}")
+    txt = read_user_text(p).strip()
+    if not txt:
+        raise EmailRulesError(f"Файл правил писем пуст: {rel}")
+    if len(txt) > 8000:
+        raise EmailRulesError("Файл правил писем превышает 8 000 символов")
+    return txt
+
+
+def save_email_rules(text: str, cfg: FridayConfig | None = None) -> Path:
+    """Сохраняет пользовательские правила автора писем в `skills/email_rules.md`."""
+    rel = (cfg.writer.email_rules.strip() if cfg and cfg.writer.email_rules.strip() else "skills/email_rules.md")
+    dest = Path(rel)
+    if not dest.is_absolute():
+        dest = PROJECT_ROOT / dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cleaned = (text or "").strip()
+    if cleaned:
+        dest.write_text(cleaned + "\n", encoding="utf-8")
+    elif dest.exists():
+        dest.unlink()
+    return dest
+
+
 def load_env(env_path: str | Path | None = None) -> EnvConfig:
     target = Path(env_path) if env_path else (PROJECT_ROOT / ".env")
     if target.exists():
         load_dotenv(dotenv_path=str(target), override=False)
     return EnvConfig(
+        llm_api_key=os.getenv("FRIDAY_LLM_API_KEY", "").strip(),
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
         yandex_search_api_key=os.getenv("YANDEX_SEARCH_API_KEY", "").strip(),
         yandex_search_folder_id=os.getenv("YANDEX_SEARCH_FOLDER_ID", "").strip(),
         yandex_xml_url=os.getenv("YANDEX_XML_URL", "").strip(),

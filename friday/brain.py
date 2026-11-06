@@ -1,25 +1,31 @@
-"""Мозг F.R.I.D.A.Y. — Вариант А: ИИ-агент рабочей среды как Мозг (`agent` mode).
+"""Мозг F.R.I.D.A.Y. — полная архитектура Harvey без шаблонов:
+1. `api`    — прямой вызов LLM API (OpenRouter, OpenAI, Anthropic, DeepSeek, локальный Ollama и др.);
+2. `claude` — локальный изолированный Claude Code CLI (`--safe-mode --tools ""` без истории и MCP);
+3. `codex`  — локальный изолированный Codex CLI (`--sandbox read-only`);
+4. `agent`  — очередь типизированных задач `agent_tasks` для ИИ-агента рабочей среды (Arena, Claude Code, Cursor).
 
-Архитектурный принцип:
-- F.R.I.D.A.Y. НЕ требует платных API-ключей к внешним LLM и НЕ вызывает сторонние CLI.
-- Python-ядро детерминированно собирает данные (Яндекс, 2ГИС, hh.ru, сайты компаний),
-  изолирует внешний текст в `<untrusted>`, проверяет юридический шлюз ФЗ-38 (`gate.py`)
-  и формирует структурированные пакеты задач (`agent_tasks`) для ИИ-агента рабочей среды
-  (Arena.ai Agent Mode, Cursor, Windsurf, Claude Code и др.).
-- ИИ-агент рабочей среды читает задачу через `friday tasks next` (или `data/agent_tasks/`),
-  выполняет интеллектуальную работу (`train_niche`, `scout_score`, `writer_draft`)
-  и записывает результат через `friday tasks apply <task_id> '<json>'` (или REST API).
-- Дополнительно доступен режим `template` — мгновенный детерминированный предпросмотр
-  черновиков и скоринга без ожидания ответа агента.
+Никаких зашитых текстовых шаблонов в Python нет: каждое письмо создаётся индивидуально по проверенным
+фактам (`<untrusted>`), системным правилам `prompts/writer.md`, базам знаний `skills/*.md`, опциональному
+проходу `humanize.py` и проходит обязательный детерминированный шлюз `friday/gate.py` (ФЗ-38 / КПЭА).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
 
-from friday.config import FridayConfig, load_config
+import httpx
+
+from friday.claude_runtime import (
+    CliRuntimeError,
+    check_claude_cli,
+    check_codex_cli,
+    run_claude_isolated,
+    run_codex_isolated,
+)
+from friday.config import FridayConfig, load_config, load_env
 from friday.gate import validate_draft
 from friday.models.draft import Draft
 from friday.paths import DATA_DIR, PROMPTS_DIR, SKILLS_DIR
@@ -27,14 +33,28 @@ from friday.state import StateManager
 from friday.trainer import apply_niche_setup
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+
+SETTING_LLM_API_KEY = "llm_api_key"
+
+PROVIDER_LABELS = {
+    "api": "LLM API",
+    "claude": "Claude Code CLI",
+    "codex": "Codex CLI",
+    "agent": "ИИ-агент рабочей среды",
+}
 
 
 class BrainError(RuntimeError):
-    """Ошибка обработки задачи Мозга."""
+    """Ошибка вызова или разбора ответа Мозга."""
+
+
+class BrainUnavailableError(BrainError):
+    """Выбранный провайдер Мозга недоступен или требует настройки."""
 
 
 class AgentTaskQueued(Exception):
-    """Сигнал о том, что задача поставлена в очередь для ИИ-агента рабочей среды."""
+    """Задача поставлена в очередь для ИИ-агента рабочей среды."""
 
     def __init__(self, task_id: str, kind: str, task_file: str = ""):
         super().__init__(f"Создана задача ИИ-агента #{task_id} ({kind})")
@@ -43,11 +63,20 @@ class AgentTaskQueued(Exception):
         self.task_file = task_file
 
 
-def load_prompt(name: str) -> str:
+def load_prompt(name: str, **variables: str) -> str:
+    """Читает `prompts/<name>.md` и подставляет переменные конфигурации `{{...}}`."""
     path = PROMPTS_DIR / f"{name}.md"
     if not path.exists():
         return ""
-    return path.read_text(encoding="utf-8").strip()
+    raw = path.read_text(encoding="utf-8").strip()
+    if not variables:
+        return raw
+
+    def _replace(match: re.Match) -> str:
+        key = match.group(1)
+        return str(variables[key]) if key in variables else match.group(0)
+
+    return TEMPLATE_VAR_RE.sub(_replace, raw)
 
 
 def load_skills(names: list[str] | None = None) -> str:
@@ -55,8 +84,8 @@ def load_skills(names: list[str] | None = None) -> str:
     if not SKILLS_DIR.exists():
         return ""
     chunks: list[str] = []
+    excluded = {"README.md", "email_rules.md", "outreach_rules.local.md", "humanizer.md"}
     if names is None:
-        # Порядок важен: сначала обученный продукт и конкуренты, затем универсальные плейбуки РФ
         priority = [
             "product_knowledge",
             "competitive_intel",
@@ -73,7 +102,7 @@ def load_skills(names: list[str] | None = None) -> str:
                 ordered_files.append(p)
                 seen.add(p.name)
         for p in sorted(SKILLS_DIR.glob("*.md")):
-            if p.name != "README.md" and p.name not in seen:
+            if p.name not in excluded and p.name not in seen:
                 ordered_files.append(p)
         files = ordered_files
     else:
@@ -85,12 +114,12 @@ def load_skills(names: list[str] | None = None) -> str:
 
 
 def extract_json_object(raw: str | dict) -> dict:
-    """Извлекает JSON-объект из ответа ИИ-агента (поддерживает чистый JSON и markdown-блоки)."""
+    """Извлекает JSON-объект из ответа модели (поддерживает чистый JSON и markdown-блоки)."""
     if isinstance(raw, dict):
         return raw
     text = (raw or "").strip()
     if not text:
-        raise BrainError("Пустой JSON-ответ")
+        raise BrainError("Пустой JSON-ответ от модели")
     try:
         obj = json.loads(text)
         if isinstance(obj, dict):
@@ -120,6 +149,224 @@ def extract_json_object(raw: str | dict) -> dict:
     raise BrainError(f"Ответ не содержит валидного JSON-объекта: {text[:240]}")
 
 
+def mask_api_key(key: str) -> str:
+    k = (key or "").strip()
+    if not k:
+        return ""
+    if len(k) <= 10:
+        return k[:2] + "•••"
+    return f"{k[:6]}•••{k[-4:]}"
+
+
+async def get_configured_api_key(state: StateManager | None = None) -> str:
+    if state is not None:
+        stored = (await state.get_setting(SETTING_LLM_API_KEY)).strip()
+        if stored:
+            return stored
+    return load_env().effective_llm_key()
+
+
+def _is_local_unauthenticated_api(base_url: str) -> bool:
+    low = (base_url or "").strip().lower()
+    return "://localhost" in low or "://127.0.0.1" in low
+
+
+class Brain:
+    """Движок мышления F.R.I.D.A.Y. по схеме Harvey (`think` / `think_json` + preflight)."""
+
+    def __init__(
+        self,
+        state: StateManager | None = None,
+        config: FridayConfig | None = None,
+        *,
+        api_key_override: str = "",
+    ):
+        self.state = state
+        self.config = config or load_config()
+        self._api_key_override = api_key_override.strip()
+
+    async def get_api_key(self) -> str:
+        if self._api_key_override:
+            return self._api_key_override
+        return await get_configured_api_key(self.state)
+
+    async def inspect_status(self) -> dict:
+        """Возвращает детальную диагностику доступных рантаймов Мозга для UI и CLI."""
+        cfg_b = self.config.brain
+        api_key = await self.get_api_key()
+        has_api = bool(api_key) or _is_local_unauthenticated_api(cfg_b.api_base_url)
+
+        claude_ok = False
+        claude_reason = ""
+        try:
+            await asyncio.to_thread(check_claude_cli)
+            claude_ok = True
+        except CliRuntimeError as exc:
+            claude_reason = str(exc)
+
+        codex_ok = False
+        codex_reason = ""
+        try:
+            await asyncio.to_thread(check_codex_cli)
+            codex_ok = True
+        except CliRuntimeError as exc:
+            codex_reason = str(exc)
+
+        selected = cfg_b.provider
+        if selected == "auto":
+            if has_api:
+                effective = "api"
+            elif claude_ok:
+                effective = "claude"
+            elif codex_ok:
+                effective = "codex"
+            else:
+                effective = "agent"
+        else:
+            effective = selected
+
+        ready_direct = (
+            (effective == "api" and has_api)
+            or (effective == "claude" and claude_ok)
+            or (effective == "codex" and codex_ok)
+        )
+
+        return {
+            "configured_provider": selected,
+            "effective_provider": effective,
+            "effective_label": PROVIDER_LABELS.get(effective, effective),
+            "direct_inference_ready": ready_direct,
+            "api_base_url": cfg_b.api_base_url,
+            "model": cfg_b.model,
+            "reasoning_effort": cfg_b.reasoning_effort,
+            "has_api_key": bool(api_key),
+            "masked_api_key": mask_api_key(api_key),
+            "humanizer": bool(self.config.writer.humanizer),
+            "runtimes": {
+                "api": {"available": has_api},
+                "claude": {"available": claude_ok, "reason": claude_reason},
+                "codex": {"available": codex_ok, "reason": codex_reason},
+                "agent": {"available": True},
+            },
+        }
+
+    @property
+    def provider_tag(self) -> str:
+        b = self.config.brain
+        if b.provider in ("claude", "codex", "agent"):
+            return b.provider
+        return f"api:{b.model}" if b.model else "api"
+
+    async def _call_http_llm(self, prompt: str, *, timeout: float = 90.0) -> str:
+        b = self.config.brain
+        base = (b.api_base_url or "https://openrouter.ai/api/v1").strip().rstrip("/")
+        api_key = await self.get_api_key()
+        if not api_key and not _is_local_unauthenticated_api(base):
+            raise BrainUnavailableError(
+                "Не задан API-ключ LLM. Укажите ключ OpenRouter / OpenAI / DeepSeek в настройках «Мозг (LLM)»."
+            )
+
+        # Поддержка нативного Anthropic Messages API (`api.anthropic.com`)
+        if "api.anthropic.com" in base.lower():
+            url = base if base.endswith("/messages") else f"{base}/messages"
+            if "/v1/" not in url and not url.endswith("/v1/messages"):
+                url = "https://api.anthropic.com/v1/messages"
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+            model_name = b.model.split("/", 1)[-1] if "/" in b.model else (b.model or "claude-3-5-sonnet-latest")
+            payload = {
+                "model": model_name,
+                "max_tokens": 1024,
+                "temperature": 0.55,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code >= 400:
+                raise BrainError(f"Ошибка Anthropic API ({resp.status_code}): {resp.text[:300]}")
+            data = resp.json()
+            blocks = data.get("content") or []
+            return "".join(bl.get("text", "") for bl in blocks if isinstance(bl, dict)).strip()
+
+        # Стандартный OpenAI-совместимый эндпоинт (OpenRouter, OpenAI, DeepSeek, Qwen, Ollama, vLLM)
+        url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        if "openrouter.ai" in url.lower():
+            headers["HTTP-Referer"] = "https://github.com/Everick-Ven/F.R.I.D.A.Y."
+            headers["X-Title"] = "F.R.I.D.A.Y."
+
+        payload = {
+            "model": b.model or "anthropic/claude-3.5-sonnet",
+            "temperature": 0.55,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            raise BrainError(f"Ошибка LLM API ({resp.status_code}): {resp.text[:300]}")
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise BrainError(f"Пустой массив choices от LLM API: {str(data)[:240]}")
+        msg = choices[0].get("message") or {}
+        return str(msg.get("content") or "").strip()
+
+    async def think(
+        self,
+        prompt: str,
+        *,
+        timeout: float = 120.0,
+        task: str = "",
+    ) -> tuple[str, str]:
+        """Выполняет прямой вызов активной модели и возвращает `(raw_text, provider_used)`."""
+        info = await self.inspect_status()
+        eff = info["effective_provider"]
+
+        if eff == "api":
+            text = await self._call_http_llm(prompt, timeout=timeout)
+            return text, f"api:{self.config.brain.model}"
+        if eff == "claude":
+            if not info["runtimes"]["claude"]["available"]:
+                raise BrainUnavailableError(info["runtimes"]["claude"]["reason"])
+            text = await asyncio.to_thread(
+                run_claude_isolated,
+                prompt,
+                model=self.config.brain.model,
+                timeout=timeout,
+            )
+            return text, "claude"
+        if eff == "codex":
+            if not info["runtimes"]["codex"]["available"]:
+                raise BrainUnavailableError(info["runtimes"]["codex"]["reason"])
+            text = await asyncio.to_thread(
+                run_codex_isolated,
+                prompt,
+                model=self.config.brain.model,
+                reasoning_effort=self.config.brain.reasoning_effort,
+                timeout=timeout,
+            )
+            return text, "codex"
+
+        raise BrainUnavailableError(
+            "Прямой провайдер LLM (API-ключ или локальный Claude/Codex CLI) не настроен; активен режим очереди ИИ-агента."
+        )
+
+    async def think_json(
+        self,
+        prompt: str,
+        *,
+        timeout: float = 120.0,
+        task: str = "",
+    ) -> dict:
+        raw, _ = await self.think(prompt, timeout=timeout, task=task)
+        return extract_json_object(raw)
+
+
 def _tasks_dir(cfg: FridayConfig) -> Path:
     raw = (cfg.brain.tasks_dir or "data/agent_tasks").strip()
     p = Path(raw)
@@ -139,10 +386,14 @@ async def enqueue_agent_task(
     user_prompt: str,
 ) -> tuple[str, str]:
     """Создаёт задачу для ИИ-агента рабочей среды в SQLite и в `data/agent_tasks/`."""
-    full_prompt = (
-        f"# СИСТЕМНАЯ ИНСТРУКЦИЯ F.R.I.D.A.Y.\n\n{system_prompt.strip()}\n\n"
-        f"---\n\n# ЗАДАЧА ({kind})\n\n{user_prompt.strip()}\n"
-    )
+    if system_prompt.strip():
+        full_prompt = (
+            f"# СИСТЕМНАЯ ИНСТРУКЦИЯ F.R.I.D.A.Y.\n\n{system_prompt.strip()}\n\n"
+            f"---\n\n# ЗАДАЧА ({kind})\n\n{user_prompt.strip()}\n"
+        )
+    else:
+        full_prompt = user_prompt.strip() + "\n"
+
     tid = await state.create_agent_task(
         kind=kind,
         payload=payload,
@@ -168,13 +419,7 @@ async def apply_agent_task_result(
     raw_result: str | dict,
     cfg: FridayConfig | None = None,
 ) -> dict:
-    """Применяет JSON-ответ ИИ-агента рабочей среды к состоянию F.R.I.D.A.Y.
-
-    Поддерживаемые типы задач (`kind`):
-    - `train_niche`  -> обновляет `friday.local.yaml`, `skills/product_knowledge.md`, `skills/competitive_intel.md`
-    - `scout_score`  -> обновляет `score` и `personalization_notes` у ЛПР
-    - `writer_draft` -> прогоняет текст через детерминированный шлюз `gate.py` (ФЗ-38) и сохраняет черновик
-    """
+    """Применяет JSON-ответ ИИ-агента рабочей среды к состоянию F.R.I.D.A.Y."""
     cfg = cfg or load_config()
     tasks = await state.list_agent_tasks(status="all")
     task = next((t for t in tasks if t["id"] == task_id), None)
@@ -265,7 +510,6 @@ async def apply_agent_task_result(
     raw_json_str = json.dumps(parsed, ensure_ascii=False)
     await state.complete_agent_task(task_id, raw_json_str)
 
-    # Обновим JSON-пакет на диске, если он есть
     tfile = _tasks_dir(cfg) / f"{task_id}_{kind}.json"
     if tfile.exists():
         try:

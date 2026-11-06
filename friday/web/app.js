@@ -3,6 +3,7 @@
 const state = {
   summary: null,
   config: null,
+  brain: null,
   cities: [],
   activeCityFilter: "",
   activeSubTab: "companies",
@@ -14,6 +15,7 @@ const state = {
   companiesCache: [],
   prospectsCache: [],
   editingDraftId: null,
+  feedbackDraftId: null,
   activeJobPoll: null,
   hideJobTimer: null,
 };
@@ -868,7 +870,22 @@ async function loadSummary() {
   ]);
   state.summary = data.summary;
   state.config = data.config;
+  state.brain = data.brain || null;
   state.cities = data.cities || [];
+
+  if (state.brain && $("brain-status-label")) {
+    const b = state.brain;
+    const shortModel = b.model ? b.model.split("/").pop() : "";
+    const lbl =
+      b.effective_provider === "api"
+        ? `Мозг: ${shortModel || "LLM API"}`
+        : `Мозг: ${b.effective_label || b.effective_provider}`;
+    $("brain-status-label").textContent = lbl;
+    const bDot = $("brain-status-dot");
+    if (bDot) {
+      bDot.className = "status-indicator " + (b.direct_inference_ready ? "ok" : "warn");
+    }
+  }
   state.signalsCatalog = sigData.items || [];
 
   const configured = Boolean(data.niche_configured);
@@ -1340,25 +1357,198 @@ async function loadProspects() {
   });
 }
 
-/* ── Мгновенная подготовка предложения по 1 компании или ЛПР ── */
+/* ── Мост прямого вызова LLM из браузера + Настройки Мозга (схема Harvey без шаблонов) ── */
+const LLM_PRESETS = {
+  openrouter: { provider: "api", baseUrl: "https://openrouter.ai/api/v1", model: "anthropic/claude-3.5-sonnet" },
+  deepseek: { provider: "api", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+  openai: { provider: "api", baseUrl: "https://api.openai.com/v1", model: "gpt-4o" },
+  anthropic: { provider: "api", baseUrl: "https://api.anthropic.com/v1", model: "claude-3-5-sonnet-latest" },
+  ollama: { provider: "api", baseUrl: "http://localhost:11434/v1", model: "qwen2.5:14b" },
+};
+
+async function callBrowserLlmText(prompt, browserCfg) {
+  const base = String(browserCfg.api_base_url || "https://openrouter.ai/api/v1").trim().replace(/\/+$/, "");
+  const apiKey = String(browserCfg.api_key || "").trim();
+  const model = String(browserCfg.model || "anthropic/claude-3.5-sonnet").trim();
+
+  if (base.toLowerCase().includes("api.anthropic.com")) {
+    const url = base.endsWith("/messages") ? base : `${base}/messages`;
+    const cleanModel = model.includes("/") ? model.split("/").pop() : model;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: cleanModel,
+        max_tokens: 1024,
+        temperature: 0.55,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data?.error?.message || `Ошибка Anthropic API (${r.status})`);
+    return (data.content || []).map((x) => x.text || "").join("").trim();
+  }
+
+  const url = base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+  if (url.toLowerCase().includes("openrouter.ai")) {
+    headers["HTTP-Referer"] = window.location.origin;
+    headers["X-Title"] = "F.R.I.D.A.Y.";
+  }
+  const r = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      temperature: 0.55,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error?.message || `Ошибка LLM API (${r.status})`);
+  return String(data?.choices?.[0]?.message?.content || "").trim();
+}
+
+async function executeBrowserLlmPacket(pkt, channel, cachedBrowserCfg = null) {
+  const bCfg = cachedBrowserCfg || (await api("/api/brain/browser-config"));
+  const rawText = await callBrowserLlmText(pkt.combined_prompt, bCfg);
+  let humanizedText = null;
+
+  if (bCfg.humanizer) {
+    try {
+      const start = rawText.indexOf("{");
+      const end = rawText.lastIndexOf("}");
+      if (start !== -1 && end > start) {
+        const parsedDraft = JSON.parse(rawText.slice(start, end + 1));
+        const hPromptResp = await api("/api/proposals/humanizer-prompt", {
+          method: "POST",
+          body: JSON.stringify(parsedDraft),
+        });
+        if (hPromptResp?.prompt) {
+          humanizedText = await callBrowserLlmText(hPromptResp.prompt, bCfg);
+        }
+      }
+    } catch (_err) {
+      humanizedText = null;
+    }
+  }
+
+  return await api("/api/proposals/apply-llm", {
+    method: "POST",
+    body: JSON.stringify({
+      prospect_id: pkt.prospect_id,
+      channel: channel || pkt.channel || "telegram",
+      raw_response: rawText,
+      humanized_response: humanizedText,
+      provider_used: `api:${bCfg.model || "llm"}`,
+    }),
+  });
+}
+
+async function openBrainModal() {
+  const modal = $("brain-modal");
+  if (!modal) return;
+  try {
+    const info = await api("/api/brain/status");
+    state.brain = info;
+    $("brain-provider").value = info.configured_provider || "auto";
+    $("brain-model").value = info.model || "anthropic/claude-3.5-sonnet";
+    $("brain-base-url").value = info.api_base_url || "https://openrouter.ai/api/v1";
+    $("brain-api-key").value = "";
+    $("brain-key-hint").textContent = info.has_api_key ? `(сохранён: ${info.masked_api_key})` : "(не задан)";
+    $("brain-humanizer").checked = Boolean(info.humanizer);
+    $("brain-email-rules").value = info.email_rules || "";
+
+    const rt = info.runtimes || {};
+    const parts = [
+      `Активный режим: ${info.effective_label}`,
+      `LLM API: ${rt.api?.available ? "готов" : "ключ не задан"}`,
+      `Claude CLI: ${rt.claude?.available ? "доступен" : "не установлен"}`,
+      `Codex CLI: ${rt.codex?.available ? "доступен" : "не установлен"}`,
+    ];
+    $("brain-runtimes-info").textContent = parts.join(" · ");
+
+    renderModalFeedbackList(info.feedback || []);
+    modal.classList.remove("hidden");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function renderModalFeedbackList(items) {
+  const wrap = $("brain-feedback-wrap");
+  if (!wrap) return;
+  if (!items.length) {
+    wrap.innerHTML = `<div class="cell-sub">Замечаний автора пока нет. Вы можете оставлять их прямо на карточках писем («Замечание автору»), и Writer будет учитывать их как в Harvey.</div>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <div class="field-label">Сохранённая обратная связь владельца (${items.length}):</div>
+    <div class="feedback-chip-list">
+      ${items
+        .map(
+          (f) => `
+        <div class="feedback-chip-item">
+          <span><strong>${esc(f.about || "черновик")}:</strong> ${esc(f.comment)}</span>
+          <button type="button" class="ghost-btn sm danger-text" data-del-feedback="${esc(f.id)}">Удалить</button>
+        </div>`
+        )
+        .join("")}
+    </div>
+  `;
+  wrap.querySelectorAll("[data-del-feedback]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      await api(`/api/feedback/${encodeURIComponent(btn.dataset.delFeedback)}`, { method: "DELETE" });
+      const refreshed = await api("/api/brain/status");
+      renderModalFeedbackList(refreshed.feedback || []);
+    });
+  });
+}
+
+function formatBrainProviderBadge(providerRaw) {
+  const p = String(providerRaw || "agent");
+  if (p === "claude") return "Claude CLI";
+  if (p === "codex") return "Codex CLI";
+  if (p.startsWith("api:")) return `LLM · ${p.slice(4).split("/").pop()}`;
+  if (p === "api") return "LLM API";
+  return "ИИ-агент (Harvey)";
+}
+
+/* ── Мгновенная подготовка предложения по 1 компании или ЛПР (схема Harvey без шаблонов) ── */
 async function prepareProposalFor(targetPayload, btnEl) {
   const channel = $("sel-draft-channel")?.value || "telegram";
   if (btnEl) {
     btnEl.disabled = true;
     btnEl._origText = btnEl.textContent;
-    btnEl.textContent = "Готовим…";
+    btnEl.textContent = "Пишем письмо…";
   }
   try {
-    const resp = await api("/api/proposals/prepare", {
+    let resp = await api("/api/proposals/prepare", {
       method: "POST",
       body: JSON.stringify({ ...targetPayload, channel }),
     });
+
+    if (resp.result?.needs_browser_llm && resp.result?.prompt_packet) {
+      resp = await executeBrowserLlmPacket(resp.result.prompt_packet, channel);
+    } else if (resp.result?.queued) {
+      await loadSummary();
+      toast("Задача поставлена ИИ-агенту (без шаблонов). Для генерации в 1 клик укажите ключ LLM в окне «Мозг».");
+      openBrainModal();
+      return;
+    }
+
     await loadSummary();
     state.draftStatusFilter = "";
     document.querySelectorAll("#draft-status-pills .seg-btn").forEach((b) => {
       b.classList.toggle("active", b.dataset.status === "");
     });
-    toast(`Персональное предложение подготовлено (${channel.toUpperCase()})`);
+    toast(`Персональное письмо написано (${channel.toUpperCase()})`);
     switchTab("drafts");
     if (resp.draft?.id) {
       setTimeout(() => {
@@ -1443,6 +1633,9 @@ async function loadDrafts() {
       }
 
       const isEditing = state.editingDraftId === d.id;
+      const isGivingFeedback = state.feedbackDraftId === d.id;
+      const providerBadge = formatBrainProviderBadge(d.brain_provider);
+      const aboutTarget = `${d.company_name || d.domain || "черновик"} (${fio})`;
 
       return `
         <article class="draft-item" data-draft-card="${esc(d.id)}">
@@ -1452,13 +1645,14 @@ async function loadDrafts() {
               <div class="draft-person">${esc(fio)}${d.title ? " · " + esc(d.title) : ""}</div>
             </div>
             <div class="draft-badges">
+              <span class="tag blue" title="Автор черновика">${esc(providerBadge)}</span>
               <span class="tag">${esc(d.channel.toUpperCase())}</span>
               <span class="tag ${stTone}">${esc(stLabel)}</span>
               <span class="score-pill ${Number(d.score) >= 65 ? "high" : ""}">${esc(d.score ?? 0)}</span>
             </div>
           </div>
 
-          ${d.audit_summary ? `<div class="audit-box"><strong>Экспресс-аудит:</strong> ${esc(d.audit_summary)}</div>` : ""}
+          ${d.audit_summary ? `<div class="audit-box"><strong>Факты разведки:</strong> ${esc(d.audit_summary)}</div>` : ""}
 
           ${
             isEditing
@@ -1479,9 +1673,25 @@ async function loadDrafts() {
           }
 
           ${
+            isGivingFeedback
+              ? `
+              <div class="feedback-inline">
+                <span class="field-label">Замечание автору (сохранится в память Writer как в Harvey и учтётся при переписывании):</span>
+                <input type="text" id="fb-input-${esc(d.id)}" placeholder="Например: Пиши короче, не упоминай адрес офиса, спроси про загрузку партнёров" />
+                <div class="row-actions">
+                  <button type="button" class="primary-btn sm" data-submit-feedback="${esc(d.id)}" data-fb-prospect="${esc(d.prospect_id)}" data-fb-company="${esc(d.company_id || "")}" data-fb-about="${esc(aboutTarget)}">Сохранить замечание и переписать</button>
+                  <button type="button" class="secondary-btn sm" data-save-feedback-only="${esc(d.id)}" data-fb-prospect="${esc(d.prospect_id)}" data-fb-company="${esc(d.company_id || "")}" data-fb-about="${esc(aboutTarget)}">Только сохранить в память</button>
+                  <button type="button" class="ghost-btn sm" data-cancel-feedback="${esc(d.id)}">Отмена</button>
+                </div>
+              </div>
+              `
+              : ""
+          }
+
+          ${
             (d.gate_notes || []).length
               ? `<div class="draft-note ${d.status === "gate_blocked" ? "err" : ""}">Проверка комплаенса (Gate): ${esc(d.gate_notes.join(" · "))}</div>`
-              : `<div class="draft-note">Проверка ФЗ-38 / КПЭА пройдена без замечаний</div>`
+              : `<div class="draft-note">Проверка ФЗ-38 / КПЭА и анти-ИИ правил пройдена без замечаний</div>`
           }
 
           <div class="draft-bottom">
@@ -1489,6 +1699,8 @@ async function loadDrafts() {
             <div class="draft-actions">
               <button type="button" class="secondary-btn sm" data-copy-draft="${esc(fullCopy)}">Скопировать текст</button>
               <button type="button" class="ghost-btn sm" data-edit-draft="${esc(d.id)}">Редактировать</button>
+              <button type="button" class="ghost-btn sm" data-open-feedback="${esc(d.id)}">Замечание автору</button>
+              <button type="button" class="ghost-btn sm" data-rewrite-prospect="${esc(d.prospect_id)}">Переписать</button>
               <button type="button" class="ghost-btn sm" data-draft-id="${esc(d.id)}" data-status="approved">Одобрить</button>
               <button type="button" class="ghost-btn sm" data-draft-id="${esc(d.id)}" data-status="sent_manually">Отправлено</button>
               ${d.domain ? `<button type="button" class="ghost-btn sm danger-text" data-dnc-domain="${esc(d.domain)}" data-draft-reject="${esc(d.id)}" title="Добавить домен в стоп-лист DNC">В стоп-лист</button>` : ""}
@@ -1518,6 +1730,75 @@ async function loadDrafts() {
       state.editingDraftId = null;
       loadDrafts();
     });
+  });
+
+  list.querySelectorAll("[data-open-feedback]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.feedbackDraftId = btn.dataset.openFeedback;
+      loadDrafts();
+    });
+  });
+
+  list.querySelectorAll("[data-cancel-feedback]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.feedbackDraftId = null;
+      loadDrafts();
+    });
+  });
+
+  list.querySelectorAll("[data-save-feedback-only]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.saveFeedbackOnly;
+      const inp = $(`fb-input-${id}`);
+      const comment = inp ? inp.value.trim() : "";
+      if (!comment) return toast("Введите текст замечания", true);
+      try {
+        await api("/api/feedback", {
+          method: "POST",
+          body: JSON.stringify({
+            comment,
+            about: btn.dataset.fbAbout || "черновик",
+            prospect_id: btn.dataset.fbProspect || "",
+            company_id: btn.dataset.fbCompany || "",
+            draft_id: id,
+          }),
+        });
+        state.feedbackDraftId = null;
+        await loadDrafts();
+        toast("Замечание сохранено в память Writer (как в Harvey)");
+      } catch (e) {
+        toast(e.message, true);
+      }
+    });
+  });
+
+  list.querySelectorAll("[data-submit-feedback]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.submitFeedback;
+      const inp = $(`fb-input-${id}`);
+      const comment = inp ? inp.value.trim() : "";
+      if (!comment) return toast("Введите текст замечания", true);
+      try {
+        await api("/api/feedback", {
+          method: "POST",
+          body: JSON.stringify({
+            comment,
+            about: btn.dataset.fbAbout || "черновик",
+            prospect_id: btn.dataset.fbProspect || "",
+            company_id: btn.dataset.fbCompany || "",
+            draft_id: id,
+          }),
+        });
+        state.feedbackDraftId = null;
+        await prepareProposalFor({ prospect_id: btn.dataset.fbProspect }, btn);
+      } catch (e) {
+        toast(e.message, true);
+      }
+    });
+  });
+
+  list.querySelectorAll("[data-rewrite-prospect]").forEach((btn) => {
+    btn.addEventListener("click", () => prepareProposalFor({ prospect_id: btn.dataset.rewriteProspect }, btn));
   });
 
   list.querySelectorAll("[data-save-edit]").forEach((btn) => {
@@ -1637,7 +1918,7 @@ async function loadSignals() {
   });
 }
 
-/* ── Пакетная подготовка предложений ── */
+/* ── Пакетная подготовка предложений (схема Harvey без шаблонов) ── */
 async function triggerBatchProposals() {
   const channel = $("sel-draft-channel")?.value || "telegram";
   const cityScope = state.activeCityFilter || "";
@@ -1648,13 +1929,65 @@ async function triggerBatchProposals() {
       "/api/jobs/drafts",
       { channel, city: cityScope, limit: 50 },
       async (job) => {
+        if (job.result?.needs_browser_llm && Array.isArray(job.result.prompt_packets) && job.result.prompt_packets.length) {
+          const packets = job.result.prompt_packets;
+          const bCfg = await api("/api/brain/browser-config");
+          let doneCount = 0;
+          for (let i = 0; i < packets.length; i++) {
+            const pkt = packets[i];
+            const pct = 15 + Math.round(((i + 1) / packets.length) * 80);
+            renderJobCard({
+              title: "Индивидуальная генерация писем (Harvey Writer)",
+              stage: `Письмо ${i + 1} из ${packets.length} через ${bCfg.model}`,
+              percent: Math.min(96, pct),
+              status: "running",
+              steps: [
+                { label: "Отбор организаций и проверенных фактов", status: "done" },
+                { label: "Индивидуальная генерация писем (Harvey Writer)", status: "active" },
+                { label: "Проверка комплаенса и анти-ИИ правил (Gate)", status: "pending" },
+              ],
+            });
+            try {
+              const r = await executeBrowserLlmPacket(pkt, channel, bCfg);
+              if (r.result?.gate_passed) doneCount += 1;
+            } catch (err) {
+              console.warn("LLM packet error:", err);
+            }
+          }
+          renderJobCard({
+            title: "Индивидуальная генерация писем (Harvey Writer)",
+            stage: `Написано и проверено Gate: ${doneCount} писем`,
+            percent: 100,
+            status: "completed",
+            steps: [
+              { label: "Отбор организаций и проверенных фактов", status: "done" },
+              { label: "Индивидуальная генерация писем (Harvey Writer)", status: "done" },
+              { label: "Проверка комплаенса и анти-ИИ правил (Gate)", status: "done" },
+            ],
+          });
+          await loadSummary();
+          if (cityScope) {
+            state.draftCityFilter = cityScope;
+            populateDraftCityDropdown();
+          }
+          toast(`Написано персональных писем: ${doneCount}`);
+          switchTab("drafts");
+          return;
+        }
+
         const ready = job.result?.drafts_ready ?? 0;
+        const queued = job.result?.queued_agent_tasks ?? 0;
         if (cityScope) {
           state.draftCityFilter = cityScope;
           populateDraftCityDropdown();
         }
-        toast(`Подготовлено предложений: ${ready}`);
-        switchTab("drafts");
+        if (ready > 0) {
+          toast(`Написано персональных писем: ${ready}`);
+          switchTab("drafts");
+        } else if (queued > 0) {
+          toast(`Поставлено задач ИИ-агенту: ${queued}. Для генерации в 1 клик укажите ключ LLM в окне «Мозг».`);
+          openBrainModal();
+        }
       }
     );
   } catch (e) {
@@ -1671,6 +2004,66 @@ function bindEvents() {
   });
 
   $("project-pill-btn").addEventListener("click", () => switchTab("project"));
+  $("btn-open-brain")?.addEventListener("click", openBrainModal);
+  $("btn-close-brain")?.addEventListener("click", () => $("brain-modal")?.classList.add("hidden"));
+  $("btn-cancel-brain")?.addEventListener("click", () => $("brain-modal")?.classList.add("hidden"));
+
+  document.querySelectorAll("[data-llm-preset]").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const pr = LLM_PRESETS[chip.dataset.llmPreset];
+      if (!pr) return;
+      $("brain-provider").value = pr.provider;
+      $("brain-base-url").value = pr.baseUrl;
+      $("brain-model").value = pr.model;
+    });
+  });
+
+  $("btn-clear-api-key")?.addEventListener("click", async () => {
+    try {
+      await api("/api/brain/save", {
+        method: "POST",
+        body: JSON.stringify({
+          provider: $("brain-provider").value,
+          api_base_url: $("brain-base-url").value.trim(),
+          model: $("brain-model").value.trim(),
+          humanizer: $("brain-humanizer").checked,
+          email_rules: $("brain-email-rules").value,
+          clear_api_key: true,
+        }),
+      });
+      await openBrainModal();
+      await loadSummary();
+      toast("Сохранённый API-ключ удалён");
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  $("btn-save-brain")?.addEventListener("click", async () => {
+    const btn = $("btn-save-brain");
+    btn.disabled = true;
+    try {
+      const keyVal = $("brain-api-key").value.trim();
+      await api("/api/brain/save", {
+        method: "POST",
+        body: JSON.stringify({
+          provider: $("brain-provider").value,
+          api_base_url: $("brain-base-url").value.trim(),
+          model: $("brain-model").value.trim(),
+          api_key: keyVal || null,
+          humanizer: $("brain-humanizer").checked,
+          email_rules: $("brain-email-rules").value,
+        }),
+      });
+      $("brain-modal")?.classList.add("hidden");
+      await loadSummary();
+      toast("Настройки Мозга и правила автора сохранены");
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
 
   document.querySelectorAll("#db-subtabs .seg-btn").forEach((b) => {
     b.addEventListener("click", () => switchSubView(b.dataset.subview));
