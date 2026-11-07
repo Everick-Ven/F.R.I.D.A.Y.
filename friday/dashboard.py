@@ -151,6 +151,8 @@ class DraftsRequest(BaseModel):
     min_score: int | None = None
     city: str = ""
     limit: int = Field(default=50, ge=1, le=200)
+    use_browser_llm: bool = False
+    variation_seed: str = ""
 
 
 class SingleDraftRequest(BaseModel):
@@ -163,6 +165,7 @@ class PrepareProposalRequest(BaseModel):
     prospect_id: str = ""
     channel: str = "telegram"
     variation_seed: str = ""
+    use_browser_llm: bool = False
 
 
 class BrainSettingsSaveRequest(BaseModel):
@@ -190,6 +193,7 @@ class WritingFeedbackRequest(BaseModel):
     prospect_id: str = ""
     company_id: str = ""
     draft_id: str = ""
+    is_global: bool = False
 
 
 class DraftContentPatch(BaseModel):
@@ -656,6 +660,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     config=cfg,
                     brain=active_brain,
                     autonomous_ui=True,
+                    prefer_browser_llm=bool(req.use_browser_llm),
+                    variation_seed=req.variation_seed.strip(),
                 )
                 if r.get("needs_browser_llm"):
                     browser_packets.append(r["prompt_packet"])
@@ -727,6 +733,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 channel=req.channel,
                 config=cfg,
                 autonomous_ui=True,
+                prefer_browser_llm=bool(req.use_browser_llm),
                 variation_seed=req.variation_seed.strip(),
             )
         except BrainError as exc:
@@ -842,11 +849,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def api_add_feedback(req: WritingFeedbackRequest):
         if not req.comment.strip():
             raise HTTPException(status_code=400, detail="Текст замечания не может быть пустым")
+        eff_prospect = "" if req.is_global else req.prospect_id
+        eff_company = "" if req.is_global else req.company_id
+        eff_about = "Общее правило автора" if req.is_global else (req.about or "черновик")
         fid = await state.add_writing_feedback(
             req.comment,
-            about=req.about or "черновик",
-            prospect_id=req.prospect_id,
-            company_id=req.company_id,
+            about=eff_about,
+            prospect_id=eff_prospect,
+            company_id=eff_company,
             draft_id=req.draft_id,
         )
         return {"ok": True, "id": fid}

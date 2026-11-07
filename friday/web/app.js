@@ -1343,90 +1343,151 @@ async function loadProspects() {
   });
 }
 
-/* ── Автоматический мост LLM (работает в фоне без ручных настроек пользователя) ── */
-async function callBrowserLlmText(prompt, browserCfg) {
-  const base = String(browserCfg.api_base_url || "https://openrouter.ai/api/v1").trim().replace(/\/+$/, "");
-  const apiKey = String(browserCfg.api_key || "").trim();
-  const model = String(browserCfg.model || "anthropic/claude-3.5-sonnet").trim();
+/* ── Автоматический вызов реальной LLM без настроек и ключей ── */
+async function callBrowserLlmText(messagesOrPrompt, browserCfg) {
+  const apiKey = String(browserCfg?.api_key || "").trim();
+  const base = String(browserCfg?.api_base_url || "").trim().replace(/\/+$/, "");
+  const model = String(browserCfg?.model || "").trim();
 
-  if (base.toLowerCase().includes("api.anthropic.com")) {
-    const url = base.endsWith("/messages") ? base : `${base}/messages`;
-    const cleanModel = model.includes("/") ? model.split("/").pop() : model;
+  const messages = Array.isArray(messagesOrPrompt)
+    ? messagesOrPrompt
+    : [{ role: "user", content: String(messagesOrPrompt || "") }];
+
+  // 1. Если в окружении сервера задан внешний API-ключ — используем его
+  if (apiKey) {
+    if (base.toLowerCase().includes("api.anthropic.com")) {
+      const url = base.endsWith("/messages") ? base : `${base}/messages`;
+      const cleanModel = (model || "claude-3-5-sonnet-latest").split("/").pop();
+      const sysMsg = messages.find((m) => m.role === "system")?.content || "";
+      const userMsgs = messages.filter((m) => m.role !== "system");
+      const r = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: cleanModel,
+          max_tokens: 1200,
+          temperature: 0.48,
+          ...(sysMsg ? { system: sysMsg } : {}),
+          messages: userMsgs.length ? userMsgs : [{ role: "user", content: sysMsg }],
+        }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data?.error?.message || `Ошибка Anthropic API (${r.status})`);
+      return (data.content || []).map((x) => x.text || "").join("").trim();
+    }
+
+    const url = (base || "https://openrouter.ai/api/v1").endsWith("/chat/completions")
+      ? base
+      : `${base || "https://openrouter.ai/api/v1"}/chat/completions`;
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    };
+    if (url.toLowerCase().includes("openrouter.ai")) {
+      headers["HTTP-Referer"] = window.location.origin;
+      headers["X-Title"] = "F.R.I.D.A.Y.";
+    }
     const r = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
+      headers,
       body: JSON.stringify({
-        model: cleanModel,
-        max_tokens: 1024,
+        model: model || "anthropic/claude-3.5-sonnet",
         temperature: 0.48,
-        messages: [{ role: "user", content: prompt }],
+        messages,
       }),
     });
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data?.error?.message || `Ошибка Anthropic API (${r.status})`);
-    return (data.content || []).map((x) => x.text || "").join("").trim();
+    if (!r.ok) throw new Error(data?.error?.message || `Ошибка LLM API (${r.status})`);
+    return String(data?.choices?.[0]?.message?.content || "").trim();
   }
 
-  const url = base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-  if (url.toLowerCase().includes("openrouter.ai")) {
-    headers["HTTP-Referer"] = window.location.origin;
-    headers["X-Title"] = "F.R.I.D.A.Y.";
+  // 2. Автономная работа «из коробки» без ключей и настроек: реальная Reasoning LLM (GPT-OSS-20B)
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 38000);
+  try {
+    const r = await fetch("https://text.pollinations.ai/openai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: ctrl.signal,
+      body: JSON.stringify({
+        model: "openai-fast",
+        seed: Math.floor(Math.random() * 900000) + 10000,
+        messages,
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      throw new Error(data?.error?.message || `HTTP ${r.status}`);
+    }
+    const txt = String(data?.choices?.[0]?.message?.content || "").trim();
+    if (!txt) throw new Error("Пустой ответ модели");
+    return txt;
+  } finally {
+    clearTimeout(timer);
   }
-  const r = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model,
-      temperature: 0.48,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data?.error?.message || `Ошибка LLM API (${r.status})`);
-  return String(data?.choices?.[0]?.message?.content || "").trim();
 }
 
 async function executeBrowserLlmPacket(pkt, channel, cachedBrowserCfg = null) {
   const bCfg = cachedBrowserCfg || (await api("/api/brain/browser-config"));
-  const rawText = await callBrowserLlmText(pkt.combined_prompt, bCfg);
-  let humanizedText = null;
+  const providerTag = bCfg.api_key ? `api:${bCfg.model || "llm"}` : "llm:gpt-oss-20b";
 
-  if (bCfg.humanizer !== false) {
-    try {
-      const start = rawText.indexOf("{");
-      const end = rawText.lastIndexOf("}");
-      if (start !== -1 && end > start) {
-        const parsedDraft = JSON.parse(rawText.slice(start, end + 1));
-        const hPromptResp = await api("/api/proposals/humanizer-prompt", {
-          method: "POST",
-          body: JSON.stringify(parsedDraft),
-        });
-        if (hPromptResp?.prompt) {
-          humanizedText = await callBrowserLlmText(hPromptResp.prompt, bCfg);
+  let userPrompt = pkt.user_prompt || pkt.combined_prompt;
+  let lastApplied = null;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const msgs = pkt.system_prompt
+      ? [
+          { role: "system", content: pkt.system_prompt },
+          { role: "user", content: userPrompt },
+        ]
+      : [{ role: "user", content: userPrompt }];
+
+    const rawText = await callBrowserLlmText(msgs, bCfg);
+    let humanizedText = null;
+
+    if (bCfg.api_key && bCfg.humanizer !== false) {
+      try {
+        const start = rawText.indexOf("{");
+        const end = rawText.lastIndexOf("}");
+        if (start !== -1 && end > start) {
+          const parsedDraft = JSON.parse(rawText.slice(start, end + 1));
+          const hPromptResp = await api("/api/proposals/humanizer-prompt", {
+            method: "POST",
+            body: JSON.stringify(parsedDraft),
+          });
+          if (hPromptResp?.prompt) {
+            humanizedText = await callBrowserLlmText(hPromptResp.prompt, bCfg);
+          }
         }
+      } catch (_err) {
+        humanizedText = null;
       }
-    } catch (_err) {
-      humanizedText = null;
     }
+
+    lastApplied = await api("/api/proposals/apply-llm", {
+      method: "POST",
+      body: JSON.stringify({
+        prospect_id: pkt.prospect_id,
+        channel: channel || pkt.channel || "telegram",
+        raw_response: rawText,
+        humanized_response: humanizedText,
+        provider_used: providerTag,
+      }),
+    });
+
+    if (lastApplied?.result?.gate_passed) {
+      return lastApplied;
+    }
+    const notes = (lastApplied?.result?.gate_notes || []).join("; ");
+    userPrompt = `${pkt.user_prompt}\n\nИСПРАВЬТЕ ЭТИ ОШИБКИ ПРЕДЫДУЩЕЙ ПОПЫТКИ:\n- ${notes}`;
   }
 
-  return await api("/api/proposals/apply-llm", {
-    method: "POST",
-    body: JSON.stringify({
-      prospect_id: pkt.prospect_id,
-      channel: channel || pkt.channel || "telegram",
-      raw_response: rawText,
-      humanized_response: humanizedText,
-      provider_used: `api:${bCfg.model || "llm"}`,
-    }),
-  });
+  return lastApplied;
 }
 
 /* ── Мгновенная подготовка предложения по 1 компании или ЛПР ── */
@@ -1435,16 +1496,24 @@ async function prepareProposalFor(targetPayload, btnEl) {
   if (btnEl) {
     btnEl.disabled = true;
     btnEl._origText = btnEl.textContent;
-    btnEl.textContent = "Готовим…";
+    btnEl.textContent = "Пишем…";
   }
   try {
     let resp = await api("/api/proposals/prepare", {
       method: "POST",
-      body: JSON.stringify({ ...targetPayload, channel }),
+      body: JSON.stringify({ ...targetPayload, channel, use_browser_llm: true }),
     });
 
     if (resp.result?.needs_browser_llm && resp.result?.prompt_packet) {
-      resp = await executeBrowserLlmPacket(resp.result.prompt_packet, channel);
+      try {
+        resp = await executeBrowserLlmPacket(resp.result.prompt_packet, channel);
+      } catch (llmErr) {
+        console.warn("Browser LLM fallback:", llmErr);
+        resp = await api("/api/proposals/prepare", {
+          method: "POST",
+          body: JSON.stringify({ ...targetPayload, channel, use_browser_llm: false }),
+        });
+      }
     }
 
     await loadSummary();
@@ -1452,8 +1521,9 @@ async function prepareProposalFor(targetPayload, btnEl) {
     document.querySelectorAll("#draft-status-pills .seg-btn").forEach((b) => {
       b.classList.toggle("active", b.dataset.status === "");
     });
-    toast(`Персональное предложение подготовлено (${channel.toUpperCase()})`);
+    toast(`Предложение подготовлено с учётом ваших правил (${channel.toUpperCase()})`);
     switchTab("drafts");
+    await loadDrafts();
     if (resp.draft?.id) {
       setTimeout(() => {
         const card = document.querySelector(`[data-draft-card="${resp.draft.id}"]`);
@@ -1470,8 +1540,47 @@ async function prepareProposalFor(targetPayload, btnEl) {
   }
 }
 
+/* ── Панель активных указаний автору ── */
+async function loadAuthorRulesBar() {
+  const wrap = $("author-rules-list");
+  if (!wrap) return;
+  try {
+    const data = await api("/api/feedback");
+    const items = data.items || [];
+    if (!items.length) {
+      wrap.innerHTML = `<span class="cell-sub">Дополнительных замечаний пока нет. Базовый режим: прямое B2B-предложение и позиционирование по Трауту и Райсу.</span>`;
+      return;
+    }
+    wrap.innerHTML = items
+      .map((f) => {
+        const isGlobal = !f.prospect_id;
+        const scope = isGlobal ? "Для всех писем" : f.about || "По карточке";
+        return `
+          <div class="author-rule-pill">
+            <span class="author-rule-scope">${esc(scope)}:</span>
+            <span>${esc(f.comment)}</span>
+            <button type="button" class="author-rule-del" data-del-rule="${esc(f.id)}" title="Удалить указание">×</button>
+          </div>
+        `;
+      })
+      .join("");
+
+    wrap.querySelectorAll("[data-del-rule]").forEach((b) => {
+      b.addEventListener("click", async () => {
+        await api(`/api/feedback/${encodeURIComponent(b.dataset.delRule)}`, { method: "DELETE" });
+        await loadAuthorRulesBar();
+        toast("Указание удалено");
+      });
+    });
+  } catch (_e) {
+    /* ignore */
+  }
+}
+
 /* ── Раздел «Предложения» (Черновики + Экспресс-аудит + Редактирование + Gate) ── */
 async function loadDrafts() {
+  await loadAuthorRulesBar();
+
   const params = new URLSearchParams();
   if (state.draftStatusFilter) params.set("status", state.draftStatusFilter);
   if (state.draftChannelFilter) params.set("channel", state.draftChannelFilter);
@@ -1578,11 +1687,15 @@ async function loadDrafts() {
             isGivingFeedback
               ? `
               <div class="feedback-inline">
-                <span class="field-label">Замечание автору (сохранится в память Writer как в Harvey и учтётся при переписывании):</span>
-                <input type="text" id="fb-input-${esc(d.id)}" placeholder="Например: Пиши короче, не упоминай адрес офиса, спроси про загрузку партнёров" />
+                <span class="field-label">Замечание автору (нейросеть учтёт его при переписывании):</span>
+                <input type="text" id="fb-input-${esc(d.id)}" placeholder="Например: Убери слово «бесплатно», сделай акцент на арбитражные споры, подпишись в конце Илья" />
+                <label class="fb-scope-check">
+                  <input type="checkbox" id="fb-global-${esc(d.id)}" checked />
+                  <span>Применить как общее правило ко всем предложениям</span>
+                </label>
                 <div class="row-actions">
-                  <button type="button" class="primary-btn sm" data-submit-feedback="${esc(d.id)}" data-fb-prospect="${esc(d.prospect_id)}" data-fb-company="${esc(d.company_id || "")}" data-fb-about="${esc(aboutTarget)}">Сохранить замечание и переписать</button>
-                  <button type="button" class="secondary-btn sm" data-save-feedback-only="${esc(d.id)}" data-fb-prospect="${esc(d.prospect_id)}" data-fb-company="${esc(d.company_id || "")}" data-fb-about="${esc(aboutTarget)}">Только сохранить в память</button>
+                  <button type="button" class="primary-btn sm" data-submit-feedback="${esc(d.id)}" data-fb-prospect="${esc(d.prospect_id)}" data-fb-company="${esc(d.company_id || "")}" data-fb-about="${esc(aboutTarget)}">Сохранить и переписать это письмо</button>
+                  <button type="button" class="secondary-btn sm" data-save-feedback-only="${esc(d.id)}" data-fb-prospect="${esc(d.prospect_id)}" data-fb-company="${esc(d.company_id || "")}" data-fb-about="${esc(aboutTarget)}">Только сохранить правило</button>
                   <button type="button" class="ghost-btn sm" data-cancel-feedback="${esc(d.id)}">Отмена</button>
                 </div>
               </div>
@@ -1652,6 +1765,7 @@ async function loadDrafts() {
     btn.addEventListener("click", async () => {
       const id = btn.dataset.saveFeedbackOnly;
       const inp = $(`fb-input-${id}`);
+      const isGlobal = Boolean($(`fb-global-${id}`)?.checked);
       const comment = inp ? inp.value.trim() : "";
       if (!comment) return toast("Введите текст замечания", true);
       try {
@@ -1663,11 +1777,12 @@ async function loadDrafts() {
             prospect_id: btn.dataset.fbProspect || "",
             company_id: btn.dataset.fbCompany || "",
             draft_id: id,
+            is_global: isGlobal,
           }),
         });
         state.feedbackDraftId = null;
         await loadDrafts();
-        toast("Замечание сохранено в память Writer (как в Harvey)");
+        toast("Правило сохранено и будет учитываться при генерации");
       } catch (e) {
         toast(e.message, true);
       }
@@ -1678,6 +1793,7 @@ async function loadDrafts() {
     btn.addEventListener("click", async () => {
       const id = btn.dataset.submitFeedback;
       const inp = $(`fb-input-${id}`);
+      const isGlobal = Boolean($(`fb-global-${id}`)?.checked);
       const comment = inp ? inp.value.trim() : "";
       if (!comment) return toast("Введите текст замечания", true);
       try {
@@ -1689,6 +1805,7 @@ async function loadDrafts() {
             prospect_id: btn.dataset.fbProspect || "",
             company_id: btn.dataset.fbCompany || "",
             draft_id: id,
+            is_global: isGlobal,
           }),
         });
         state.feedbackDraftId = null;
@@ -1828,16 +1945,18 @@ async function loadSignals() {
   });
 }
 
-/* ── Пакетная подготовка предложений (схема Harvey без шаблонов) ── */
+/* ── Пакетная подготовка предложений ── */
 async function triggerBatchProposals() {
   const channel = $("sel-draft-channel")?.value || "telegram";
-  const cityScope = state.activeCityFilter || "";
+  const cityScope = state.draftCityFilter || state.activeCityFilter || "";
   const btn = $("btn-generate-drafts");
+  const btn2 = $("btn-drafts-tab-generate");
   if (btn) btn.disabled = true;
+  if (btn2) btn2.disabled = true;
   try {
     await runTrackedJob(
       "/api/jobs/drafts",
-      { channel, city: cityScope, limit: 50 },
+      { channel, city: cityScope, limit: 30, use_browser_llm: true, variation_seed: String(Date.now()) },
       async (job) => {
         if (job.result?.needs_browser_llm && Array.isArray(job.result.prompt_packets) && job.result.prompt_packets.length) {
           const packets = job.result.prompt_packets;
@@ -1847,32 +1966,46 @@ async function triggerBatchProposals() {
             const pkt = packets[i];
             const pct = 15 + Math.round(((i + 1) / packets.length) * 80);
             renderJobCard({
-              title: "Индивидуальная генерация писем (Harvey Writer)",
-              stage: `Письмо ${i + 1} из ${packets.length} через ${bCfg.model}`,
+              title: "Индивидуальная генерация предложений",
+              stage: `Письмо ${i + 1} из ${packets.length} (с учётом правил автора)…`,
               percent: Math.min(96, pct),
               status: "running",
               steps: [
                 { label: "Отбор организаций и проверенных фактов", status: "done" },
-                { label: "Индивидуальная генерация писем (Harvey Writer)", status: "active" },
-                { label: "Проверка комплаенса и анти-ИИ правил (Gate)", status: "pending" },
+                { label: "Индивидуальная генерация предложений", status: "active" },
+                { label: "Проверка комплаенса ФЗ-38 / КПЭА (Gate)", status: "pending" },
               ],
             });
             try {
               const r = await executeBrowserLlmPacket(pkt, channel, bCfg);
               if (r.result?.gate_passed) doneCount += 1;
             } catch (err) {
-              console.warn("LLM packet error:", err);
+              console.warn("LLM packet fallback:", err);
+              try {
+                const fb = await api("/api/proposals/prepare", {
+                  method: "POST",
+                  body: JSON.stringify({
+                    prospect_id: pkt.prospect_id,
+                    channel,
+                    use_browser_llm: false,
+                    variation_seed: String(Date.now()),
+                  }),
+                });
+                if (fb.result?.gate_passed) doneCount += 1;
+              } catch (_e2) {
+                /* ignore */
+              }
             }
           }
           renderJobCard({
-            title: "Индивидуальная генерация писем (Harvey Writer)",
-            stage: `Написано и проверено Gate: ${doneCount} писем`,
+            title: "Индивидуальная генерация предложений",
+            stage: `Подготовлено и проверено Gate: ${doneCount} предложений`,
             percent: 100,
             status: "completed",
             steps: [
               { label: "Отбор организаций и проверенных фактов", status: "done" },
-              { label: "Индивидуальная генерация писем (Harvey Writer)", status: "done" },
-              { label: "Проверка комплаенса и анти-ИИ правил (Gate)", status: "done" },
+              { label: "Индивидуальная генерация предложений", status: "done" },
+              { label: "Проверка комплаенса ФЗ-38 / КПЭА (Gate)", status: "done" },
             ],
           });
           await loadSummary();
@@ -1880,8 +2013,9 @@ async function triggerBatchProposals() {
             state.draftCityFilter = cityScope;
             populateDraftCityDropdown();
           }
-          toast(`Написано персональных писем: ${doneCount}`);
+          toast(`Подготовлено персональных предложений: ${doneCount}`);
           switchTab("drafts");
+          await loadDrafts();
           return;
         }
 
@@ -1892,12 +2026,14 @@ async function triggerBatchProposals() {
         }
         toast(`Подготовлено персональных предложений: ${ready}`);
         switchTab("drafts");
+        await loadDrafts();
       }
     );
   } catch (e) {
     toast(e.message, true);
   } finally {
     if (btn) btn.disabled = false;
+    if (btn2) btn2.disabled = false;
   }
 }
 
@@ -1930,6 +2066,37 @@ function bindEvents() {
   $("flt-draft-city").addEventListener("change", (e) => {
     state.draftCityFilter = e.target.value;
     loadDrafts();
+  });
+
+  $("btn-save-rule-only")?.addEventListener("click", async () => {
+    const inp = $("inp-global-author-rule");
+    const comment = inp ? inp.value.trim() : "";
+    if (!comment) return toast("Введите правило для автора писем", true);
+    try {
+      await api("/api/feedback", {
+        method: "POST",
+        body: JSON.stringify({ comment, is_global: true }),
+      });
+      inp.value = "";
+      await loadAuthorRulesBar();
+      toast("Общее правило сохранено и будет учитываться во всех письмах");
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  $("btn-save-rule-rewrite-all")?.addEventListener("click", async () => {
+    const inp = $("inp-global-author-rule");
+    const comment = inp ? inp.value.trim() : "";
+    if (comment) {
+      await api("/api/feedback", {
+        method: "POST",
+        body: JSON.stringify({ comment, is_global: true }),
+      });
+      inp.value = "";
+      await loadAuthorRulesBar();
+    }
+    await triggerBatchProposals();
   });
 
   $("sel-require-signal").addEventListener("change", () => loadCompanies());

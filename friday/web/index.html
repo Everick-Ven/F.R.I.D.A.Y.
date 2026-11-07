@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>F.R.I.D.A.Y.</title>
-  <link rel="stylesheet" href="/static/app.css?v=9" />
+  <link rel="stylesheet" href="/static/app.css?v=10" />
 </head>
 <body>
   <header class="topbar">
@@ -349,8 +349,23 @@
               <option value="whatsapp">WhatsApp</option>
             </select>
             <button type="button" id="btn-drafts-tab-generate" class="primary-btn sm">
-              Подготовить предложения
+              Переписать все предложения
             </button>
+          </div>
+        </div>
+
+        <div class="author-rules-box" id="author-rules-box">
+          <div class="author-rules-head">
+            <div>
+              <strong>Указания автору писем</strong>
+              <span class="cell-sub"> — учитываются нейросетью при написании и переписывании каждого предложения</span>
+            </div>
+          </div>
+          <div id="author-rules-list" class="author-rules-list"></div>
+          <div class="author-rules-form">
+            <input id="inp-global-author-rule" type="text" placeholder="Новое правило автору (например: делай акцент на арбитражные дела, без слова «бесплатно», подпишись в конце Илья)" />
+            <button type="button" id="btn-save-rule-rewrite-all" class="primary-btn sm">Сохранить и переписать все</button>
+            <button type="button" id="btn-save-rule-only" class="secondary-btn sm">Сохранить правило</button>
           </div>
         </div>
 
@@ -386,6 +401,6 @@
   </main>
 
   <div id="toast" class="toast hidden" role="status"></div>
-  <script src="/static/app.js?v=9"></script>
+  <script src="/static/app.js?v=10"></script>
 </body>
 </html>

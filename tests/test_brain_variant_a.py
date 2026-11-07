@@ -255,3 +255,69 @@ async def test_agent_queue_mode_without_any_python_templates(
     )
     assert ok_out["gate_passed"] is True
     assert ok_out["status"] == "pending_review"
+
+
+@pytest.mark.asyncio
+async def test_author_feedback_propagation_and_gate_blocks_fake_survey_questions(
+    state: StateManager,
+    tmp_path: Path,
+):
+    from friday.gate import validate_draft
+
+    cfg = FridayConfig()
+    cfg.persona.company = "Голубев & Кульков"
+    cfg.product.name = "Разработка сайтов и SEO для адвокатов"
+    cfg.icp.niche = "Адвокаты и адвокатские бюро"
+    cfg.compliance.regulated_niche = "legal_advocates"
+
+    # 1. Gate обязан блокировать фальшивые вопросы-опросники незнакомцу
+    bad_gate = validate_draft(
+        channel="telegram",
+        subject="",
+        body=(
+            "Алексей Владимирович, здравствуйте. Смотрел a-lunev.ru со смартфона. "
+            "Скажите, вам комфортнее принимать первичные запросы только голосом по телефону "
+            "или письменные обращения тоже удобны?"
+        ),
+        config=cfg,
+    )
+    assert bad_gate.passed is False
+
+    # 2. Замечание, оставленное на одной карточке или глобально, попадает в промпт других карточек и в офлайн-фолбэк
+    cid1, _ = await state.upsert_company(Company(name="КА Лунёв и партнеры", website="https://a-lunev.ru", city="Москва"))
+    pid1, _ = await state.upsert_prospect(
+        Prospect(company_id=cid1, last_name="Лунёв", first_name="Алексей", middle_name="Владимирович", title="Председатель")
+    )
+    cid2, _ = await state.upsert_company(Company(name="РОКА Формат", website="https://ka-format.ru", city="Ростов-на-Дону"))
+    await state.record_observation(signal_code="THIN_SERVICE_STRUCTURE", company_id=cid2, value_text="5 практик на одном экране")
+    pid2, _ = await state.upsert_prospect(
+        Prospect(company_id=cid2, last_name="Меншиков", first_name="Алексей", middle_name="Сергеевич", title="Управляющий партнёр")
+    )
+
+    await state.add_writing_feedback(
+        "Пиши грамотное предложение по Трауту и Райсу, упор на арбитражные споры, убери бесплатно, подпись: Илья, Голубев и Кульков",
+        about="КА Лунёв и партнеры",
+        prospect_id=pid1,
+        company_id=cid1,
+    )
+
+    p2 = await state.get_prospect(pid2)
+    assert p2 is not None
+
+    # При вызове из браузера (prefer_browser_llm=True) возвращается пакет с замечанием автора в system и user промптах
+    browser_res = await generate_draft_for_prospect(state, p2, channel="telegram", config=cfg, prefer_browser_llm=True)
+    assert browser_res["needs_browser_llm"] is True
+    pkt = browser_res["prompt_packet"]
+    assert pkt["feedback_count"] >= 1
+    assert "по Трауту и Райсу" in pkt["system_prompt"]
+    assert "по Трауту и Райсу" in pkt["user_prompt"]
+
+    # А офлайн-фолбэк (autonomous_ui=True, prefer_browser_llm=False) тоже исполняет указания автора и проходит Gate
+    fb_res = await generate_draft_for_prospect(state, p2, channel="telegram", config=cfg, autonomous_ui=True, prefer_browser_llm=False)
+    assert fb_res["gate_passed"] is True
+    saved_draft = await state.get_draft(fb_res["draft_id"])
+    assert saved_draft is not None
+    assert "бесплатно" not in saved_draft["body"].lower()
+    assert "арбитражные споры" in saved_draft["body"].lower()
+    assert "Илья, Голубев и Кульков" in saved_draft["body"]
+

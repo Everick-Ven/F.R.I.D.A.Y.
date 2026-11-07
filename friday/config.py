@@ -107,8 +107,8 @@ class ComplianceConfig(BaseModel):
     mode: Literal["recon_and_drafts_only"] = "recon_and_drafts_only"
     enforce_fz38: bool = True
     regulated_niche: RegulatedNiche = "none"
-    max_telegram_words: int = 85
-    max_email_words: int = 140
+    max_telegram_words: int = 115
+    max_email_words: int = 165
     do_not_contact: list[str] = Field(default_factory=list)
 
     @field_validator("do_not_contact", mode="before")

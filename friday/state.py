@@ -1269,12 +1269,55 @@ class StateManager:
         self,
         prospect_ids: list[str] | None = None,
         *,
+        company_id: str = "",
+        include_all_recent: bool = True,
         limit: int = 15,
     ) -> list[dict]:
-        """Возвращает заметки владельца (новейшие первыми): общие + относящиеся к указанным ЛПР."""
+        """Возвращает указания и замечания владельца (новейшие первыми):
+        - при `prospect_ids is None` возвращает все сохранённые замечания (и общие, и по карточкам);
+        - при генерации под конкретного получателя возвращает замечания по нему/его организации + общие правила
+          + недавние замечания автора, чтобы правки стиля применялись сразу ко всем черновикам.
+        """
         async with self._connect() as db:
-            if prospect_ids:
-                placeholders = ",".join("?" for _ in prospect_ids)
+            if prospect_ids is None:
+                sql = """
+                    SELECT id, prospect_id, company_id, draft_id, about, comment, created_at
+                    FROM writing_feedback
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                """
+                async with db.execute(sql, (limit,)) as cur:
+                    return [dict(r) for r in await cur.fetchall()]
+
+            clean_pids = [p.strip() for p in prospect_ids if p and p.strip()]
+            clean_cid = (company_id or "").strip()
+            if include_all_recent:
+                sql = """
+                    SELECT id, prospect_id, company_id, draft_id, about, comment, created_at
+                    FROM writing_feedback
+                    ORDER BY
+                        CASE
+                            WHEN (? != '' AND company_id = ?) THEN 0
+                            WHEN prospect_id = '' THEN 1
+                            ELSE 2
+                        END ASC,
+                        created_at DESC,
+                        rowid DESC
+                    LIMIT ?
+                """
+                async with db.execute(sql, (clean_cid, clean_cid, limit)) as cur:
+                    rows = [dict(r) for r in await cur.fetchall()]
+                    if clean_pids:
+                        pid_set = set(clean_pids)
+                        rows.sort(
+                            key=lambda r: (
+                                0 if r.get("prospect_id") in pid_set else (1 if not r.get("prospect_id") else 2)
+                            )
+                        )
+                    return rows
+
+            if clean_pids:
+                placeholders = ",".join("?" for _ in clean_pids)
                 sql = f"""
                     SELECT id, prospect_id, company_id, draft_id, about, comment, created_at
                     FROM writing_feedback
@@ -1282,7 +1325,7 @@ class StateManager:
                     ORDER BY created_at DESC, rowid DESC
                     LIMIT ?
                 """
-                params = (*prospect_ids, limit)
+                params = (*clean_pids, limit)
             else:
                 sql = """
                     SELECT id, prospect_id, company_id, draft_id, about, comment, created_at

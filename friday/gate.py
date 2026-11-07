@@ -96,6 +96,10 @@ AI_AND_SPAM_PHRASES: tuple[str, ...] = (
     "синергия",
     "я ии-ассистент",
     "как языковая модель",
+    "комфортнее принимать первичные запросы",
+    "голосом по телефону или письменные обращения",
+    "осознанно не ведете отдельный сайт",
+    "руки не доходили",
 )
 
 FAKE_REPLY_SUBJECT_RE = re.compile(r"^\s*(?:re|fwd|отв|пересл)\s*:", re.I)
@@ -247,8 +251,8 @@ def check_draft(
     dnc = getattr(comp, "do_not_contact", None) or []
     enforce_fz38 = True if comp is None else bool(comp.enforce_fz38)
     reg_niche = getattr(comp, "regulated_niche", "none") if comp else "none"
-    max_tg_words = getattr(comp, "max_telegram_words", 85) if comp else 85
-    max_email_words = getattr(comp, "max_email_words", 140) if comp else 140
+    max_tg_words = getattr(comp, "max_telegram_words", 115) if comp else 115
+    max_email_words = getattr(comp, "max_email_words", 165) if comp else 165
 
     hit_dnc = match_do_not_contact(domain=domain, email=email, telegram=telegram, entries=dnc)
     if hit_dnc:
