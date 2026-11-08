@@ -321,3 +321,94 @@ async def test_author_feedback_propagation_and_gate_blocks_fake_survey_questions
     assert "арбитражные споры" in saved_draft["body"].lower()
     assert "Илья, Голубев и Кульков" in saved_draft["body"]
 
+
+@pytest.mark.asyncio
+async def test_api_empty_response_resilience_and_reasoning_payload_shapes(
+    state: StateManager,
+    monkeypatch,
+):
+    from friday.brain import extract_json_object, extract_llm_text_from_payload
+
+    # 1. Скобки внутри <think>...</think> не ломают извлечение финального JSON
+    raw_with_think = (
+        '<think>\nПользователь ждёт {"subject": "...", "body": "..."} по правилам Траута.\n</think>\n'
+        '{"subject": "", "body": "Алексей Сергеевич, добрый день. Разбор готов. Прислать?", '
+        '"audit_summary": "Tilda", "signal_used": "Структура сайта"}'
+    )
+    parsed_think = extract_json_object(raw_with_think)
+    assert parsed_think["body"].startswith("Алексей Сергеевич")
+
+    # 2. Массив блоков content[] и пустой content с reasoning_content
+    arr_payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {"type": "thinking", "thinking": "думаю..."},
+                        {"type": "text", "text": '{"subject": "", "body": "Текст из блока"}'},
+                    ]
+                }
+            }
+        ]
+    }
+    assert extract_json_object(extract_llm_text_from_payload(arr_payload))["body"] == "Текст из блока"
+
+    reasoning_only_payload = {
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {
+                    "content": None,
+                    "reasoning_content": 'Итог: {"subject": "", "body": "Текст из reasoning_content"}',
+                },
+            }
+        ]
+    }
+    assert extract_json_object(extract_llm_text_from_payload(reasoning_only_payload))["body"] == "Текст из reasoning_content"
+
+    # 3. Если по API 1-й вызов вернул пустую строку, Writer НЕ падает на 1-й попытке, а повторяет и выдаёт валидный черновик
+    cfg = FridayConfig()
+    cfg.persona.company = "Голубев & Кульков"
+    cfg.product.name = "Сайты и SEO для адвокатов"
+    cfg.icp.niche = "Адвокаты"
+    cfg.compliance.regulated_niche = "legal_advocates"
+    cfg.writer.humanizer = False
+
+    cid, _ = await state.upsert_company(Company(name="РОКА Тест", website="https://roka-test.ru", city="Ростов-на-Дону"))
+    pid, _ = await state.upsert_prospect(
+        Prospect(company_id=cid, last_name="Иванов", first_name="Пётр", middle_name="Сергеевич", title="Председатель")
+    )
+    p_obj = await state.get_prospect(pid)
+    assert p_obj is not None
+
+    pkt = await build_writer_prompt(state, p_obj, channel="telegram", config=cfg)
+    assert len(pkt["combined_prompt"]) < 11000
+
+    attempt_counter = {"n": 0}
+
+    async def flaky_api_llm(self, prompt: str, *, timeout: float = 90.0, **kwargs) -> str:
+        attempt_counter["n"] += 1
+        if attempt_counter["n"] == 1:
+            return ""
+        return json.dumps(
+            {
+                "subject": "",
+                "body": (
+                    "Пётр Сергеевич, добрый день.\n\n"
+                    "Пишу из бюро «Голубев & Кульков»: разрабатываем сайты и поисковую выдачу Яндекса "
+                    "исключительно для адвокатских образований с соблюдением ст. 17 КПЭА.\n\n"
+                    "Могу прислать короткий разбор по roka-test.ru на 1 страницу. Прислать сюда?"
+                ),
+                "audit_summary": "Проверен сайт roka-test.ru.",
+                "signal_used": "Анализ сайта",
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(Brain, "_call_http_llm", flaky_api_llm)
+    brain = Brain(state=state, config=cfg, api_key_override="sk-or-test-flaky")
+    res = await generate_draft_for_prospect(state, p_obj, channel="telegram", config=cfg, brain=brain, autonomous_ui=True)
+    assert attempt_counter["n"] == 2
+    assert res["gate_passed"] is True
+
+

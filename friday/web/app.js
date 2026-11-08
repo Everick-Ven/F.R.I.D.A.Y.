@@ -1343,6 +1343,61 @@ async function loadProspects() {
   });
 }
 
+/* ── Универсальное извлечение текста из любого ответа LLM API ── */
+function flattenLlmBlocks(val) {
+  if (typeof val === "string") return val.trim();
+  if (Array.isArray(val)) {
+    const texts = [];
+    const fallbacks = [];
+    for (const item of val) {
+      if (typeof item === "string") texts.push(item);
+      else if (item && typeof item === "object") {
+        const btype = String(item.type || "").toLowerCase();
+        if (btype === "thinking" || btype === "reasoning") {
+          const fb = String(item.thinking || item.text || "").trim();
+          if (fb) fallbacks.push(fb);
+          continue;
+        }
+        const t = String(item.text || item.content || item.value || "").trim();
+        if (t) texts.push(t);
+      }
+    }
+    return (texts.length ? texts.join("\n") : fallbacks.join("\n")).trim();
+  }
+  if (val && typeof val === "object") {
+    return String(val.text || val.content || "").trim();
+  }
+  return "";
+}
+
+function extractLlmTextFromPayload(data) {
+  if (!data) return "";
+  if (typeof data === "string") return data.trim();
+  if (Array.isArray(data.choices) && data.choices.length) {
+    const c0 = data.choices[0] || {};
+    const msg = c0.message || {};
+    const cTxt = flattenLlmBlocks(msg.content);
+    if (cTxt) return cTxt;
+    const dTxt = flattenLlmBlocks(c0.text);
+    if (dTxt) return dTxt;
+    const rTxt = flattenLlmBlocks(msg.reasoning_content || msg.reasoning);
+    if (rTxt && rTxt.includes("{") && rTxt.includes("}")) return rTxt;
+  }
+  const outTxt = flattenLlmBlocks(data.output_text);
+  if (outTxt) return outTxt;
+  if (Array.isArray(data.output)) {
+    const parts = data.output.map((it) => flattenLlmBlocks(it?.content || it?.text)).filter(Boolean);
+    if (parts.length) return parts.join("\n").trim();
+  }
+  const anthTxt = flattenLlmBlocks(data.content);
+  if (anthTxt) return anthTxt;
+  if (Array.isArray(data.candidates) && data.candidates[0]?.content?.parts) {
+    const gTxt = flattenLlmBlocks(data.candidates[0].content.parts);
+    if (gTxt) return gTxt;
+  }
+  return "";
+}
+
 /* ── Автоматический вызов реальной LLM без настроек и ключей ── */
 async function callBrowserLlmText(messagesOrPrompt, browserCfg) {
   const apiKey = String(browserCfg?.api_key || "").trim();
@@ -1352,8 +1407,9 @@ async function callBrowserLlmText(messagesOrPrompt, browserCfg) {
   const messages = Array.isArray(messagesOrPrompt)
     ? messagesOrPrompt
     : [{ role: "user", content: String(messagesOrPrompt || "") }];
+  const combinedSingle = messages.map((m) => m.content || "").join("\n\n---\n\n");
 
-  // 1. Если в окружении сервера задан внешний API-ключ — используем его
+  // 1. Если в окружении сервера задан внешний API-ключ — используем его с автокаскадом
   if (apiKey) {
     if (base.toLowerCase().includes("api.anthropic.com")) {
       const url = base.endsWith("/messages") ? base : `${base}/messages`;
@@ -1370,7 +1426,7 @@ async function callBrowserLlmText(messagesOrPrompt, browserCfg) {
         },
         body: JSON.stringify({
           model: cleanModel,
-          max_tokens: 1200,
+          max_tokens: 3500,
           temperature: 0.48,
           ...(sysMsg ? { system: sysMsg } : {}),
           messages: userMsgs.length ? userMsgs : [{ role: "user", content: sysMsg }],
@@ -1378,32 +1434,63 @@ async function callBrowserLlmText(messagesOrPrompt, browserCfg) {
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data?.error?.message || `Ошибка Anthropic API (${r.status})`);
-      return (data.content || []).map((x) => x.text || "").join("").trim();
+      const txt = extractLlmTextFromPayload(data);
+      if (!txt) throw new Error("Anthropic API вернул пустой текстовый блок");
+      return txt;
     }
 
     const url = (base || "https://openrouter.ai/api/v1").endsWith("/chat/completions")
       ? base
       : `${base || "https://openrouter.ai/api/v1"}/chat/completions`;
+    const isOpenRouter = url.toLowerCase().includes("openrouter.ai");
     const headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     };
-    if (url.toLowerCase().includes("openrouter.ai")) {
+    if (isOpenRouter) {
       headers["HTTP-Referer"] = window.location.origin;
       headers["X-Title"] = "F.R.I.D.A.Y.";
     }
-    const r = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: model || "anthropic/claude-3.5-sonnet",
-        temperature: 0.48,
-        messages,
-      }),
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data?.error?.message || `Ошибка LLM API (${r.status})`);
-    return String(data?.choices?.[0]?.message?.content || "").trim();
+
+    const primaryModel = model || (isOpenRouter ? "anthropic/claude-3.5-sonnet" : "gpt-4o");
+    const candidateModels = isOpenRouter
+      ? Array.from(new Set([primaryModel, "anthropic/claude-3.5-sonnet", "openai/gpt-4o", "deepseek/deepseek-chat"]))
+      : [primaryModel];
+
+    let lastErr = "";
+    for (const candModel of candidateModels) {
+      const isReasoning = /(?:^|\/)(?:o1|o3|o4|gpt-5)(?:[-.]|$)/i.test(candModel) || candModel.toLowerCase().includes("reasoner");
+      const reqBody = isReasoning && !isOpenRouter
+        ? { model: candModel, max_completion_tokens: 4096, messages }
+        : { model: candModel, max_tokens: 3500, temperature: 0.48, messages };
+
+      let r = await fetch(url, { method: "POST", headers, body: JSON.stringify(reqBody) });
+      if (r.status === 400) {
+        r = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ model: candModel, messages: [{ role: "user", content: combinedSingle }] }),
+        });
+      }
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        lastErr = data?.error?.message || `HTTP ${r.status}`;
+        continue;
+      }
+      let txt = extractLlmTextFromPayload(data);
+      if (!txt) {
+        const r2 = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ model: candModel, messages: [{ role: "user", content: combinedSingle }] }),
+        });
+        const d2 = await r2.json().catch(() => ({}));
+        if (r2.ok) txt = extractLlmTextFromPayload(d2);
+      }
+      if (txt) return txt;
+      lastErr = `пустой ответ (${candModel})`;
+    }
+    throw new Error(lastErr || "Не удалось получить текст от LLM API");
   }
 
   // 2. Автономная работа «из коробки» без ключей и настроек: реальная Reasoning LLM (GPT-OSS-20B)
@@ -1420,11 +1507,16 @@ async function callBrowserLlmText(messagesOrPrompt, browserCfg) {
         messages,
       }),
     });
-    const data = await r.json().catch(() => ({}));
+    const rawBody = await r.text();
     if (!r.ok) {
-      throw new Error(data?.error?.message || `HTTP ${r.status}`);
+      throw new Error(`HTTP ${r.status}`);
     }
-    const txt = String(data?.choices?.[0]?.message?.content || "").trim();
+    let txt = "";
+    try {
+      txt = extractLlmTextFromPayload(JSON.parse(rawBody));
+    } catch (_jsonErr) {
+      txt = rawBody.trim();
+    }
     if (!txt) throw new Error("Пустой ответ модели");
     return txt;
   } finally {

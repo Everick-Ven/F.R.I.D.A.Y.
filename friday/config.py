@@ -148,9 +148,15 @@ class FridayConfig(BaseModel):
 
 class EnvConfig(BaseModel):
     llm_api_key: str = ""
+    llm_base_url: str = ""
+    llm_model: str = ""
     openai_api_key: str = ""
+    openai_base_url: str = ""
+    openai_model: str = ""
     openrouter_api_key: str = ""
+    openrouter_model: str = ""
     anthropic_api_key: str = ""
+    anthropic_model: str = ""
     deepseek_api_key: str = ""
     yandex_search_api_key: str = ""
     yandex_search_folder_id: str = ""
@@ -165,6 +171,17 @@ class EnvConfig(BaseModel):
             or self.openrouter_api_key
             or self.openai_api_key
             or self.deepseek_api_key
+        ).strip()
+
+    def effective_base_url(self) -> str:
+        return (self.llm_base_url or self.openai_base_url).strip()
+
+    def effective_model(self) -> str:
+        return (
+            self.llm_model
+            or self.openrouter_model
+            or self.openai_model
+            or self.anthropic_model
         ).strip()
 
     def as_dict(self) -> dict[str, str]:
@@ -266,10 +283,16 @@ def load_env(env_path: str | Path | None = None) -> EnvConfig:
     if target.exists():
         load_dotenv(dotenv_path=str(target), override=False)
     return EnvConfig(
-        llm_api_key=os.getenv("FRIDAY_LLM_API_KEY", "").strip(),
+        llm_api_key=(os.getenv("FRIDAY_LLM_API_KEY") or os.getenv("LLM_API_KEY") or "").strip(),
+        llm_base_url=(os.getenv("FRIDAY_LLM_BASE_URL") or os.getenv("LLM_BASE_URL") or "").strip(),
+        llm_model=(os.getenv("FRIDAY_LLM_MODEL") or os.getenv("LLM_MODEL") or "").strip(),
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip(),
+        openai_model=os.getenv("OPENAI_MODEL", "").strip(),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
+        openrouter_model=os.getenv("OPENROUTER_MODEL", "").strip(),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
+        anthropic_model=os.getenv("ANTHROPIC_MODEL", "").strip(),
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
         yandex_search_api_key=os.getenv("YANDEX_SEARCH_API_KEY", "").strip(),
         yandex_search_folder_id=os.getenv("YANDEX_SEARCH_FOLDER_ID", "").strip(),

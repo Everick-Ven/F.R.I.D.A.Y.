@@ -201,9 +201,7 @@ async def build_writer_prompt(
         entry_offer=entry_offer_val,
         target_niche=target_niche_val,
     )
-    skills_part = load_skills(
-        ["product_knowledge", "competitive_intel", "ru_compliance", "outreach_frameworks_ru"]
-    )
+    skills_part = load_skills(["competitive_intel"])
     feedback_notes = await _load_feedback_notes(state, prospect.id, prospect.company_id or "")
     fb_part = _format_feedback_block(feedback_notes)
     op_part = operator_rules_block(rules)
@@ -613,6 +611,7 @@ async def generate_draft_for_prospect(
     if brain_info["direct_inference_ready"]:
         retry_notes = ""
         last_result: dict | None = None
+        last_brain_err: Exception | None = None
         for _attempt in range(1, MAX_WRITE_ATTEMPTS + 1):
             pkt = await build_writer_prompt(
                 state,
@@ -627,6 +626,18 @@ async def generate_draft_for_prospect(
                     pkt["combined_prompt"],
                     task="personal_outreach",
                 )
+                parsed = extract_json_object(raw_text)
+                if humanizer_enabled(cfg):
+                    parsed = await humanize_draft(active_brain, parsed, enabled=True)
+
+                last_result = await finalize_llm_draft(
+                    state,
+                    prospect,
+                    parsed,
+                    channel=channel,
+                    provider_used=provider_used,
+                    config=cfg,
+                )
             except httpx.HTTPError as net_exc:
                 if brain_info["effective_provider"] == "api" or prefer_browser_llm:
                     return {
@@ -637,25 +648,57 @@ async def generate_draft_for_prospect(
                         "prompt_packet": pkt,
                         "humanizer_prompt_template": build_humanizer_prompt({"subject": "", "body": ""}),
                     }
-                raise BrainError(f"Сетевая ошибка обращения к LLM API: {net_exc}") from net_exc
+                last_brain_err = BrainError(f"Сетевая ошибка обращения к LLM API: {net_exc}")
+                break
+            except BrainError as b_exc:
+                last_brain_err = b_exc
+                retry_notes = (
+                    f"- Предыдущий ответ не удалось разобрать ({b_exc}). "
+                    'Верните ТОЛЬКО непустой JSON {"subject": "...", "body": "...", "audit_summary": "...", "signal_used": "..."} без рассуждений.'
+                )
+                continue
 
-            parsed = extract_json_object(raw_text)
-            if humanizer_enabled(cfg):
-                parsed = await humanize_draft(active_brain, parsed, enabled=True)
-
-            last_result = await finalize_llm_draft(
-                state,
-                prospect,
-                parsed,
-                channel=channel,
-                provider_used=provider_used,
-                config=cfg,
-            )
             if last_result["gate_passed"]:
                 return last_result
             retry_notes = "\n".join(f"- {n}" for n in last_result.get("gate_notes") or [])
 
-        return last_result or {"ok": False, "queued": False, "status": "gate_blocked"}
+        if last_result is not None:
+            return last_result
+        if prefer_browser_llm:
+            pkt = await build_writer_prompt(
+                state,
+                prospect,
+                channel=channel,
+                config=cfg,
+                variation_seed=variation_seed,
+            )
+            return {
+                "ok": False,
+                "queued": False,
+                "needs_browser_llm": True,
+                "reason": str(last_brain_err or "api_empty_fallback"),
+                "prompt_packet": pkt,
+                "humanizer_prompt_template": build_humanizer_prompt({"subject": "", "body": ""}),
+            }
+        if autonomous_ui:
+            composed = await compose_autonomous_harvey_draft(
+                state,
+                prospect,
+                channel=channel,
+                config=cfg,
+                variation_seed=variation_seed,
+            )
+            return await finalize_llm_draft(
+                state,
+                prospect,
+                composed,
+                channel=channel,
+                provider_used="agent",
+                config=cfg,
+            )
+        if last_brain_err is not None:
+            raise last_brain_err
+        return {"ok": False, "queued": False, "status": "gate_blocked"}
 
     # 2. Прозрачный вызов реальной LLM прямо из браузера пользователя (0 настроек, 0 ключей, полный учёт замечаний!)
     if prefer_browser_llm:

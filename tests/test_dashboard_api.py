@@ -294,6 +294,11 @@ def test_live_progress_jobs_train_and_drafts_for_legal_seo_niche(
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-auto-selected-key")
         monkeypatch.setattr("friday.brain.Brain._call_http_llm", _mock_harvey_llm)
 
+        bcfg = client.get("/api/brain/browser-config")
+        assert bcfg.status_code == 200
+        assert "api_base_url" in bcfg.json()
+        assert "model" in bcfg.json()
+
         prep_res = client.post(
             "/api/proposals/prepare",
             json={"company_id": rostov_web_comp["id"], "channel": "telegram"},
